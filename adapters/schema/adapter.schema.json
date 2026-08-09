@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-tool-control-center.example/schema/adapter-v1.json",
+  "title": "AI Tool Control Center declarative adapter",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "id", "version", "name", "documentation", "detections"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "id": { "type": "string", "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$", "maxLength": 80 },
+    "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 100 },
+    "documentation": { "type": "string", "format": "uri", "pattern": "^https://" },
+    "detections": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "oneOf": [
+          { "$ref": "#/$defs/file" },
+          { "$ref": "#/$defs/process" },
+          { "$ref": "#/$defs/service" },
+          { "$ref": "#/$defs/loopback" }
+        ]
+      }
+    },
+    "operations": {
+      "type": "array",
+      "items": { "enum": ["open_folder", "open_documentation", "service_status", "service_start", "service_stop", "loopback_probe"] },
+      "uniqueItems": true
+    }
+  },
+  "$defs": {
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path"],
+      "properties": { "kind": { "const": "file" }, "path": { "type": "string", "maxLength": 500 } }
+    },
+    "process": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "executable_name"],
+      "properties": { "kind": { "const": "process" }, "executable_name": { "type": "string", "pattern": "^[^/\\\\]+\\.exe$" } }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "service_name"],
+      "properties": { "kind": { "const": "service" }, "service_name": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+$" } }
+    },
+    "loopback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "port"],
+      "properties": { "kind": { "const": "loopback" }, "port": { "type": "integer", "minimum": 1, "maximum": 65535 } }
+    }
+  }
+}

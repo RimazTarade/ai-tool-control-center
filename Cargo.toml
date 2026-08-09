@@ -1,0 +1,22 @@
+[workspace]
+members = ["engine/rust/control-center-core", "apps/desktop/src-tauri"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.96"
+
+[workspace.dependencies]
+chrono = { version = "0.4.45", features = ["serde"] }
+regex = "1.13.1"
+rusqlite = { version = "0.40.1", features = ["bundled", "chrono", "uuid"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio-util = "0.7.19"
+uuid = { version = "1.24.0", features = ["serde", "v4"] }
+walkdir = "2.5.0"

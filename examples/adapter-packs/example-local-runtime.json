@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "example.local-runtime",
+  "version": "1.0.0",
+  "name": "Example local runtime",
+  "documentation": "https://example.com/docs/local-runtime",
+  "detections": [
+    { "kind": "process", "executable_name": "example-runtime.exe" },
+    { "kind": "loopback", "port": 12345 }
+  ],
+  "operations": ["loopback_probe", "open_documentation"]
+}

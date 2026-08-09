@@ -1,0 +1,24 @@
+name: Bug report
+description: Report a reproducible defect without private machine data
+body:
+  - type: markdown
+    attributes:
+      value: Do not include credentials, private inventory, usernames, or absolute user paths.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Expected and actual result
+    validations:
+      required: true

@@ -1,0 +1,8 @@
+{
+  "demo": true,
+  "notice": "Synthetic examples only; not observed on any computer.",
+  "items": [
+    { "name": "Example local runtime", "type": "runtime", "health": "unknown" },
+    { "name": "Example MCP registration", "type": "mcp", "health": "unknown" }
+  ]
+}

@@ -1,0 +1,21 @@
+[package]
+name = "ai-tool-control-center-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "ai_tool_control_center_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5.6", features = [] }
+
+[dependencies]
+control-center-core = { path = "../../../engine/rust/control-center-core" }
+serde.workspace = true
+tauri = { version = "2.11.5", features = [] }
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
