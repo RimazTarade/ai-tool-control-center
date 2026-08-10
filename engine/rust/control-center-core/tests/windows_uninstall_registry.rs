@@ -27,7 +27,7 @@ impl UninstallRegistrySource for FixtureRegistry {
                     view,
                     key_name: "Ollama".into(),
                     display_name: Some("Ollama".into()),
-                    install_location: Some(PathBuf::from(r"C:\Users\fixture\AppData\Local\Programs\Ollama")),
+                    install_location: Some(PathBuf::from(r"C:\Fixture\Programs\Ollama")),
                     publisher: Some("Ollama".into()),
                 },
                 UninstallRegistryRecord {
