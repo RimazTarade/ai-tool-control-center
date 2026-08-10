@@ -296,6 +296,71 @@ pub trait ProcessSource {
     fn read_processes(&self) -> Result<Vec<ProcessRecord>, String>;
 }
 
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WindowsProcessSource;
+
+#[cfg(windows)]
+impl ProcessSource for WindowsProcessSource {
+    fn read_processes(&self) -> Result<Vec<ProcessRecord>, String> {
+        use std::{io, mem::size_of};
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+            System::Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+                TH32CS_SNAPPROCESS,
+            },
+        };
+
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(format!(
+                "failed to create Windows process snapshot: {}",
+                io::Error::last_os_error()
+            ));
+        }
+
+        let mut entry = PROCESSENTRY32W::default();
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+
+        if unsafe { Process32FirstW(snapshot, &mut entry) } == 0 {
+            let error = io::Error::last_os_error();
+            let _ = unsafe { CloseHandle(snapshot) };
+            return Err(format!(
+                "failed to read first Windows process snapshot entry: {error}"
+            ));
+        }
+
+        let mut records = Vec::new();
+        loop {
+            let pid = entry.th32ProcessID;
+            if pid != 0 {
+                let name_len = entry
+                    .szExeFile
+                    .iter()
+                    .position(|value| *value == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..name_len]);
+
+                if !name.trim().is_empty() {
+                    records.push(ProcessRecord {
+                        pid,
+                        name,
+                        executable_path: windows_process_executable_path(pid),
+                    });
+                }
+            }
+
+            if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
+                break;
+            }
+        }
+
+        let _ = unsafe { CloseHandle(snapshot) };
+        Ok(records)
+    }
+}
+
 /// Converts running process observations into pending discoveries.
 ///
 /// Executable paths provide the strongest stable identity. When a path is not
@@ -346,6 +411,37 @@ pub fn discover_processes_with(source: &impl ProcessSource) -> Result<Vec<Discov
     }
 
     Ok(discoveries)
+}
+
+#[cfg(windows)]
+fn windows_process_executable_path(pid: u32) -> Option<PathBuf> {
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+        },
+    };
+
+    const PROCESS_PATH_CAPACITY: usize = 32_768;
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return None;
+    }
+
+    let mut buffer = vec![0u16; PROCESS_PATH_CAPACITY];
+    let mut length = buffer.len() as u32;
+    let success =
+        unsafe { QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut length) };
+    let _ = unsafe { CloseHandle(process) };
+
+    if success == 0 || length == 0 {
+        return None;
+    }
+
+    Some(PathBuf::from(String::from_utf16_lossy(
+        &buffer[..length as usize],
+    )))
 }
 
 fn has_executable_extension(path: &Path, extensions: &HashSet<String>) -> bool {
