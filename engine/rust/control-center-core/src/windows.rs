@@ -473,6 +473,214 @@ pub trait TcpEndpointSource {
     fn read_listening_endpoints(&self) -> Result<Vec<TcpEndpointRecord>, String>;
 }
 
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WindowsTcpEndpointSource;
+
+#[cfg(windows)]
+impl TcpEndpointSource for WindowsTcpEndpointSource {
+    fn read_listening_endpoints(&self) -> Result<Vec<TcpEndpointRecord>, String> {
+        use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+
+        let mut records = windows_tcp_ipv4_listeners(AF_INET as u32)?;
+        records.extend(windows_tcp_ipv6_listeners(AF_INET6 as u32)?);
+        Ok(records)
+    }
+}
+
+#[cfg(windows)]
+fn windows_tcp_table_buffer(address_family: u32) -> Result<Vec<usize>, String> {
+    use std::{io, mem::size_of, ptr};
+    use windows_sys::Win32::{
+        Foundation::ERROR_INSUFFICIENT_BUFFER,
+        NetworkManagement::IpHelper::{GetExtendedTcpTable, TCP_TABLE_OWNER_PID_LISTENER},
+    };
+
+    const MAX_BUFFER_ATTEMPTS: usize = 4;
+
+    let mut required_bytes = 0u32;
+    let first_status = unsafe {
+        GetExtendedTcpTable(
+            ptr::null_mut(),
+            &mut required_bytes,
+            0,
+            address_family,
+            TCP_TABLE_OWNER_PID_LISTENER,
+            0,
+        )
+    };
+
+    if first_status != ERROR_INSUFFICIENT_BUFFER && first_status != 0 {
+        return Err(format!(
+            "failed to size Windows TCP listener table for address family {address_family}: {}",
+            io::Error::from_raw_os_error(first_status as i32)
+        ));
+    }
+
+    if required_bytes == 0 {
+        return Ok(Vec::new());
+    }
+
+    for _ in 0..MAX_BUFFER_ATTEMPTS {
+        let words = (required_bytes as usize).div_ceil(size_of::<usize>());
+        let mut buffer = vec![0usize; words];
+        let mut buffer_bytes = (buffer.len() * size_of::<usize>()) as u32;
+
+        let status = unsafe {
+            GetExtendedTcpTable(
+                buffer.as_mut_ptr().cast(),
+                &mut buffer_bytes,
+                0,
+                address_family,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            )
+        };
+
+        if status == 0 {
+            return Ok(buffer);
+        }
+
+        if status != ERROR_INSUFFICIENT_BUFFER {
+            return Err(format!(
+                "failed to enumerate Windows TCP listeners for address family {address_family}: {}",
+                io::Error::from_raw_os_error(status as i32)
+            ));
+        }
+
+        if buffer_bytes <= required_bytes {
+            return Err(format!(
+                "Windows TCP listener table for address family {address_family} requested a larger buffer without increasing its size"
+            ));
+        }
+
+        required_bytes = buffer_bytes;
+    }
+
+    Err(format!(
+        "Windows TCP listener table for address family {address_family} changed size too many times"
+    ))
+}
+
+#[cfg(windows)]
+fn windows_tcp_ipv4_listeners(address_family: u32) -> Result<Vec<TcpEndpointRecord>, String> {
+    use std::{
+        mem::{offset_of, size_of},
+        net::Ipv4Addr,
+        slice,
+    };
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
+    };
+
+    let buffer = windows_tcp_table_buffer(address_family)?;
+    if buffer.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let buffer_bytes = buffer.len() * size_of::<usize>();
+    if buffer_bytes < size_of::<u32>() {
+        return Err("Windows IPv4 TCP listener table was shorter than its entry count".into());
+    }
+
+    let table = buffer.as_ptr().cast::<MIB_TCPTABLE_OWNER_PID>();
+    let entry_count = unsafe { (*table).dwNumEntries as usize };
+    let rows_offset = offset_of!(MIB_TCPTABLE_OWNER_PID, table);
+
+    if buffer_bytes < rows_offset {
+        return Err("Windows IPv4 TCP listener table had an invalid row offset".into());
+    }
+
+    let available_rows = (buffer_bytes - rows_offset) / size_of::<MIB_TCPROW_OWNER_PID>();
+    if entry_count > available_rows {
+        return Err(format!(
+            "Windows IPv4 TCP listener table reported {entry_count} rows but only {available_rows} fit in the returned buffer"
+        ));
+    }
+
+    let rows = unsafe {
+        let rows_ptr = buffer
+            .as_ptr()
+            .cast::<u8>()
+            .add(rows_offset)
+            .cast::<MIB_TCPROW_OWNER_PID>();
+        slice::from_raw_parts(rows_ptr, entry_count)
+    };
+
+    Ok(rows
+        .iter()
+        .map(|row| TcpEndpointRecord {
+            local_address: Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes()).to_string(),
+            local_port: u16::from_be(row.dwLocalPort as u16),
+            owning_pid: (row.dwOwningPid != 0).then_some(row.dwOwningPid),
+        })
+        .collect())
+}
+
+#[cfg(windows)]
+fn windows_tcp_ipv6_listeners(address_family: u32) -> Result<Vec<TcpEndpointRecord>, String> {
+    use std::{
+        mem::{offset_of, size_of},
+        net::Ipv6Addr,
+        slice,
+    };
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
+    };
+
+    let buffer = windows_tcp_table_buffer(address_family)?;
+    if buffer.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let buffer_bytes = buffer.len() * size_of::<usize>();
+    if buffer_bytes < size_of::<u32>() {
+        return Err("Windows IPv6 TCP listener table was shorter than its entry count".into());
+    }
+
+    let table = buffer.as_ptr().cast::<MIB_TCP6TABLE_OWNER_PID>();
+    let entry_count = unsafe { (*table).dwNumEntries as usize };
+    let rows_offset = offset_of!(MIB_TCP6TABLE_OWNER_PID, table);
+
+    if buffer_bytes < rows_offset {
+        return Err("Windows IPv6 TCP listener table had an invalid row offset".into());
+    }
+
+    let available_rows = (buffer_bytes - rows_offset) / size_of::<MIB_TCP6ROW_OWNER_PID>();
+    if entry_count > available_rows {
+        return Err(format!(
+            "Windows IPv6 TCP listener table reported {entry_count} rows but only {available_rows} fit in the returned buffer"
+        ));
+    }
+
+    let rows = unsafe {
+        let rows_ptr = buffer
+            .as_ptr()
+            .cast::<u8>()
+            .add(rows_offset)
+            .cast::<MIB_TCP6ROW_OWNER_PID>();
+        slice::from_raw_parts(rows_ptr, entry_count)
+    };
+
+    Ok(rows
+        .iter()
+        .map(|row| {
+            let address = Ipv6Addr::from(row.ucLocalAddr);
+            let local_address = if row.dwLocalScopeId == 0 {
+                address.to_string()
+            } else {
+                format!("{address}%{}", row.dwLocalScopeId)
+            };
+
+            TcpEndpointRecord {
+                local_address,
+                local_port: u16::from_be(row.dwLocalPort as u16),
+                owning_pid: (row.dwOwningPid != 0).then_some(row.dwOwningPid),
+            }
+        })
+        .collect())
+}
+
 /// Converts listening TCP endpoint observations into pending discoveries.
 pub fn discover_tcp_endpoints_with(
     source: &impl TcpEndpointSource,
