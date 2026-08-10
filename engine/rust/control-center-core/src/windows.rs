@@ -1,4 +1,4 @@
-use crate::{Confidence, Discovery, Evidence, ToolKind};
+use crate::{Confidence, Discovery, Evidence, ObservedState, ToolKind};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
@@ -285,6 +285,69 @@ pub fn discover_uninstall_registry_with(
     report
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessRecord {
+    pub pid: u32,
+    pub name: String,
+    pub executable_path: Option<PathBuf>,
+}
+
+pub trait ProcessSource {
+    fn read_processes(&self) -> Result<Vec<ProcessRecord>, String>;
+}
+
+/// Converts running process observations into pending discoveries.
+///
+/// Executable paths provide the strongest stable identity. When a path is not
+/// available, the normalized process name is used instead.
+pub fn discover_processes_with(source: &impl ProcessSource) -> Result<Vec<Discovery>, String> {
+    let records = source.read_processes()?;
+    let mut seen = HashSet::new();
+    let mut discoveries = Vec::new();
+
+    for record in records {
+        let raw_name = record.name.trim();
+        if raw_name.is_empty() {
+            continue;
+        }
+
+        let name = Path::new(raw_name)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(raw_name);
+
+        let identity = record
+            .executable_path
+            .as_ref()
+            .map(|path| format!("path:{}", windows_path_key(path)))
+            .unwrap_or_else(|| format!("name:{}", raw_name.to_ascii_lowercase()));
+
+        if !seen.insert(identity.clone()) {
+            continue;
+        }
+
+        let mut discovery = Discovery::unknown(
+            name,
+            "windows.process",
+            fingerprint_process_identity(&identity),
+        );
+        discovery.runtime_state = ObservedState::Running;
+        discovery.confidence = if record.executable_path.is_some() {
+            Confidence::High
+        } else {
+            Confidence::Medium
+        };
+        discovery.evidence.push(Evidence {
+            kind: "process".into(),
+            summary: process_evidence_summary(&record),
+        });
+        discoveries.push(discovery);
+    }
+
+    Ok(discoveries)
+}
+
 fn has_executable_extension(path: &Path, extensions: &HashSet<String>) -> bool {
     path.extension()
         .and_then(|value| value.to_str())
@@ -297,6 +360,26 @@ fn fingerprint_windows_path(path: &Path) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn fingerprint_process_identity(identity: &str) -> String {
+    Sha256::digest(identity.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn process_evidence_summary(record: &ProcessRecord) -> String {
+    let mut parts = vec![
+        format!("pid={}", record.pid),
+        format!("name={}", record.name.trim()),
+    ];
+
+    if let Some(path) = record.executable_path.as_ref() {
+        parts.push(format!("executable={}", path.display()));
+    }
+
+    parts.join("; ")
 }
 
 fn fingerprint_registry_record(record: &UninstallRegistryRecord) -> String {
