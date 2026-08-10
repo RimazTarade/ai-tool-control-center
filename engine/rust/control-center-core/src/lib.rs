@@ -2,6 +2,7 @@ pub mod action;
 pub mod model;
 pub mod scan;
 pub mod storage;
+pub mod windows;
 
 pub use action::{ActionError, ActionPreview, ActionSource, CommandSpec};
 pub use model::*;
