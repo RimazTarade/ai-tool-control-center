@@ -118,3 +118,60 @@ fn known_location_discovery_keeps_valid_results_when_one_root_is_invalid() {
     assert_eq!(report.errors.len(), 1);
     assert_eq!(report.errors[0].root, invalid);
 }
+
+#[cfg(windows)]
+#[test]
+fn known_location_discovery_refuses_directory_junction_targets() {
+    use std::process::Command;
+
+    let root = tempdir().expect("temporary root should be created");
+    let programs = root.path().join("Programs");
+    let local = programs.join("Local");
+    let outside = root.path().join("OutsideTarget");
+    let junction = programs.join("Linked");
+
+    fs::create_dir_all(&local).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+
+    fs::write(local.join("VisibleTool.exe"), b"fixture").unwrap();
+    fs::write(outside.join("HiddenBehindJunction.exe"), b"fixture").unwrap();
+
+    let status = Command::new("cmd.exe")
+        .arg("/c")
+        .arg("mklink")
+        .arg("/J")
+        .arg(&junction)
+        .arg(&outside)
+        .status()
+        .expect("junction creation command should run");
+
+    assert!(status.success(), "junction fixture should be created");
+
+    let report = discover_known_locations(
+        &[KnownLocationRoot {
+            kind: KnownLocationKind::Programs,
+            path: programs,
+        }],
+        4,
+    );
+
+    let _ = Command::new("cmd.exe")
+        .arg("/c")
+        .arg("rmdir")
+        .arg(&junction)
+        .status();
+
+    assert!(
+        report
+            .discoveries
+            .iter()
+            .any(|discovery| discovery.suggested_name == "VisibleTool")
+    );
+    assert!(
+        report
+            .discoveries
+            .iter()
+            .all(|discovery| discovery.suggested_name != "HiddenBehindJunction"),
+        "scanner must never traverse a Windows directory junction"
+    );
+}
