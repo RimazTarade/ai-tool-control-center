@@ -462,6 +462,70 @@ pub trait ServiceSource {
     fn read_services(&self) -> Result<Vec<ServiceRecord>, String>;
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TcpEndpointRecord {
+    pub local_address: String,
+    pub local_port: u16,
+    pub owning_pid: Option<u32>,
+}
+
+pub trait TcpEndpointSource {
+    fn read_listening_endpoints(&self) -> Result<Vec<TcpEndpointRecord>, String>;
+}
+
+/// Converts listening TCP endpoint observations into pending discoveries.
+pub fn discover_tcp_endpoints_with(
+    source: &impl TcpEndpointSource,
+) -> Result<Vec<Discovery>, String> {
+    let records = source.read_listening_endpoints()?;
+    let mut seen = HashSet::new();
+    let mut discoveries = Vec::new();
+
+    for record in records {
+        let address = record.local_address.trim();
+        if address.is_empty() || record.local_port == 0 {
+            continue;
+        }
+
+        let normalized_address = address.to_ascii_lowercase();
+        let identity = format!("{normalized_address}:{}", record.local_port);
+        if !seen.insert(identity.clone()) {
+            continue;
+        }
+
+        let suggested_name = if address.contains(':') {
+            format!("[{address}]:{}", record.local_port)
+        } else {
+            format!("{address}:{}", record.local_port)
+        };
+
+        let fingerprint: String = Sha256::digest(format!("tcp:{identity}").as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+
+        let mut discovery =
+            Discovery::unknown(suggested_name, "windows.tcp", fingerprint);
+        discovery.suggested_type = ToolKind::LocalService;
+        discovery.confidence = Confidence::Medium;
+        discovery.runtime_state = ObservedState::Running;
+        discovery.evidence.push(Evidence {
+            kind: "tcp".into(),
+            summary: format!(
+                "address={address} port={} pid={}",
+                record.local_port,
+                record
+                    .owning_pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "unknown".into())
+            ),
+        });
+        discoveries.push(discovery);
+    }
+
+    Ok(discoveries)
+}
+
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WindowsServiceSource;
