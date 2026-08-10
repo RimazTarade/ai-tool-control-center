@@ -35,6 +35,29 @@ pub fn dedupe_windows_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<Pat
     deduped
 }
 
+/// Parses a semicolon-separated Windows PATH-style value into unique entries.
+///
+/// Surrounding whitespace is ignored, a single pair of surrounding quotes is
+/// removed, and empty entries are discarded before Windows-style
+/// case-insensitive deduplication.
+pub fn parse_windows_path_entries(raw: &str) -> Vec<PathBuf> {
+    let entries = raw.split(';').filter_map(|entry| {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let unquoted = trimmed
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .unwrap_or(trimmed);
+
+        Some(PathBuf::from(unquoted.trim()))
+    });
+
+    dedupe_windows_paths(entries)
+}
+
 fn is_drive_root(path: &str) -> bool {
     let bytes = path.as_bytes();
     bytes.len() == 3 && bytes[1] == b':' && bytes[2] == b'\\'
