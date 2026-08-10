@@ -444,6 +444,101 @@ fn windows_process_executable_path(pid: u32) -> Option<PathBuf> {
     )))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceRuntimeState {
+    Running,
+    Stopped,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceRecord {
+    pub service_name: String,
+    pub display_name: Option<String>,
+    pub runtime_state: ServiceRuntimeState,
+}
+
+pub trait ServiceSource {
+    fn read_services(&self) -> Result<Vec<ServiceRecord>, String>;
+}
+
+/// Converts Windows service observations into pending discoveries.
+pub fn discover_services_with(source: &impl ServiceSource) -> Result<Vec<Discovery>, String> {
+    let records = source.read_services()?;
+    let mut seen = HashSet::new();
+    let mut discoveries = Vec::new();
+
+    for record in records {
+        let service_name = record.service_name.trim();
+        if service_name.is_empty() {
+            continue;
+        }
+
+        let identity = service_name.to_ascii_lowercase();
+        if !seen.insert(identity.clone()) {
+            continue;
+        }
+
+        let suggested_name = record
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(service_name);
+
+        let mut discovery = Discovery::unknown(
+            suggested_name,
+            "windows.service",
+            fingerprint_service_identity(&identity),
+        );
+        discovery.suggested_type = ToolKind::WindowsService;
+        discovery.confidence = Confidence::High;
+        discovery.registration_state = ObservedState::Registered;
+        discovery.runtime_state = match record.runtime_state {
+            ServiceRuntimeState::Running => ObservedState::Running,
+            ServiceRuntimeState::Stopped => ObservedState::Stopped,
+            ServiceRuntimeState::Unknown => ObservedState::Unknown,
+        };
+        discovery.evidence.push(Evidence {
+            kind: "service".into(),
+            summary: service_evidence_summary(&record),
+        });
+        discoveries.push(discovery);
+    }
+
+    Ok(discoveries)
+}
+
+fn fingerprint_service_identity(identity: &str) -> String {
+    Sha256::digest(format!("service:{identity}").as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn service_evidence_summary(record: &ServiceRecord) -> String {
+    let state = match record.runtime_state {
+        ServiceRuntimeState::Running => "running",
+        ServiceRuntimeState::Stopped => "stopped",
+        ServiceRuntimeState::Unknown => "unknown",
+    };
+    let mut parts = vec![
+        format!("service_name={}", record.service_name.trim()),
+        format!("state={state}"),
+    ];
+
+    if let Some(display_name) = record
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        parts.push(format!("display_name={display_name}"));
+    }
+
+    parts.join("; ")
+}
+
 fn has_executable_extension(path: &Path, extensions: &HashSet<String>) -> bool {
     path.extension()
         .and_then(|value| value.to_str())
