@@ -1,5 +1,8 @@
+use crate::{Confidence, Discovery, Evidence, ToolKind};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -56,6 +59,70 @@ pub fn parse_windows_path_entries(raw: &str) -> Vec<PathBuf> {
     });
 
     dedupe_windows_paths(entries)
+}
+
+/// Observes executable files directly present in Windows PATH directories.
+///
+/// This is an observation scanner only. It does not execute discovered files
+/// and every result remains pending for the mandatory review queue.
+pub fn discover_path_executables(path_value: &str, pathext_value: &str) -> Vec<Discovery> {
+    let executable_extensions: HashSet<String> = pathext_value
+        .split(';')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_start_matches('.').to_ascii_lowercase())
+        .collect();
+
+    if executable_extensions.is_empty() {
+        return Vec::new();
+    }
+
+    let mut discoveries = Vec::new();
+    for directory in parse_windows_path_entries(path_value) {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if !path.is_file() || !has_executable_extension(&path, &executable_extensions) {
+                continue;
+            }
+
+            let Some(name) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+
+            let mut discovery = Discovery::unknown(
+                name,
+                "windows.path",
+                fingerprint_windows_path(&path),
+            );
+            discovery.suggested_type = ToolKind::Cli;
+            discovery.confidence = Confidence::Medium;
+            discovery.evidence.push(Evidence {
+                kind: "path".into(),
+                summary: path.display().to_string(),
+            });
+            discoveries.push(discovery);
+        }
+    }
+
+    discoveries
+}
+
+fn has_executable_extension(path: &Path, extensions: &HashSet<String>) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|extension| extensions.contains(&extension))
+}
+
+fn fingerprint_windows_path(path: &Path) -> String {
+    Sha256::digest(windows_path_key(path).as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn is_drive_root(path: &str) -> bool {
