@@ -141,6 +141,79 @@ pub trait UninstallRegistrySource {
     ) -> Result<Vec<UninstallRegistryRecord>, String>;
 }
 
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WindowsUninstallRegistrySource;
+
+#[cfg(windows)]
+impl UninstallRegistrySource for WindowsUninstallRegistrySource {
+    fn read_uninstall_entries(
+        &self,
+        hive: RegistryHive,
+        view: RegistryView,
+    ) -> Result<Vec<UninstallRegistryRecord>, String> {
+        use std::io::ErrorKind;
+        use winreg::{
+            enums::{KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY},
+            HKCU, HKLM,
+        };
+
+        const UNINSTALL_PATH: &str =
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+
+        let root = match hive {
+            RegistryHive::CurrentUser => &HKCU,
+            RegistryHive::LocalMachine => &HKLM,
+        };
+        let view_flag = match view {
+            RegistryView::Registry32 => KEY_WOW64_32KEY,
+            RegistryView::Registry64 => KEY_WOW64_64KEY,
+        };
+        let permissions = KEY_READ | view_flag;
+
+        let uninstall = match root.open_subkey_with_flags(UNINSTALL_PATH, permissions) {
+            Ok(key) => key,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(format!(
+                    "failed to open {hive:?} {view:?} uninstall key: {error}"
+                ));
+            }
+        };
+
+        let mut records = Vec::new();
+        for key_name in uninstall.enum_keys().filter_map(Result::ok) {
+            let Ok(app_key) = uninstall.open_subkey_with_flags(&key_name, permissions) else {
+                continue;
+            };
+
+            let display_name = app_key.get_value::<String, _>("DisplayName").ok();
+            let install_location = app_key
+                .get_value::<String, _>("InstallLocation")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from);
+            let publisher = app_key
+                .get_value::<String, _>("Publisher")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+
+            records.push(UninstallRegistryRecord {
+                hive,
+                view,
+                key_name,
+                display_name,
+                install_location,
+                publisher,
+            });
+        }
+
+        Ok(records)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UninstallRegistryError {
     pub hive: RegistryHive,
