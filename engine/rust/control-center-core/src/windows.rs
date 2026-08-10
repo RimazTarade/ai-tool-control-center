@@ -61,6 +61,156 @@ pub fn parse_windows_path_entries(raw: &str) -> Vec<PathBuf> {
     dedupe_windows_paths(entries)
 }
 
+const KNOWN_LOCATION_EXCLUDED: &[&str] = &[
+    ".git",
+    "node_modules",
+    ".venv",
+    "venv",
+    "target",
+    "Cache",
+    "Caches",
+    ".cache",
+    "Code Cache",
+    "GPUCache",
+    "Temp",
+    "tmp",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KnownLocationKind {
+    Programs,
+    Launcher,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KnownLocationRoot {
+    pub kind: KnownLocationKind,
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KnownLocationError {
+    pub root: PathBuf,
+    pub message: String,
+}
+
+#[derive(Debug, Default)]
+pub struct KnownLocationReport {
+    pub discoveries: Vec<Discovery>,
+    pub errors: Vec<KnownLocationError>,
+}
+
+/// Observes executable and launcher files under explicitly supplied Windows roots.
+///
+/// Traversal is depth-bounded, does not follow links, skips common high-noise
+/// directories, and reports a root failure without discarding discoveries from
+/// other roots.
+pub fn discover_known_locations(
+    roots: &[KnownLocationRoot],
+    max_depth: usize,
+) -> KnownLocationReport {
+    let mut report = KnownLocationReport::default();
+    let mut seen = HashSet::new();
+
+    for root in roots {
+        if !root.path.exists() {
+            continue;
+        }
+
+        if !root.path.is_dir() {
+            report.errors.push(KnownLocationError {
+                root: root.path.clone(),
+                message: "known location root is not a directory".into(),
+            });
+            continue;
+        }
+
+        let entries = walkdir::WalkDir::new(&root.path)
+            .follow_links(false)
+            .max_depth(max_depth)
+            .into_iter()
+            .filter_entry(|entry| {
+                entry.depth() == 0
+                    || !KNOWN_LOCATION_EXCLUDED.iter().any(|excluded| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .eq_ignore_ascii_case(excluded)
+                    })
+            });
+
+        for entry_result in entries {
+            let entry = match entry_result {
+                Ok(entry) => entry,
+                Err(error) => {
+                    report.errors.push(KnownLocationError {
+                        root: root.path.clone(),
+                        message: format!("failed to read known location: {error}"),
+                    });
+                    continue;
+                }
+            };
+
+            if !entry.file_type().is_file() {
+                continue;
+            }
+
+            let path = entry.path();
+            let Some(suggested_type) = known_location_tool_kind(path) else {
+                continue;
+            };
+            let Some(name) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+
+            let identity = windows_path_key(path);
+            if !seen.insert(identity) {
+                continue;
+            }
+
+            let mut discovery = Discovery::unknown(
+                name,
+                "windows.known_location",
+                fingerprint_windows_path(path),
+            );
+            discovery.suggested_type = suggested_type;
+            discovery.confidence = Confidence::Medium;
+            discovery.evidence.push(Evidence {
+                kind: "path".into(),
+                summary: format!(
+                    "location_kind={}; path={}",
+                    known_location_kind_key(root.kind),
+                    path.display()
+                ),
+            });
+            report.discoveries.push(discovery);
+        }
+    }
+
+    report
+}
+
+fn known_location_tool_kind(path: &Path) -> Option<ToolKind> {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("exe") => Some(ToolKind::DesktopApplication),
+        Some("cmd" | "bat" | "ps1") => Some(ToolKind::Cli),
+        Some("lnk") => Some(ToolKind::Launcher),
+        _ => None,
+    }
+}
+
+fn known_location_kind_key(kind: KnownLocationKind) -> &'static str {
+    match kind {
+        KnownLocationKind::Programs => "programs",
+        KnownLocationKind::Launcher => "launcher",
+    }
+}
+
 /// Observes executable files directly present in Windows PATH directories.
 ///
 /// This is an observation scanner only. It does not execute discovered files
