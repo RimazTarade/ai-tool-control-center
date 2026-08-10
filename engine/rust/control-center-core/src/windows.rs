@@ -462,6 +462,146 @@ pub trait ServiceSource {
     fn read_services(&self) -> Result<Vec<ServiceRecord>, String>;
 }
 
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WindowsServiceSource;
+
+#[cfg(windows)]
+impl ServiceSource for WindowsServiceSource {
+    fn read_services(&self) -> Result<Vec<ServiceRecord>, String> {
+        use std::{io, mem::size_of, ptr, slice};
+        use windows_sys::Win32::{
+            Foundation::ERROR_MORE_DATA,
+            System::Services::{
+                CloseServiceHandle, ENUM_SERVICE_STATUS_PROCESSW, EnumServicesStatusExW,
+                OpenSCManagerW, SC_ENUM_PROCESS_INFO, SC_MANAGER_ENUMERATE_SERVICE,
+                SERVICE_RUNNING, SERVICE_STATE_ALL, SERVICE_STOPPED, SERVICE_WIN32,
+            },
+        };
+
+        const ENUM_BUFFER_BYTES: usize = 256 * 1024;
+        const MAX_ENUMERATION_CHUNKS: usize = 64;
+
+        let manager =
+            unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_ENUMERATE_SERVICE) };
+        if manager.is_null() {
+            return Err(format!(
+                "failed to open Windows service control manager: {}",
+                io::Error::last_os_error()
+            ));
+        }
+
+        let result = (|| {
+            let words = ENUM_BUFFER_BYTES.div_ceil(size_of::<usize>());
+            let mut resume_handle = 0u32;
+            let mut records = Vec::new();
+
+            for _ in 0..MAX_ENUMERATION_CHUNKS {
+                // Use usize storage so the Win32 structures in the byte buffer
+                // have pointer-width alignment on both 32-bit and 64-bit Windows.
+                let mut buffer = vec![0usize; words];
+                let mut bytes_needed = 0u32;
+                let mut services_returned = 0u32;
+
+                let success = unsafe {
+                    EnumServicesStatusExW(
+                        manager,
+                        SC_ENUM_PROCESS_INFO,
+                        SERVICE_WIN32,
+                        SERVICE_STATE_ALL,
+                        buffer.as_mut_ptr().cast::<u8>(),
+                        ENUM_BUFFER_BYTES as u32,
+                        &mut bytes_needed,
+                        &mut services_returned,
+                        &mut resume_handle,
+                        ptr::null(),
+                    )
+                };
+
+                if services_returned > 0 {
+                    let entries = unsafe {
+                        slice::from_raw_parts(
+                            buffer.as_ptr().cast::<ENUM_SERVICE_STATUS_PROCESSW>(),
+                            services_returned as usize,
+                        )
+                    };
+
+                    for entry in entries {
+                        let Some(service_name) =
+                            (unsafe { windows_service_wide_string(entry.lpServiceName) })
+                        else {
+                            continue;
+                        };
+                        if service_name.trim().is_empty() {
+                            continue;
+                        }
+
+                        let display_name =
+                            unsafe { windows_service_wide_string(entry.lpDisplayName) }
+                                .map(|value| value.trim().to_string())
+                                .filter(|value| !value.is_empty());
+
+                        let runtime_state = match entry.ServiceStatusProcess.dwCurrentState {
+                            SERVICE_RUNNING => ServiceRuntimeState::Running,
+                            SERVICE_STOPPED => ServiceRuntimeState::Stopped,
+                            _ => ServiceRuntimeState::Unknown,
+                        };
+
+                        records.push(ServiceRecord {
+                            service_name,
+                            display_name,
+                            runtime_state,
+                        });
+                    }
+                }
+
+                if success != 0 {
+                    return Ok(records);
+                }
+
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(ERROR_MORE_DATA as i32) {
+                    return Err(format!("failed to enumerate Windows services: {error}"));
+                }
+
+                if services_returned == 0 {
+                    return Err(format!(
+                        "Windows service enumeration made no progress ({} bytes still needed)",
+                        bytes_needed
+                    ));
+                }
+            }
+
+            Err(format!(
+                "Windows service enumeration exceeded {MAX_ENUMERATION_CHUNKS} chunks"
+            ))
+        })();
+
+        let _ = unsafe { CloseServiceHandle(manager) };
+        result
+    }
+}
+
+#[cfg(windows)]
+unsafe fn windows_service_wide_string(value: *const u16) -> Option<String> {
+    const MAX_SERVICE_STRING_UNITS: usize = 1024;
+
+    if value.is_null() {
+        return None;
+    }
+
+    let mut length = 0usize;
+    while length < MAX_SERVICE_STRING_UNITS {
+        if unsafe { *value.add(length) } == 0 {
+            let units = unsafe { std::slice::from_raw_parts(value, length) };
+            return Some(String::from_utf16_lossy(units));
+        }
+        length += 1;
+    }
+
+    None
+}
+
 /// Converts Windows service observations into pending discoveries.
 pub fn discover_services_with(source: &impl ServiceSource) -> Result<Vec<Discovery>, String> {
     let records = source.read_services()?;
