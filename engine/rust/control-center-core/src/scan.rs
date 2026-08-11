@@ -82,12 +82,95 @@ impl ScanSettlement {
         }
     }
 
-    fn mark_settled(&mut self, scanner_id: &str) {
-        self.pending.remove(scanner_id);
+    fn mark_settled(&mut self, scanner_id: &str) -> bool {
+        self.pending.remove(scanner_id)
     }
 
     fn is_terminal(&self) -> bool {
         self.pending.is_empty()
+    }
+}
+
+#[derive(Debug)]
+enum ScannerTerminal {
+    Completed { visited: u64, discovered: u64 },
+    Cancelled { visited: u64, discovered: u64 },
+    Failed { code: String, message: String },
+}
+
+#[derive(Debug)]
+struct ScanCoordinatorState {
+    settlement: ScanSettlement,
+    visited: u64,
+    discovered: u64,
+    cancelled: bool,
+}
+
+impl ScanCoordinatorState {
+    fn new<I, S>(scanner_ids: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            settlement: ScanSettlement::new(scanner_ids),
+            visited: 0,
+            discovered: 0,
+            cancelled: false,
+        }
+    }
+
+    fn settle(&mut self, scanner_id: &str, terminal: ScannerTerminal) -> Vec<ScanEvent> {
+        if !self.settlement.mark_settled(scanner_id) {
+            return Vec::new();
+        }
+
+        let mut events = Vec::new();
+
+        match terminal {
+            ScannerTerminal::Completed {
+                visited,
+                discovered,
+            } => {
+                self.visited = self.visited.saturating_add(visited);
+                self.discovered = self.discovered.saturating_add(discovered);
+            }
+            ScannerTerminal::Cancelled {
+                visited,
+                discovered,
+            } => {
+                self.visited = self.visited.saturating_add(visited);
+                self.discovered = self.discovered.saturating_add(discovered);
+                self.cancelled = true;
+            }
+            ScannerTerminal::Failed { code, message } => {
+                events.push(ScanEvent::ScannerFailed {
+                    scanner_id: scanner_id.to_string(),
+                    code,
+                    message,
+                });
+            }
+        }
+
+        if self.is_terminal() {
+            events.push(if self.cancelled {
+                ScanEvent::Cancelled {
+                    visited: self.visited,
+                    discovered: self.discovered,
+                }
+            } else {
+                ScanEvent::Completed {
+                    visited: self.visited,
+                    discovered: self.discovered,
+                }
+            });
+        }
+
+        events
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.settlement.is_terminal()
     }
 }
 
@@ -99,20 +182,19 @@ pub async fn quick_scan(
     const SCANNER_ID: &str = "filesystem.quick";
 
     let terminal_events = events.clone();
-    let mut settlement = ScanSettlement::new([SCANNER_ID]);
+    let mut coordinator = ScanCoordinatorState::new([SCANNER_ID]);
     let task = tokio::task::spawn_blocking(move || scan_blocking(roots, events, cancellation));
 
-    let terminal_event = match task.await {
-        Ok(event) => event,
-        Err(_) => ScanEvent::Failed {
+    let terminal = match task.await {
+        Ok(terminal) => terminal,
+        Err(_) => ScannerTerminal::Failed {
             code: "scanner_failed".into(),
             message: "The filesystem scanner stopped unexpectedly".into(),
         },
     };
 
-    settlement.mark_settled(SCANNER_ID);
-    if settlement.is_terminal() {
-        let _ = terminal_events.send(terminal_event).await;
+    for event in coordinator.settle(SCANNER_ID, terminal) {
+        let _ = terminal_events.send(event).await;
     }
 }
 
@@ -120,12 +202,12 @@ fn scan_blocking(
     roots: Vec<PathBuf>,
     events: mpsc::Sender<ScanEvent>,
     cancellation: CancellationToken,
-) -> ScanEvent {
+) -> ScannerTerminal {
     let mut visited = 0;
     let mut discovered = 0;
     for root in roots {
         if cancellation.is_cancelled() {
-            return ScanEvent::Cancelled {
+            return ScannerTerminal::Cancelled {
                 visited,
                 discovered,
             };
@@ -141,7 +223,7 @@ fn scan_blocking(
             .filter_map(Result::ok)
         {
             if cancellation.is_cancelled() {
-                return ScanEvent::Cancelled {
+                return ScannerTerminal::Cancelled {
                     visited,
                     discovered,
                 };
@@ -166,7 +248,7 @@ fn scan_blocking(
             }
         }
     }
-    ScanEvent::Completed {
+    ScannerTerminal::Completed {
         visited,
         discovered,
     }
@@ -253,6 +335,47 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("filesystem.quick")
         );
+    }
+
+    #[test]
+    fn scanner_failure_is_isolated_until_other_scanners_settle() {
+        let mut coordinator = ScanCoordinatorState::new(["windows.process", "windows.path"]);
+
+        let failure_events = coordinator.settle(
+            "windows.process",
+            ScannerTerminal::Failed {
+                code: "access_denied".into(),
+                message: "partial failure".into(),
+            },
+        );
+
+        assert!(matches!(
+            failure_events.as_slice(),
+            [ScanEvent::ScannerFailed {
+                scanner_id,
+                code,
+                ..
+            }] if scanner_id == "windows.process" && code == "access_denied"
+        ));
+        assert!(!coordinator.is_terminal());
+
+        let completion_events = coordinator.settle(
+            "windows.path",
+            ScannerTerminal::Completed {
+                visited: 3,
+                discovered: 1,
+            },
+        );
+
+        assert!(matches!(
+            completion_events.as_slice(),
+            [ScanEvent::Completed {
+                visited: 3,
+                discovered: 1,
+                ..
+            }]
+        ));
+        assert!(coordinator.is_terminal());
     }
 
     #[test]
