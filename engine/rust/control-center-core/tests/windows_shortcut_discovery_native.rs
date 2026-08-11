@@ -55,10 +55,11 @@ fn native_shortcut_discovery_includes_resolved_target_evidence() {
         .find(|evidence| evidence.kind == "shortcut")
         .expect("launcher discovery should include resolved shortcut evidence");
 
+    let expected_target = windows_path_key(&target);
+
     assert!(
-        shortcut_evidence
-            .summary
-            .contains(&windows_path_key(&target)),
-        "shortcut evidence should contain the resolved target path"
+    shortcut_evidence.summary.contains(&expected_target),
+    "shortcut evidence mismatch\nexpected target: {expected_target}\nactual evidence: {}",
+    shortcut_evidence.summary
     );
 }
