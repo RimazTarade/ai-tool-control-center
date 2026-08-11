@@ -41,12 +41,29 @@ const SIGNALS: &[&str] = &[
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ScanEvent {
-    Progress { visited: u64 },
-    Discovery { discovery: Discovery },
-    ScannerFailed { code: String, message: String },
-    Completed { visited: u64, discovered: u64 },
-    Cancelled { visited: u64, discovered: u64 },
-    Failed { code: String, message: String },
+    Progress {
+        visited: u64,
+    },
+    Discovery {
+        discovery: Discovery,
+    },
+    ScannerFailed {
+        scanner_id: String,
+        code: String,
+        message: String,
+    },
+    Completed {
+        visited: u64,
+        discovered: u64,
+    },
+    Cancelled {
+        visited: u64,
+        discovered: u64,
+    },
+    Failed {
+        code: String,
+        message: String,
+    },
 }
 
 pub async fn quick_scan(
@@ -186,6 +203,25 @@ mod tests {
             }
         }
         assert!(found);
+    }
+    #[test]
+    fn scanner_failed_events_preserve_scanner_id() {
+        let encoded = r#"{
+        "kind": "scanner_failed",
+        "scanner_id": "filesystem.quick",
+        "code": "access_denied",
+        "message": "partial failure"
+    }"#;
+
+        let event: ScanEvent = serde_json::from_str(encoded).unwrap();
+        let round_trip = serde_json::to_value(event).unwrap();
+
+        assert_eq!(
+            round_trip
+                .get("scanner_id")
+                .and_then(|value| value.as_str()),
+            Some("filesystem.quick")
+        );
     }
 
     #[tokio::test]

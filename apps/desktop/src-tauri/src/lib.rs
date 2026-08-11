@@ -89,6 +89,7 @@ async fn start_quick_scan(
                         event
                     } else {
                         ScanEvent::ScannerFailed {
+                            scanner_id: discovery.source_scanner.clone(),
                             code: "storage_integrity".into(),
                             message: "A discovery could not be saved".into(),
                         }
