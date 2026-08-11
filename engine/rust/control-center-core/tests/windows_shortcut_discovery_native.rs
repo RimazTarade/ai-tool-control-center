@@ -58,8 +58,8 @@ fn native_shortcut_discovery_includes_resolved_target_evidence() {
     let expected_target = windows_path_key(&target);
 
     assert!(
-    shortcut_evidence.summary.contains(&expected_target),
-    "shortcut evidence mismatch\nexpected target: {expected_target}\nactual evidence: {}",
-    shortcut_evidence.summary
+        shortcut_evidence.summary.contains(&expected_target),
+        "shortcut evidence mismatch\nexpected target: {expected_target}\nactual evidence: {}",
+        shortcut_evidence.summary
     );
 }
