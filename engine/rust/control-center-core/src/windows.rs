@@ -100,6 +100,102 @@ pub struct KnownLocationReport {
     pub errors: Vec<KnownLocationError>,
 }
 
+#[cfg(windows)]
+#[derive(Debug, Default)]
+pub struct WindowsKnownLocationRootReport {
+    pub roots: Vec<KnownLocationRoot>,
+    pub errors: Vec<String>,
+}
+
+#[cfg(windows)]
+pub fn windows_known_location_roots() -> WindowsKnownLocationRootReport {
+    use windows_sys::Win32::UI::Shell::{
+        FOLDERID_CommonPrograms, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86,
+        FOLDERID_Programs,
+    };
+
+    let locations = [
+        (
+            &FOLDERID_ProgramFiles,
+            KnownLocationKind::Programs,
+            "Program Files",
+        ),
+        (
+            &FOLDERID_ProgramFilesX86,
+            KnownLocationKind::Programs,
+            "Program Files (x86)",
+        ),
+        (
+            &FOLDERID_Programs,
+            KnownLocationKind::Launcher,
+            "user Start Menu programs",
+        ),
+        (
+            &FOLDERID_CommonPrograms,
+            KnownLocationKind::Launcher,
+            "common Start Menu programs",
+        ),
+    ];
+
+    let mut report = WindowsKnownLocationRootReport::default();
+    let mut seen = HashSet::new();
+
+    for (folder_id, kind, label) in locations {
+        match windows_known_folder_path(folder_id) {
+            Ok(path) if path.is_dir() => {
+                if seen.insert(windows_path_key(&path)) {
+                    report.roots.push(KnownLocationRoot { kind, path });
+                }
+            }
+            Ok(path) => report.errors.push(format!(
+                "{label}: known-folder path is not an existing directory: {}",
+                path.display()
+            )),
+            Err(message) => report.errors.push(format!("{label}: {message}")),
+        }
+    }
+
+    report
+}
+
+#[cfg(windows)]
+fn windows_known_folder_path(folder_id: &windows_sys::core::GUID) -> Result<PathBuf, String> {
+    use windows_sys::Win32::{
+        System::Com::CoTaskMemFree,
+        UI::Shell::SHGetKnownFolderPath,
+    };
+
+    let mut raw_path = std::ptr::null_mut();
+    let result =
+        unsafe { SHGetKnownFolderPath(folder_id, 0, std::ptr::null_mut(), &mut raw_path) };
+
+    if result < 0 {
+        return Err(format!(
+            "SHGetKnownFolderPath failed with HRESULT 0x{:08X}",
+            result as u32
+        ));
+    }
+    if raw_path.is_null() {
+        return Err("SHGetKnownFolderPath returned a null path".into());
+    }
+
+    let mut len = 0usize;
+    while unsafe { *raw_path.add(len) } != 0 {
+        len += 1;
+        if len >= 32_768 {
+            unsafe { CoTaskMemFree(raw_path.cast::<core::ffi::c_void>()) };
+            return Err("known-folder path exceeded the Windows UTF-16 path bound".into());
+        }
+    }
+
+    let path = PathBuf::from(String::from_utf16_lossy(unsafe {
+        std::slice::from_raw_parts(raw_path, len)
+    }));
+    unsafe { CoTaskMemFree(raw_path.cast::<core::ffi::c_void>()) };
+
+    Ok(path)
+}
+
 /// Observes executable and launcher files under explicitly supplied Windows roots.
 ///
 /// Traversal is depth-bounded, does not follow links, skips common high-noise
