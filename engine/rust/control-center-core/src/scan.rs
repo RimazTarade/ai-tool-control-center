@@ -66,20 +66,53 @@ pub enum ScanEvent {
     },
 }
 
+#[derive(Debug)]
+struct ScanSettlement {
+    pending: std::collections::HashSet<String>,
+}
+
+impl ScanSettlement {
+    fn new<I, S>(scanner_ids: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            pending: scanner_ids.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    fn mark_settled(&mut self, scanner_id: &str) {
+        self.pending.remove(scanner_id);
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
 pub async fn quick_scan(
     roots: Vec<PathBuf>,
     events: mpsc::Sender<ScanEvent>,
     cancellation: CancellationToken,
 ) {
-    let failure_events = events.clone();
+    const SCANNER_ID: &str = "filesystem.quick";
+
+    let terminal_events = events.clone();
+    let mut settlement = ScanSettlement::new([SCANNER_ID]);
     let task = tokio::task::spawn_blocking(move || scan_blocking(roots, events, cancellation));
-    if task.await.is_err() {
-        let _ = failure_events
-            .send(ScanEvent::Failed {
-                code: "scanner_failed".into(),
-                message: "The filesystem scanner stopped unexpectedly".into(),
-            })
-            .await;
+
+    let terminal_event = match task.await {
+        Ok(event) => event,
+        Err(_) => ScanEvent::Failed {
+            code: "scanner_failed".into(),
+            message: "The filesystem scanner stopped unexpectedly".into(),
+        },
+    };
+
+    settlement.mark_settled(SCANNER_ID);
+    if settlement.is_terminal() {
+        let _ = terminal_events.send(terminal_event).await;
     }
 }
 
@@ -87,16 +120,15 @@ fn scan_blocking(
     roots: Vec<PathBuf>,
     events: mpsc::Sender<ScanEvent>,
     cancellation: CancellationToken,
-) {
+) -> ScanEvent {
     let mut visited = 0;
     let mut discovered = 0;
     for root in roots {
         if cancellation.is_cancelled() {
-            let _ = events.blocking_send(ScanEvent::Cancelled {
+            return ScanEvent::Cancelled {
                 visited,
                 discovered,
-            });
-            return;
+            };
         }
         if !root.is_absolute() || !root.exists() {
             continue;
@@ -109,11 +141,10 @@ fn scan_blocking(
             .filter_map(Result::ok)
         {
             if cancellation.is_cancelled() {
-                let _ = events.blocking_send(ScanEvent::Cancelled {
+                return ScanEvent::Cancelled {
                     visited,
                     discovered,
-                });
-                return;
+                };
             }
             visited += 1;
             if visited % 64 == 0 {
@@ -135,10 +166,10 @@ fn scan_blocking(
             }
         }
     }
-    let _ = events.blocking_send(ScanEvent::Completed {
+    ScanEvent::Completed {
         visited,
         discovered,
-    });
+    }
 }
 
 fn is_allowed(entry: &DirEntry) -> bool {
@@ -222,6 +253,27 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("filesystem.quick")
         );
+    }
+
+    #[test]
+    fn scan_settlement_waits_for_every_selected_scanner() {
+        let mut settlement =
+            ScanSettlement::new(["windows.path", "windows.process", "windows.services"]);
+
+        assert!(!settlement.is_terminal());
+
+        settlement.mark_settled("windows.path");
+        assert!(!settlement.is_terminal());
+
+        settlement.mark_settled("windows.path");
+        settlement.mark_settled("unknown");
+        assert!(!settlement.is_terminal());
+
+        settlement.mark_settled("windows.process");
+        assert!(!settlement.is_terminal());
+
+        settlement.mark_settled("windows.services");
+        assert!(settlement.is_terminal());
     }
 
     #[tokio::test]
