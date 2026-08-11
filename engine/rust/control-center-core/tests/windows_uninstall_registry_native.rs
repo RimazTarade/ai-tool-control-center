@@ -21,9 +21,7 @@ fn native_uninstall_registry_source_reads_each_requested_registry_view() {
             });
 
         assert!(records.iter().all(|record| {
-            record.hive == hive
-                && record.view == view
-                && !record.key_name.trim().is_empty()
+            record.hive == hive && record.view == view && !record.key_name.trim().is_empty()
         }));
     }
 }

@@ -5,14 +5,8 @@ use std::path::PathBuf;
 
 #[test]
 fn windows_path_identity_is_case_insensitive_and_separator_stable() {
-    assert_eq!(
-        windows_path_key(&PathBuf::from(r"C:\Tools\\")),
-        r"c:\tools"
-    );
-    assert_eq!(
-        windows_path_key(&PathBuf::from("c:/tools")),
-        r"c:\tools"
-    );
+    assert_eq!(windows_path_key(&PathBuf::from(r"C:\Tools\\")), r"c:\tools");
+    assert_eq!(windows_path_key(&PathBuf::from("c:/tools")), r"c:\tools");
 }
 
 #[test]

@@ -1,8 +1,6 @@
 #![cfg(windows)]
 
-use control_center_core::windows::{
-    ServiceRuntimeState, ServiceSource, WindowsServiceSource,
-};
+use control_center_core::windows::{ServiceRuntimeState, ServiceSource, WindowsServiceSource};
 
 #[test]
 fn native_service_source_enumerates_windows_services() {

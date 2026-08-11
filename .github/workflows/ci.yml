@@ -26,6 +26,8 @@ jobs:
       - name: Install pinned tools
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $ErrorActionPreference = "Stop"
           corepack enable
           corepack prepare pnpm@10.33.2 --activate
           rustup toolchain install 1.96.0 --profile minimal --component rustfmt,clippy
@@ -35,12 +37,16 @@ jobs:
       - name: Rust
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $ErrorActionPreference = "Stop"
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo test --workspace --locked
       - name: Python
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $ErrorActionPreference = "Stop"
           uv sync --project engine/python --frozen
           uv run --project engine/python ruff check engine/python
           uv run --project engine/python mypy engine/python/src
@@ -49,6 +55,8 @@ jobs:
       - name: Frontend
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $ErrorActionPreference = "Stop"
           pnpm install --frozen-lockfile
           pnpm lint
           pnpm test

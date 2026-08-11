@@ -39,16 +39,16 @@ impl UninstallRegistrySource for FixtureRegistry {
                     publisher: None,
                 },
             ]),
-            (RegistryHive::LocalMachine, RegistryView::Registry64) => Ok(vec![
-                UninstallRegistryRecord {
+            (RegistryHive::LocalMachine, RegistryView::Registry64) => {
+                Ok(vec![UninstallRegistryRecord {
                     hive,
                     view,
                     key_name: "{DOCKER-FIXTURE}".into(),
                     display_name: Some("Docker Desktop".into()),
                     install_location: Some(PathBuf::from(r"C:\Program Files\Docker\Docker")),
                     publisher: Some("Docker Inc.".into()),
-                },
-            ]),
+                }])
+            }
             (RegistryHive::LocalMachine, RegistryView::Registry32) => {
                 Err("access denied fixture".into())
             }

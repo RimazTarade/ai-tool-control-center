@@ -2,9 +2,7 @@ use std::fs;
 
 use control_center_core::{
     Confidence, ToolKind,
-    windows::{
-        KnownLocationKind, KnownLocationRoot, discover_known_locations,
-    },
+    windows::{KnownLocationKind, KnownLocationRoot, discover_known_locations},
 };
 use tempfile::tempdir;
 
@@ -27,6 +25,25 @@ fn known_location_discovery_is_bounded_excludes_noise_and_classifies_launchers()
     fs::write(vendor.join("README.txt"), b"fixture").unwrap();
     fs::write(cache.join("IgnoredTool.exe"), b"fixture").unwrap();
     fs::write(too_deep.join("TooDeep.exe"), b"fixture").unwrap();
+    #[cfg(windows)]
+    {
+        let shortcut_target = vendor.join("ExampleTool.exe");
+        let shortcut_path = launchers.join("Example Launcher.lnk");
+        let status = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$shell = New-Object -ComObject WScript.Shell; $link = $shell.CreateShortcut($env:ATCC_SHORTCUT); $link.TargetPath = $env:ATCC_TARGET; $link.Save()",
+            ])
+            .env("ATCC_SHORTCUT", &shortcut_path)
+            .env("ATCC_TARGET", &shortcut_target)
+            .status()
+            .expect("PowerShell shortcut fixture command should run");
+        assert!(status.success(), "shortcut fixture should be created");
+    }
+
+    #[cfg(not(windows))]
     fs::write(launchers.join("Example Launcher.lnk"), b"fixture").unwrap();
 
     let roots = vec![

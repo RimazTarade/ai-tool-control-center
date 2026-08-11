@@ -1,8 +1,6 @@
 #![cfg(windows)]
 
-use control_center_core::windows::{
-    KnownLocationKind, windows_known_location_roots,
-};
+use control_center_core::windows::{KnownLocationKind, windows_known_location_roots};
 
 #[test]
 fn native_known_location_roots_include_program_and_launcher_locations() {

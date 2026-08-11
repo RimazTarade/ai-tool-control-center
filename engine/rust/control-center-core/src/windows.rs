@@ -110,8 +110,7 @@ pub struct WindowsKnownLocationRootReport {
 #[cfg(windows)]
 pub fn windows_known_location_roots() -> WindowsKnownLocationRootReport {
     use windows_sys::Win32::UI::Shell::{
-        FOLDERID_CommonPrograms, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86,
-        FOLDERID_Programs,
+        FOLDERID_CommonPrograms, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, FOLDERID_Programs,
     };
 
     let locations = [
@@ -160,14 +159,10 @@ pub fn windows_known_location_roots() -> WindowsKnownLocationRootReport {
 
 #[cfg(windows)]
 fn windows_known_folder_path(folder_id: &windows_sys::core::GUID) -> Result<PathBuf, String> {
-    use windows_sys::Win32::{
-        System::Com::CoTaskMemFree,
-        UI::Shell::SHGetKnownFolderPath,
-    };
+    use windows_sys::Win32::{System::Com::CoTaskMemFree, UI::Shell::SHGetKnownFolderPath};
 
     let mut raw_path = std::ptr::null_mut();
-    let result =
-        unsafe { SHGetKnownFolderPath(folder_id, 0, std::ptr::null_mut(), &mut raw_path) };
+    let result = unsafe { SHGetKnownFolderPath(folder_id, 0, std::ptr::null_mut(), &mut raw_path) };
 
     if result < 0 {
         return Err(format!(
@@ -194,6 +189,92 @@ fn windows_known_folder_path(folder_id: &windows_sys::core::GUID) -> Result<Path
     unsafe { CoTaskMemFree(raw_path.cast::<core::ffi::c_void>()) };
 
     Ok(path)
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowsShortcutMetadata {
+    pub target_path: PathBuf,
+    pub arguments: Option<String>,
+    pub working_directory: Option<PathBuf>,
+    pub description: Option<String>,
+}
+
+#[cfg(windows)]
+pub fn resolve_windows_shortcut(path: &Path) -> Result<WindowsShortcutMetadata, String> {
+    use windows::{
+        Win32::{
+            System::Com::{
+                CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+                CoUninitialize, IPersistFile, STGM_READ,
+            },
+            UI::Shell::{IShellLinkW, ShellLink},
+        },
+        core::{HSTRING, Interface},
+    };
+
+    struct ComGuard;
+
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            unsafe { CoUninitialize() };
+        }
+    }
+
+    let init_result = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if init_result.is_err() {
+        return Err(format!("CoInitializeEx failed: {init_result:?}"));
+    }
+    let _com_guard = ComGuard;
+
+    let shell_link: IShellLinkW =
+        unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }
+            .map_err(|error| format!("failed to create ShellLink COM object: {error}"))?;
+    let persist_file: IPersistFile = shell_link
+        .cast()
+        .map_err(|error| format!("failed to query IPersistFile: {error}"))?;
+
+    let shortcut_path = HSTRING::from(path.to_string_lossy().as_ref());
+    unsafe { persist_file.Load(&shortcut_path, STGM_READ) }
+        .map_err(|error| format!("failed to load shortcut {}: {error}", path.display()))?;
+
+    let mut target_buffer = vec![0u16; 32_768];
+    unsafe { shell_link.GetPath(&mut target_buffer, std::ptr::null_mut(), 0) }
+        .map_err(|error| format!("failed to read shortcut target: {error}"))?;
+    let target = utf16_buffer_string(&target_buffer)
+        .ok_or_else(|| "shortcut target path is empty".to_string())?;
+
+    let mut arguments_buffer = vec![0u16; 32_768];
+    unsafe { shell_link.GetArguments(&mut arguments_buffer) }
+        .map_err(|error| format!("failed to read shortcut arguments: {error}"))?;
+
+    let mut working_directory_buffer = vec![0u16; 32_768];
+    unsafe { shell_link.GetWorkingDirectory(&mut working_directory_buffer) }
+        .map_err(|error| format!("failed to read shortcut working directory: {error}"))?;
+
+    let mut description_buffer = vec![0u16; 32_768];
+    unsafe { shell_link.GetDescription(&mut description_buffer) }
+        .map_err(|error| format!("failed to read shortcut description: {error}"))?;
+
+    Ok(WindowsShortcutMetadata {
+        target_path: PathBuf::from(target),
+        arguments: utf16_buffer_string(&arguments_buffer),
+        working_directory: utf16_buffer_string(&working_directory_buffer).map(PathBuf::from),
+        description: utf16_buffer_string(&description_buffer),
+    })
+}
+
+#[cfg(windows)]
+fn utf16_buffer_string(buffer: &[u16]) -> Option<String> {
+    let end = buffer
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(buffer.len());
+    if end == 0 {
+        return None;
+    }
+
+    Some(String::from_utf16_lossy(&buffer[..end]))
 }
 
 /// Observes executable and launcher files under explicitly supplied Windows roots.
@@ -279,6 +360,24 @@ pub fn discover_known_locations(
                     path.display()
                 ),
             });
+
+            #[cfg(windows)]
+            if discovery.suggested_type == ToolKind::Launcher {
+                match resolve_windows_shortcut(path) {
+                    Ok(shortcut) => discovery.evidence.push(Evidence {
+                        kind: "shortcut".into(),
+                        summary: format!("target={}", windows_path_key(&shortcut.target_path)),
+                    }),
+                    Err(message) => report.errors.push(KnownLocationError {
+                        root: root.path.clone(),
+                        message: format!(
+                            "failed to resolve shortcut {}: {message}",
+                            path.display()
+                        ),
+                    }),
+                }
+            }
+
             report.discoveries.push(discovery);
         }
     }
@@ -339,11 +438,8 @@ pub fn discover_path_executables(path_value: &str, pathext_value: &str) -> Vec<D
                 continue;
             };
 
-            let mut discovery = Discovery::unknown(
-                name,
-                "windows.path",
-                fingerprint_windows_path(&path),
-            );
+            let mut discovery =
+                Discovery::unknown(name, "windows.path", fingerprint_windows_path(&path));
             discovery.suggested_type = ToolKind::Cli;
             discovery.confidence = Confidence::Medium;
             discovery.evidence.push(Evidence {
@@ -400,12 +496,11 @@ impl UninstallRegistrySource for WindowsUninstallRegistrySource {
     ) -> Result<Vec<UninstallRegistryRecord>, String> {
         use std::io::ErrorKind;
         use winreg::{
-            enums::{KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY},
             HKCU, HKLM,
+            enums::{KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY},
         };
 
-        const UNINSTALL_PATH: &str =
-            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+        const UNINSTALL_PATH: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
 
         let root = match hive {
             RegistryHive::CurrentUser => &HKCU,
@@ -566,8 +661,10 @@ impl ProcessSource for WindowsProcessSource {
             ));
         }
 
-        let mut entry = PROCESSENTRY32W::default();
-        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        let mut entry = PROCESSENTRY32W {
+            dwSize: size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
 
         if unsafe { Process32FirstW(snapshot, &mut entry) } == 0 {
             let error = io::Error::last_os_error();
@@ -958,8 +1055,7 @@ pub fn discover_tcp_endpoints_with(
             .map(|byte| format!("{byte:02x}"))
             .collect();
 
-        let mut discovery =
-            Discovery::unknown(suggested_name, "windows.tcp", fingerprint);
+        let mut discovery = Discovery::unknown(suggested_name, "windows.tcp", fingerprint);
         discovery.suggested_type = ToolKind::LocalService;
         discovery.confidence = Confidence::Medium;
         discovery.runtime_state = ObservedState::Running;

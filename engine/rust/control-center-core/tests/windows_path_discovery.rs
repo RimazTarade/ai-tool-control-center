@@ -1,6 +1,5 @@
 use control_center_core::{
-    Confidence, ObservedState, ToolKind,
-    windows::discover_path_executables,
+    Confidence, ObservedState, ToolKind, windows::discover_path_executables,
 };
 use std::fs;
 use tempfile::tempdir;
