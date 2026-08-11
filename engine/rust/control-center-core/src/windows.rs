@@ -12,7 +12,13 @@ use std::{
 /// here. Both slash styles are normalized so observations from PATH, registry,
 /// configuration files, and native APIs can be compared consistently.
 pub fn windows_path_key(path: &Path) -> String {
-    let mut key = path
+    #[cfg(windows)]
+    let identity_path = windows_long_path(path).unwrap_or_else(|| path.to_path_buf());
+
+    #[cfg(not(windows))]
+    let identity_path = path.to_path_buf();
+
+    let mut key = identity_path
         .to_string_lossy()
         .replace('/', "\\")
         .to_ascii_lowercase();
@@ -22,6 +28,31 @@ pub fn windows_path_key(path: &Path) -> String {
     }
 
     key
+}
+
+#[cfg(windows)]
+fn windows_long_path(path: &Path) -> Option<PathBuf> {
+    use std::{
+        ffi::OsString,
+        os::windows::ffi::{OsStrExt, OsStringExt},
+    };
+    use windows::{Win32::Storage::FileSystem::GetLongPathNameW, core::PCWSTR};
+
+    let input: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut output = vec![0u16; 32_768];
+
+    let len = unsafe { GetLongPathNameW(PCWSTR(input.as_ptr()), Some(&mut output)) } as usize;
+
+    if len == 0 || len >= output.len() {
+        return None;
+    }
+
+    Some(PathBuf::from(OsString::from_wide(&output[..len])))
 }
 
 /// Removes duplicate Windows paths while preserving the first observation.
