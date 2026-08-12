@@ -36,7 +36,7 @@ export async function review(id: string, decision: "import" | "ignore" | "unknow
   if (isDesktop()) await invoke("review_discovery", { id, decision });
 }
 
-export type ScanEvent = { kind: string; visited?: number; discovered?: number; message?: string };
+export type ScanEvent = { kind: string; scanner_id?: string; visited?: number; discovered?: number; message?: string };
 
 export async function startQuickScan(onEvent: (event: ScanEvent) => void): Promise<{ id: string; unlisten: UnlistenFn } | null> {
   if (!isDesktop()) return null;

@@ -8,7 +8,7 @@ export default function App() {
   const [page, setPage] = useState<PageName>("Overview");
   const [state, setState] = useState<BootstrapState>({ mode: "demo", pending: [], inventory: [] });
   const [query, setQuery] = useState("");
-  const [scan, setScan] = useState<{ active: boolean; paused: boolean; progress: number; visited: number; id?: string; notice?: string }>({ active: false, paused: false, progress: 0, visited: 0 });
+  const [scan, setScan] = useState<{ active: boolean; paused: boolean; progress: number; visited: number; id?: string; scannerId?: string; notice?: string }>({ active: false, paused: false, progress: 0, visited: 0 });
   const stopListening = useRef<null | (() => void)>(null);
 
   useEffect(() => { void bootstrap().then(setState); }, []);
@@ -40,7 +40,7 @@ export default function App() {
     let endedBeforeStartReturned = false;
     try {
       const running = await startQuickScan((event) => {
-        if (event.kind === "progress") setScan((current) => ({ ...current, visited: event.visited ?? current.visited }));
+        if (event.kind === "progress") setScan((current) => ({ ...current, scannerId: event.scanner_id ?? current.scannerId, visited: event.visited ?? current.visited }));
         if (event.kind === "scanner_failed") setScan((current) => ({ ...current, notice: event.message ?? "Part of the scan could not complete." }));
         if (["completed", "cancelled", "failed"].includes(event.kind)) {
           endedBeforeStartReturned = true;
@@ -94,7 +94,7 @@ export default function App() {
           </div>
         </header>
         {state.mode === "demo" && <div className="demo" role="status">Demo mode · all records are synthetic and do not describe this computer.</div>}
-        {scan.active && <section className="scanbar" aria-label="Scan progress"><div><strong>{scan.paused ? "Scan paused" : "Scanning local sources"}</strong><span>{state.mode === "demo" ? `${scan.progress}%` : `${scan.visited} locations checked`}</span></div>{state.mode === "demo" ? <progress value={scan.progress} max="100" /> : <progress />}<footer>{state.mode === "demo" && <button onClick={() => setScan((current) => ({ ...current, paused: !current.paused }))}>{scan.paused ? "Resume" : "Pause"}</button>}<button disabled={state.mode === "desktop" && !scan.id} onClick={() => void cancelScan()}>Cancel</button></footer></section>}
+        {scan.active && <section className="scanbar" aria-label="Scan progress"><div><strong>{scan.paused ? "Scan paused" : "Scanning local sources"}</strong><span>{state.mode === "demo" ? `${scan.progress}%` : `${scan.scannerId ? `${scan.scannerId} | ` : ""}${scan.visited} locations checked`}</span></div>{state.mode === "demo" ? <progress value={scan.progress} max="100" /> : <progress />}<footer>{state.mode === "demo" && <button onClick={() => setScan((current) => ({ ...current, paused: !current.paused }))}>{scan.paused ? "Resume" : "Pause"}</button>}<button disabled={state.mode === "desktop" && !scan.id} onClick={() => void cancelScan()}>Cancel</button></footer></section>}
         {scan.notice && <div className="scan-warning" role="alert">{scan.notice}</div>}
         {page === "Overview" ? <Overview state={state} onReview={() => setPage("Review Queue")} /> : page === "Review Queue" ? <ReviewQueue items={visible} decide={decide} /> : page === "Inventory" ? <Inventory items={state.inventory} /> : <EmptyPage name={page} />}
       </main>

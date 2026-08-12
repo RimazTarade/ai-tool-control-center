@@ -44,6 +44,20 @@ describe("desktop scan recovery", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(/could not be saved/i);
   });
 
+  it("shows the scanner identity for progress events", async () => {
+    vi.mocked(startQuickScan).mockImplementation(async (onEvent) => {
+      onEvent({ kind: "progress", scanner_id: "windows.process", visited: 7 });
+      return { id: "scan-1", unlisten: vi.fn() };
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: /run quick scan/i }));
+
+    const progress = await screen.findByLabelText(/scan progress/i);
+    expect(progress).toHaveTextContent("windows.process | 7 locations checked");
+  });
+
   it("disables cancellation until the backend returns a scan id", async () => {
     vi.mocked(startQuickScan).mockImplementation(() => new Promise(() => undefined));
     const user = userEvent.setup();
