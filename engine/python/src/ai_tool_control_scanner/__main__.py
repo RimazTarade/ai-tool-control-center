@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import sys
 
-from .protocol import ProtocolError, decode, redact, write
+from .protocol import ProtocolError, decode, read_bounded_line, redact, write
 from .scanners import scan
 
 
 def main() -> int:
     cancelled: set[str] = set()
-    for line in sys.stdin:
+    while True:
         try:
+            line = read_bounded_line(sys.stdin.buffer)
+            if line is None:
+                break
             request = decode(line)
             if request.operation == "ping":
                 write(sys.stdout, {"request_id": request.request_id, "kind": "pong"})
