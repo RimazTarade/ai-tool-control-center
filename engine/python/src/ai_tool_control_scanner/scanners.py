@@ -2,12 +2,23 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tomllib
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 NAMES = {"claude", "codex", "mcp", "docker", "ollama"}
 SUFFIXES = {".json", ".yaml", ".yml", ".toml"}
+
+
+def _path_product(path: Path) -> str | None:
+    name = path.name.casefold()
+    parts = {part.casefold() for part in path.parts}
+
+    for product in NAMES:
+        if product in name or f".{product}" in parts:
+            return product
+    return None
 
 
 def scan(roots: tuple[str, ...]) -> Iterator[dict[str, Any]]:
@@ -20,20 +31,37 @@ def scan(roots: tuple[str, ...]) -> Iterator[dict[str, Any]]:
                 continue
             if not path.is_file() or path.suffix.lower() not in SUFFIXES:
                 continue
-            if not any(name in path.name.lower() for name in NAMES):
+            if _path_product(path) is None:
                 continue
             yield discovery(path)
 
 
 def discovery(path: Path) -> dict[str, Any]:
-    kind = "unknown"
-    evidence = "matching configuration filename"
+    product = _path_product(path)
+    kind = product or "unknown"
+    evidence = (
+        f"configuration path matches {product}"
+        if product is not None
+        else "matching configuration filename"
+    )
     try:
-        data = json.loads(path.read_text(encoding="utf-8")) if path.suffix.lower() == ".json" else None
-        if isinstance(data, dict) and ("mcpServers" in data or "mcp_servers" in data):
-            kind = "mcp"
-            evidence = "configuration contains an MCP server mapping"
-    except (OSError, UnicodeError, json.JSONDecodeError):
+        if path.suffix.casefold() == ".json":
+            data: Any = json.loads(path.read_text(encoding="utf-8"))
+        elif path.suffix.casefold() == ".toml":
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+        else:
+            data = None
+
+        if isinstance(data, dict) and (
+            isinstance(data.get("mcpServers"), dict)
+            or isinstance(data.get("mcp_servers"), dict)
+        ):
+            if product == "mcp":
+                kind = "mcp"
+                evidence = "configuration contains an MCP server mapping"
+            else:
+                evidence = f"{product} configuration contains an MCP server mapping"
+    except (OSError, UnicodeError, json.JSONDecodeError, tomllib.TOMLDecodeError):
         pass
     fingerprint = hashlib.sha256(str(path).casefold().encode()).hexdigest()
     return {

@@ -139,6 +139,90 @@ class ScannerTest(unittest.TestCase):
         self.assertIn('"kind":"pong"', lines[1])
         self.assertIn('"request_id":"ping-3"', lines[1])
 
+    def test_claude_config_is_classified_without_health_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".claude.json"
+            path.write_text('{"projects": {}}', encoding="utf-8")
+
+            [result] = list(scan((directory,)))
+
+            self.assertEqual(result["suggested_type"], "claude")
+            self.assertEqual(result["health_state"], "unknown")
+            self.assertEqual(result["confidence"], "medium")
+
+    def test_codex_config_toml_is_found_from_canonical_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_dir = Path(directory) / ".codex"
+            codex_dir.mkdir()
+            path = codex_dir / "config.toml"
+            path.write_text('model = "example"', encoding="utf-8")
+
+            [result] = list(scan((directory,)))
+
+            self.assertEqual(result["suggested_type"], "codex")
+            self.assertEqual(result["health_state"], "unknown")
+
+    def test_codex_mcp_toml_preserves_codex_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_dir = Path(directory) / ".codex"
+            codex_dir.mkdir()
+            path = codex_dir / "config.toml"
+            path.write_text(
+                '[mcp_servers.example]\ncommand = "example"\n',
+                encoding="utf-8",
+            )
+
+            [result] = list(scan((directory,)))
+
+            self.assertEqual(result["suggested_type"], "codex")
+            self.assertEqual(result["health_state"], "unknown")
+            reasons = [
+                item["summary"]
+                for item in result["evidence"]
+                if item["kind"] == "reason"
+            ]
+            self.assertTrue(any("MCP server mapping" in reason for reason in reasons))
+
+    def test_docker_config_is_evidence_not_runtime_health(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            docker_dir = Path(directory) / ".docker"
+            docker_dir.mkdir()
+            path = docker_dir / "config.json"
+            path.write_text('{"auths": {}}', encoding="utf-8")
+
+            [result] = list(scan((directory,)))
+
+            self.assertEqual(result["suggested_type"], "docker")
+            self.assertEqual(result["health_state"], "unknown")
+            self.assertNotIn("runtime_state", result)
+            self.assertNotIn("authentication_state", result)
+
+    def test_unrelated_config_is_not_discovered(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            path.write_text('{"example": true}', encoding="utf-8")
+
+            self.assertEqual(list(scan((directory,))), [])
+
+    def test_claude_mcp_json_preserves_claude_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".claude.json"
+            path.write_text(
+                '{"mcpServers": {"example": {"command": "example"}}}',
+                encoding="utf-8",
+            )
+
+            [result] = list(scan((directory,)))
+
+            self.assertEqual(result["suggested_type"], "claude")
+            self.assertEqual(result["health_state"], "unknown")
+            reasons = [
+                item["summary"]
+                for item in result["evidence"]
+                if item["kind"] == "reason"
+            ]
+            self.assertTrue(any("MCP server mapping" in reason for reason in reasons))
+
     def test_mcp_config_is_evidence_not_health(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "example-mcp.json"
