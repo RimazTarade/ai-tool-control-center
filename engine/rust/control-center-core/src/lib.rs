@@ -1,5 +1,7 @@
 pub mod action;
 pub mod model;
+pub mod python_supervisor;
+pub mod redaction;
 pub mod scan;
 pub mod storage;
 pub mod windows;
