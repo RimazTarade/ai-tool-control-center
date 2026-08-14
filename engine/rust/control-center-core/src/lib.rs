@@ -8,5 +8,5 @@ pub mod windows;
 
 pub use action::{ActionError, ActionPreview, ActionSource, CommandSpec};
 pub use model::*;
-pub use scan::{ScanEvent, quick_scan};
+pub use scan::{PythonRootError, QuickScanContext, ScanEvent, quick_scan};
 pub use storage::{ReviewDecision, Store, StoreError};

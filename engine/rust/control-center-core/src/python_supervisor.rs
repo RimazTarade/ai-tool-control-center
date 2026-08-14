@@ -126,6 +126,11 @@ struct WindowsJob {
 }
 
 #[cfg(windows)]
+// SAFETY: Windows kernel handles are process-scoped. This wrapper uniquely owns the handle
+// and moving ownership between threads does not duplicate or concurrently close it.
+unsafe impl Send for WindowsJob {}
+
+#[cfg(windows)]
 impl WindowsJob {
     fn new() -> Result<Self, &'static str> {
         use std::mem::{size_of, zeroed};

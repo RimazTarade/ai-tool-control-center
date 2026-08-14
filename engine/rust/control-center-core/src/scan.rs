@@ -55,10 +55,20 @@ const QUICK_SCAN_SCANNER_IDS: &[&str] = &[
     "windows.process",
     "windows.service",
     "windows.tcp",
+    "python.config",
 ];
 
 fn quick_scan_scanner_ids() -> &'static [&'static str] {
     QUICK_SCAN_SCANNER_IDS
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PythonRootError;
+
+#[derive(Debug, Clone)]
+pub struct QuickScanContext {
+    pub roots: Vec<PathBuf>,
+    pub python_app_root: Result<PathBuf, PythonRootError>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -289,18 +299,147 @@ async fn emit_partial_failure(events: &mpsc::Sender<ScanEvent>, scanner_id: &str
 }
 
 #[cfg(windows)]
-fn build_quick_scan_jobs(roots: Vec<PathBuf>) -> Vec<ScannerJob> {
+fn build_python_config_job_with_runner<F, Fut>(
+    app_root: Result<PathBuf, PythonRootError>,
+    roots: Vec<PathBuf>,
+    runner: F,
+) -> ScannerJob
+where
+    F: FnOnce(
+            PathBuf,
+            Vec<PathBuf>,
+            Duration,
+            CancellationToken,
+            mpsc::UnboundedSender<Discovery>,
+        ) -> Fut
+        + Send
+        + 'static,
+    Fut: Future<Output = Result<u64, crate::python_supervisor::PythonSupervisorError>>
+        + Send
+        + 'static,
+{
+    ScannerJob::new(
+        "python.config",
+        QUICK_SCAN_SCANNER_TIMEOUT,
+        move |events, cancellation| async move {
+            let app_root = match app_root {
+                Ok(app_root) => app_root,
+                Err(_) => {
+                    return ScannerTerminal::Failed {
+                        code: "scanner_failed".into(),
+                        message: "Python application root is unavailable".into(),
+                    };
+                }
+            };
+
+            let (discovery_tx, mut discovery_rx) = mpsc::unbounded_channel();
+            let scan = runner(
+                app_root,
+                roots,
+                QUICK_SCAN_SCANNER_TIMEOUT,
+                cancellation,
+                discovery_tx,
+            );
+            tokio::pin!(scan);
+
+            let mut forwarded = 0_u64;
+            let mut discovery_channel_open = true;
+
+            loop {
+                tokio::select! {
+                    result = &mut scan => {
+                        while let Ok(discovery) = discovery_rx.try_recv() {
+                            if events
+                                .send(ScanEvent::Discovery { discovery })
+                                .await
+                                .is_err()
+                            {
+                                return ScannerTerminal::Failed {
+                                    code: "event_channel_closed".into(),
+                                    message: "Scan event channel closed while publishing discoveries".into(),
+                                };
+                            }
+                            forwarded = forwarded.saturating_add(1);
+                        }
+
+                        return match result {
+                            Ok(count) => ScannerTerminal::Completed {
+                                visited: 0,
+                                discovered: count,
+                            },
+                            Err(error) if error.code() == "scanner_cancelled" => {
+                                ScannerTerminal::Cancelled {
+                                    visited: 0,
+                                    discovered: forwarded,
+                                }
+                            }
+                            Err(error) => ScannerTerminal::Failed {
+                                code: error.code().into(),
+                                message: "Python scanner failed".into(),
+                            },
+                        };
+                    }
+                    discovery = discovery_rx.recv(), if discovery_channel_open => {
+                        match discovery {
+                            Some(discovery) => {
+                                if events
+                                    .send(ScanEvent::Discovery { discovery })
+                                    .await
+                                    .is_err()
+                                {
+                                    return ScannerTerminal::Failed {
+                                        code: "event_channel_closed".into(),
+                                        message: "Scan event channel closed while publishing discoveries".into(),
+                                    };
+                                }
+                                forwarded = forwarded.saturating_add(1);
+                            }
+                            None => discovery_channel_open = false,
+                        }
+                    }
+                }
+            }
+        },
+    )
+}
+#[cfg(windows)]
+fn build_python_config_job(
+    app_root: Result<PathBuf, PythonRootError>,
+    roots: Vec<PathBuf>,
+) -> ScannerJob {
+    build_python_config_job_with_runner(
+        app_root,
+        roots,
+        |app_root, roots, timeout, cancellation, discoveries| async move {
+            crate::python_supervisor::run_python_scan(
+                &app_root,
+                &roots,
+                timeout,
+                cancellation,
+                move |discovery| {
+                    let _ = discoveries.send(discovery);
+                },
+            )
+            .await
+        },
+    )
+}
+#[cfg(windows)]
+fn build_quick_scan_jobs(context: QuickScanContext) -> Vec<ScannerJob> {
     use crate::windows::{
         WindowsProcessSource, WindowsServiceSource, WindowsTcpEndpointSource,
         WindowsUninstallRegistrySource, discover_known_locations, discover_path_executables,
         discover_processes_with, discover_services_with, discover_tcp_endpoints_with,
         discover_uninstall_registry_with, windows_known_location_roots,
     };
+    let python_roots = context.roots.clone();
+    let roots = context.roots;
+    let python_app_root = context.python_app_root;
 
     let path_value = std::env::var("PATH").unwrap_or_default();
     let pathext_value = std::env::var("PATHEXT").unwrap_or_default();
 
-    let jobs = vec![
+    let mut jobs = vec![
         ScannerJob::new(
             "filesystem.quick",
             QUICK_SCAN_SCANNER_TIMEOUT,
@@ -476,6 +615,8 @@ fn build_quick_scan_jobs(roots: Vec<PathBuf>) -> Vec<ScannerJob> {
         ),
     ];
 
+    jobs.push(build_python_config_job(python_app_root, python_roots));
+
     debug_assert_eq!(
         jobs.iter()
             .map(|job| job.scanner_id.as_str())
@@ -563,13 +704,13 @@ impl ScanCoordinatorState {
 }
 
 pub async fn quick_scan(
-    roots: Vec<PathBuf>,
+    context: QuickScanContext,
     events: mpsc::Sender<ScanEvent>,
     cancellation: CancellationToken,
 ) {
     #[cfg(windows)]
     {
-        let jobs = build_quick_scan_jobs(roots);
+        let jobs = build_quick_scan_jobs(context);
         run_scanner_jobs(jobs, QUICK_SCAN_MAX_CONCURRENCY, events, cancellation).await;
     }
 
@@ -577,6 +718,7 @@ pub async fn quick_scan(
     {
         const SCANNER_ID: &str = "filesystem.quick";
 
+        let roots = context.roots;
         let terminal_events = events.clone();
         let mut coordinator = ScanCoordinatorState::new([SCANNER_ID]);
         let task = tokio::task::spawn_blocking(move || scan_blocking(roots, events, cancellation));
@@ -705,6 +847,7 @@ mod tests {
                 "windows.process",
                 "windows.service",
                 "windows.tcp",
+                "python.config",
             ]
         );
     }
@@ -712,12 +855,120 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn quick_scan_builds_every_stable_scanner_job() {
-        let jobs = build_quick_scan_jobs(Vec::new());
+        let jobs = build_quick_scan_jobs(QuickScanContext {
+            roots: Vec::new(),
+            python_app_root: Err(PythonRootError),
+        });
         let scanner_ids: Vec<&str> = jobs.iter().map(|job| job.scanner_id.as_str()).collect();
 
         assert_eq!(scanner_ids, quick_scan_scanner_ids());
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn python_config_job_forwards_discoveries_and_counts_them() {
+        let app_root = tempdir().unwrap();
+        let expected_root = app_root.path().to_path_buf();
+        let expected_root_for_runner = expected_root.clone();
+
+        let mut discovery = Discovery::unknown(
+            "Python config",
+            "python.config",
+            "python-config-test".into(),
+        );
+        discovery.evidence.push(Evidence {
+            kind: "config".into(),
+            summary: "test config".into(),
+        });
+
+        let job = build_python_config_job_with_runner(
+            Ok(expected_root),
+            vec![PathBuf::from(r"C:\scan-root")],
+            move |app_root, roots, _timeout, _cancellation, discoveries| async move {
+                assert_eq!(app_root, expected_root_for_runner);
+                assert_eq!(roots, vec![PathBuf::from(r"C:\scan-root")]);
+                discoveries.send(discovery).unwrap();
+                Ok::<u64, crate::python_supervisor::PythonSupervisorError>(1)
+            },
+        );
+
+        let (sender, mut receiver) = mpsc::channel(16);
+        run_scanner_jobs(vec![job], 1, sender, CancellationToken::new()).await;
+
+        let mut saw_discovery = false;
+        let mut saw_completed = false;
+
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                ScanEvent::Discovery { discovery }
+                    if discovery.source_scanner == "python.config"
+                        && discovery.suggested_name == "Python config" =>
+                {
+                    saw_discovery = true;
+                }
+                ScanEvent::Completed { discovered: 1, .. } => saw_completed = true,
+                _ => {}
+            }
+        }
+
+        assert!(saw_discovery);
+        assert!(saw_completed);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn missing_python_root_fails_only_python_job_and_scan_still_settles() {
+        let python_job = build_python_config_job_with_runner(
+            Err(PythonRootError),
+            Vec::new(),
+            |_app_root, _roots, _timeout, _cancellation, _discoveries| async move {
+                panic!("Python runner must not execute when the application root is unavailable");
+                #[allow(unreachable_code)]
+                Ok::<u64, crate::python_supervisor::PythonSupervisorError>(0)
+            },
+        );
+
+        let native_job = ScannerJob::new(
+            "test.native",
+            Duration::from_secs(1),
+            |_events, _cancellation| async move {
+                ScannerTerminal::Completed {
+                    visited: 2,
+                    discovered: 1,
+                }
+            },
+        );
+
+        let (sender, mut receiver) = mpsc::channel(16);
+        run_scanner_jobs(
+            vec![python_job, native_job],
+            2,
+            sender,
+            CancellationToken::new(),
+        )
+        .await;
+
+        let mut saw_python_failure = false;
+        let mut saw_completed = false;
+
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                ScanEvent::ScannerFailed {
+                    scanner_id, code, ..
+                } if scanner_id == "python.config" && code == "scanner_failed" => {
+                    saw_python_failure = true;
+                }
+                ScanEvent::Completed {
+                    visited: 2,
+                    discovered: 1,
+                } => saw_completed = true,
+                _ => {}
+            }
+        }
+
+        assert!(saw_python_failure);
+        assert!(saw_completed);
+    }
     #[tokio::test]
     async fn filesystem_job_finds_generic_signal_and_finishes() {
         let root = tempdir().unwrap();
