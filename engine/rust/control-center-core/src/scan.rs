@@ -917,6 +917,63 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
+    async fn python_config_cancellation_preserves_forwarded_discovery_and_scan_settlement() {
+        let mut discovery = Discovery::unknown(
+            "Python config",
+            "python.config",
+            "python-config-cancel-test".into(),
+        );
+        discovery.evidence.push(Evidence {
+            kind: "config".into(),
+            summary: "test config".into(),
+        });
+
+        let job = build_python_config_job_with_runner(
+            Ok(PathBuf::from(r"C:\app")),
+            Vec::new(),
+            move |_app_root, _roots, _timeout, _cancellation, discoveries| async move {
+                discoveries.send(discovery).unwrap();
+                Err(crate::python_supervisor::PythonSupervisorError::cancelled())
+            },
+        );
+
+        let native_job = ScannerJob::new(
+            "test.native",
+            Duration::from_secs(1),
+            |_events, _cancellation| async move {
+                ScannerTerminal::Completed {
+                    visited: 2,
+                    discovered: 1,
+                }
+            },
+        );
+
+        let (sender, mut receiver) = mpsc::channel(16);
+        run_scanner_jobs(vec![job, native_job], 2, sender, CancellationToken::new()).await;
+
+        let mut saw_python_discovery = false;
+        let mut saw_cancelled = false;
+
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                ScanEvent::Discovery { discovery }
+                    if discovery.source_scanner == "python.config" =>
+                {
+                    saw_python_discovery = true;
+                }
+                ScanEvent::Cancelled {
+                    visited: 2,
+                    discovered: 2,
+                } => saw_cancelled = true,
+                _ => {}
+            }
+        }
+
+        assert!(saw_python_discovery);
+        assert!(saw_cancelled);
+    }
+    #[cfg(windows)]
+    #[tokio::test]
     async fn missing_python_root_fails_only_python_job_and_scan_still_settles() {
         let python_job = build_python_config_job_with_runner(
             Err(PythonRootError),
