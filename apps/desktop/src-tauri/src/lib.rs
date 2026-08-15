@@ -1,4 +1,7 @@
-use control_center_core::{Discovery, ReviewDecision, ScanEvent, Store, quick_scan};
+mod runtime_root;
+use control_center_core::{
+    Discovery, QuickScanContext, ReviewDecision, ScanEvent, Store, quick_scan,
+};
 use serde::Serialize;
 use std::{collections::HashMap, fs, path::PathBuf, sync::Mutex};
 use tauri::{Emitter, Manager, State};
@@ -72,8 +75,12 @@ async fn start_quick_scan(
     drop(scans);
     let (sender, mut receiver) = mpsc::channel(128);
     let app_for_scan = app.clone();
+    let context = QuickScanContext {
+        roots,
+        python_app_root: runtime_root::resolve_python_app_root(),
+    };
     tauri::async_runtime::spawn(async move {
-        quick_scan(roots, sender, cancellation).await;
+        quick_scan(context, sender, cancellation).await;
     });
     tauri::async_runtime::spawn(async move {
         while let Some(event) = receiver.recv().await {
