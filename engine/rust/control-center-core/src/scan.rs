@@ -916,6 +916,87 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn repository_root_for_acceptance() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .canonicalize()
+            .expect("repository root must exist")
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "requires runtimes/cpython-3.14.7-windows-x86_64/python.exe"]
+    async fn bundled_python_config_job_runs_with_staged_runtime() {
+        let app_root = repository_root_for_acceptance();
+        let job = build_python_config_job(Ok(app_root), Vec::new());
+
+        let (sender, mut receiver) = mpsc::channel(16);
+        run_scanner_jobs(vec![job], 1, sender, CancellationToken::new()).await;
+
+        let mut saw_completed = false;
+        let mut saw_python_failure = false;
+
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                ScanEvent::ScannerFailed { scanner_id, .. } if scanner_id == "python.config" => {
+                    saw_python_failure = true;
+                }
+                ScanEvent::Completed { .. } => saw_completed = true,
+                _ => {}
+            }
+        }
+
+        assert!(!saw_python_failure);
+        assert!(saw_completed);
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "run only while the staged bundled runtime directory is temporarily unavailable"]
+    async fn missing_bundled_python_runtime_fails_only_python_job() {
+        let app_root = repository_root_for_acceptance();
+        let python_job = build_python_config_job(Ok(app_root), Vec::new());
+        let native_job = ScannerJob::new(
+            "test.native",
+            Duration::from_secs(1),
+            |_events, _cancellation| async move {
+                ScannerTerminal::Completed {
+                    visited: 2,
+                    discovered: 1,
+                }
+            },
+        );
+
+        let (sender, mut receiver) = mpsc::channel(16);
+        run_scanner_jobs(
+            vec![python_job, native_job],
+            2,
+            sender,
+            CancellationToken::new(),
+        )
+        .await;
+
+        let mut saw_python_failure = false;
+        let mut saw_completed = false;
+
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                ScanEvent::ScannerFailed {
+                    scanner_id, code, ..
+                } if scanner_id == "python.config" && code == "scanner_failed" => {
+                    saw_python_failure = true;
+                }
+                ScanEvent::Completed {
+                    visited: 2,
+                    discovered: 1,
+                } => saw_completed = true,
+                _ => {}
+            }
+        }
+
+        assert!(saw_python_failure);
+        assert!(saw_completed);
+    }
+    #[cfg(windows)]
     #[tokio::test]
     async fn python_config_cancellation_preserves_forwarded_discovery_and_scan_settlement() {
         let mut discovery = Discovery::unknown(
