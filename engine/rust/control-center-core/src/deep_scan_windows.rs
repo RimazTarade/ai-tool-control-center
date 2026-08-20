@@ -38,8 +38,20 @@ pub(crate) struct EntryPolicy {
 
 /// A stable identity for a directory, used to detect cycles when following
 /// reparse points is explicitly enabled.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct DirectoryIdentity(String);
+
+#[cfg(test)]
+impl DirectoryIdentity {
+    /// Test-only constructor. Task 5's fake filesystem needs to hand out
+    /// deterministic, non-filesystem-backed identities to simulate cycles
+    /// and hard-linked directories without touching a real disk; the field
+    /// stays private everywhere else so production code can only obtain an
+    /// identity via [`stable_directory_identity`].
+    pub(crate) fn for_test(id: impl Into<String>) -> Self {
+        DirectoryIdentity(id.into())
+    }
+}
 
 #[cfg(windows)]
 pub(crate) fn classify_root(path: &Path) -> io::Result<RootLocation> {

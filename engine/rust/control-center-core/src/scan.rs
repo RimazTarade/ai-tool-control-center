@@ -832,7 +832,14 @@ fn is_allowed(entry: &DirEntry) -> bool {
         })
 }
 
-fn looks_relevant(path: &Path) -> bool {
+/// The Quick Scan directory exclusion-name list, exposed crate-private so
+/// Deep Scan (`deep_scan.rs`) can reuse it rather than maintaining a second,
+/// divergent list.
+pub(crate) fn quick_excluded_names() -> &'static [&'static str] {
+    EXCLUDED
+}
+
+pub(crate) fn looks_relevant(path: &Path) -> bool {
     let name = path
         .file_name()
         .and_then(|value| value.to_str())
@@ -848,7 +855,7 @@ fn looks_relevant(path: &Path) -> bool {
         )
 }
 
-fn fingerprint(path: &Path) -> String {
+pub(crate) fn fingerprint(path: &Path) -> String {
     Sha256::digest(path.to_string_lossy().to_ascii_lowercase().as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
