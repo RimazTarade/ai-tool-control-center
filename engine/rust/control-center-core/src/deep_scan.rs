@@ -51,7 +51,7 @@ pub enum DeepScanError {
 }
 
 impl DeepScanError {
-    fn code(&self) -> &'static str {
+    pub fn code(&self) -> &'static str {
         match self {
             DeepScanError::NoRootsSelected => "no_roots_selected",
             DeepScanError::NetworkConsentRequired => "network_consent_required",
@@ -62,6 +62,14 @@ impl DeepScanError {
 
 /// Validates the roots a Deep Scan is about to run over. Never persists
 /// `network_consent`; it is checked fresh for this call only.
+///
+/// Exposed publicly so callers (the Tauri command layer) can run the same
+/// check synchronously, before a scan is admitted, rather than only inside
+/// the spawned `deep_scan` task.
+pub fn validate_deep_roots(roots: &[PathBuf], network_consent: bool) -> Result<(), DeepScanError> {
+    validate_roots(roots, network_consent)
+}
+
 fn validate_roots(roots: &[PathBuf], network_consent: bool) -> Result<(), DeepScanError> {
     if roots.is_empty() {
         return Err(DeepScanError::NoRootsSelected);

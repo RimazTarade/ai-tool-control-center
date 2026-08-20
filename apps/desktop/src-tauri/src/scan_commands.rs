@@ -13,7 +13,8 @@ use crate::runtime_root;
 use chrono::{DateTime, Utc};
 use control_center_core::{
     Discovery, PauseGate, QuickScanContext, ScanEvent, ScanEventSink, ScanLifecycleState,
-    ScanScope, Store, deep_scan::DeepScanContext, deep_scan, quick_scan,
+    ScanScope, Store, deep_scan, deep_scan::DeepScanContext, deep_scan::DeepScanError,
+    quick_scan, validate_deep_roots,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, sync::Mutex};
@@ -61,6 +62,13 @@ impl CommandError {
 
     pub(crate) fn no_roots_selected() -> Self {
         Self::new("no_roots_selected", "Select at least one folder to scan")
+    }
+
+    pub(crate) fn network_consent_required() -> Self {
+        Self::new(
+            "network_consent_required",
+            "A selected root is on the network and requires explicit consent for this scan",
+        )
     }
 
     pub(crate) fn storage_integrity(message: impl Into<String>) -> Self {
@@ -526,99 +534,158 @@ fn duration_ms_of(event: &ScanEvent) -> u64 {
     }
 }
 
+/// The bridge's dependencies, abstracted so the persistence-before-
+/// notification ordering can be exercised without a real Tauri window.
+/// `TauriPorts` is the production implementation; tests use a
+/// call-order-recording fake.
+trait EventBridgePorts: Send + 'static {
+    fn persist_discovery(&self, scan_id: Uuid, discovery: &Discovery) -> Result<(), CommandError>;
+    fn persist_scan_error(
+        &self,
+        scan_id: Uuid,
+        scanner_id: &str,
+        code: &str,
+        message: &str,
+    ) -> Result<(), CommandError>;
+    fn persist_terminal(
+        &self,
+        scan_id: Uuid,
+        state: ScanLifecycleState,
+        failure_count: u64,
+    ) -> Result<(), CommandError>;
+    fn emit(&self, event: &ScanEvent);
+    fn remove_scan(&self, scan_id: Uuid);
+}
+
+struct TauriPorts(tauri::AppHandle);
+
+impl EventBridgePorts for TauriPorts {
+    fn persist_discovery(&self, scan_id: Uuid, discovery: &Discovery) -> Result<(), CommandError> {
+        persist_discovery(&self.0, scan_id, discovery)
+    }
+
+    fn persist_scan_error(
+        &self,
+        scan_id: Uuid,
+        scanner_id: &str,
+        code: &str,
+        message: &str,
+    ) -> Result<(), CommandError> {
+        persist_scan_error(&self.0, scan_id, scanner_id, code, message)
+    }
+
+    fn persist_terminal(
+        &self,
+        scan_id: Uuid,
+        state: ScanLifecycleState,
+        failure_count: u64,
+    ) -> Result<(), CommandError> {
+        persist_terminal(&self.0, scan_id, state, failure_count)
+    }
+
+    fn emit(&self, event: &ScanEvent) {
+        emit(&self.0, event)
+    }
+
+    fn remove_scan(&self, scan_id: Uuid) {
+        if let Some(state) = self.0.try_state::<AppState>() {
+            state.scans.remove(scan_id);
+        }
+    }
+}
+
 /// Drains the runner's event channel, persisting every event's durable
-/// consequence *before* announcing it to the frontend.
-fn spawn_event_bridge(
-    app: tauri::AppHandle,
+/// consequence *before* announcing it to the frontend. Generic over
+/// [`EventBridgePorts`] so the ordering invariant is unit-testable without a
+/// Tauri window (see `persistence_before_notification_*` tests below).
+async fn run_event_bridge<P: EventBridgePorts>(
+    ports: P,
     scan_id: Uuid,
     mut receiver: mpsc::Receiver<ScanEvent>,
 ) {
-    tauri::async_runtime::spawn(async move {
-        let mut storage_failures: u64 = 0;
+    let mut storage_failures: u64 = 0;
 
-        while let Some(event) = receiver.recv().await {
-            match &event {
-                ScanEvent::Discovery { discovery } => {
-                    if persist_discovery(&app, scan_id, discovery).is_err() {
-                        // The discovery is not announced: there is no durable
-                        // record to back it. Record the integrity failure
-                        // instead and count it toward the run's failures.
-                        storage_failures += 1;
-                        let scanner_id = discovery.source_scanner.clone();
-                        let _ = persist_scan_error(
-                            &app,
-                            scan_id,
-                            &scanner_id,
-                            "storage_integrity",
-                            STORAGE_INTEGRITY_MESSAGE,
-                        );
-                        emit(
-                            &app,
-                            &ScanEvent::ScannerFailed {
-                                scanner_id,
-                                code: "storage_integrity".into(),
-                                message: STORAGE_INTEGRITY_MESSAGE.into(),
-                            },
-                        );
-                        continue;
-                    }
-                    emit(&app, &event);
+    while let Some(event) = receiver.recv().await {
+        match &event {
+            ScanEvent::Discovery { discovery } => {
+                if ports.persist_discovery(scan_id, discovery).is_err() {
+                    // The discovery is not announced: there is no durable
+                    // record to back it. Record the integrity failure
+                    // instead and count it toward the run's failures.
+                    storage_failures += 1;
+                    let scanner_id = discovery.source_scanner.clone();
+                    let _ = ports.persist_scan_error(
+                        scan_id,
+                        &scanner_id,
+                        "storage_integrity",
+                        STORAGE_INTEGRITY_MESSAGE,
+                    );
+                    ports.emit(&ScanEvent::ScannerFailed {
+                        scanner_id,
+                        code: "storage_integrity".into(),
+                        message: STORAGE_INTEGRITY_MESSAGE.into(),
+                    });
+                    continue;
                 }
-                ScanEvent::ScannerFailed {
-                    scanner_id,
-                    code,
-                    message,
-                } => {
-                    if persist_scan_error(&app, scan_id, scanner_id, code, message).is_err() {
-                        storage_failures += 1;
-                    }
-                    // The failure itself is still news even if recording it
-                    // did not survive, so it is always announced.
-                    emit(&app, &event);
+                ports.emit(&event);
+            }
+            ScanEvent::ScannerFailed {
+                scanner_id,
+                code,
+                message,
+            } => {
+                if ports
+                    .persist_scan_error(scan_id, scanner_id, code, message)
+                    .is_err()
+                {
+                    storage_failures += 1;
                 }
-                // Paused/Resumed are owned by their commands, which persist
-                // and emit them directly. The runner never originates them.
-                ScanEvent::Paused | ScanEvent::Resumed => {}
-                _ => {
-                    if let Some(state) = terminal_state_of(&event) {
-                        let event = with_added_failures(event.clone(), storage_failures);
-                        let failure_count = match &event {
-                            ScanEvent::Cancelled { failure_count, .. }
-                            | ScanEvent::Completed { failure_count, .. }
-                            | ScanEvent::Failed { failure_count, .. } => *failure_count,
-                            _ => storage_failures,
-                        };
+                // The failure itself is still news even if recording it
+                // did not survive, so it is always announced.
+                ports.emit(&event);
+            }
+            // Paused/Resumed are owned by their commands, which persist
+            // and emit them directly. The runner never originates them.
+            ScanEvent::Paused | ScanEvent::Resumed => {}
+            _ => {
+                if let Some(state) = terminal_state_of(&event) {
+                    let event = with_added_failures(event.clone(), storage_failures);
+                    let failure_count = match &event {
+                        ScanEvent::Cancelled { failure_count, .. }
+                        | ScanEvent::Completed { failure_count, .. }
+                        | ScanEvent::Failed { failure_count, .. } => *failure_count,
+                        _ => storage_failures,
+                    };
 
-                        if persist_terminal(&app, scan_id, state, failure_count).is_err() {
-                            // There is no valid terminal record to announce as
-                            // successful, so the run is reported as failed.
-                            emit(
-                                &app,
-                                &ScanEvent::Failed {
-                                    code: "storage_integrity".into(),
-                                    message: STORAGE_INTEGRITY_MESSAGE.into(),
-                                    failure_count: failure_count + 1,
-                                    duration_ms: duration_ms_of(&event),
-                                },
-                            );
-                        } else {
-                            emit(&app, &event);
-                        }
-
-                        if let Some(state) = app.try_state::<AppState>() {
-                            state.scans.remove(scan_id);
-                        }
-                        break;
+                    if ports
+                        .persist_terminal(scan_id, state, failure_count)
+                        .is_err()
+                    {
+                        // There is no valid terminal record to announce as
+                        // successful, so the run is reported as failed.
+                        ports.emit(&ScanEvent::Failed {
+                            code: "storage_integrity".into(),
+                            message: STORAGE_INTEGRITY_MESSAGE.into(),
+                            failure_count: failure_count + 1,
+                            duration_ms: duration_ms_of(&event),
+                        });
+                    } else {
+                        ports.emit(&event);
                     }
-                    emit(&app, &event);
+
+                    ports.remove_scan(scan_id);
+                    break;
                 }
+                ports.emit(&event);
             }
         }
+    }
 
-        if let Some(state) = app.try_state::<AppState>() {
-            state.scans.remove(scan_id);
-        }
-    });
+    ports.remove_scan(scan_id);
+}
+
+fn spawn_event_bridge(app: tauri::AppHandle, scan_id: Uuid, receiver: mpsc::Receiver<ScanEvent>) {
+    tauri::async_runtime::spawn(run_event_bridge(TauriPorts(app), scan_id, receiver));
 }
 
 // ---------------------------------------------------------------------------
@@ -675,10 +742,27 @@ pub(crate) async fn start_scan(
             if request.roots.is_empty() {
                 return Err(CommandError::no_roots_selected());
             }
+            let roots: Vec<PathBuf> = request.roots.iter().map(PathBuf::from).collect();
+
             // 5. Core root validation (including unconfirmed network roots)
-            //    runs inside `deep_scan` and surfaces as a `failed` event.
+            //    runs synchronously, here, before scan id generation,
+            //    persistence or spawning: an unconfirmed network root must
+            //    be rejected as a command error, not admitted and failed
+            //    later inside the spawned `deep_scan` task.
+            if let Err(error) = validate_deep_roots(&roots, request.network_consent) {
+                return Err(match error {
+                    DeepScanError::NoRootsSelected => CommandError::no_roots_selected(),
+                    DeepScanError::NetworkConsentRequired => {
+                        CommandError::network_consent_required()
+                    }
+                    DeepScanError::RootUnavailable { message } => {
+                        CommandError::invalid_request(message)
+                    }
+                });
+            }
+
             Some(DeepScanContext {
-                roots: request.roots.iter().map(PathBuf::from).collect(),
+                roots,
                 follow_reparse_points: request.follow_reparse_points,
                 network_consent: request.network_consent,
             })
@@ -955,5 +1039,143 @@ mod tests {
 
         assert!(admitted.cancellation.is_cancelled());
         assert!(!admitted.pause_gate.is_paused());
+    }
+
+    // -----------------------------------------------------------------
+    // persistence-before-notification ordering (spawn_event_bridge)
+    // -----------------------------------------------------------------
+
+    /// Call-order-recording fake standing in for the Tauri-backed ports:
+    /// every persist/emit call appends a label instead of touching a real
+    /// store or window, so the exact call sequence can be asserted.
+    struct RecordingPorts {
+        log: std::sync::Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl EventBridgePorts for RecordingPorts {
+        fn persist_discovery(
+            &self,
+            _scan_id: Uuid,
+            _discovery: &Discovery,
+        ) -> Result<(), CommandError> {
+            self.log.lock().unwrap().push("persist_discovery");
+            Ok(())
+        }
+
+        fn persist_scan_error(
+            &self,
+            _scan_id: Uuid,
+            _scanner_id: &str,
+            _code: &str,
+            _message: &str,
+        ) -> Result<(), CommandError> {
+            self.log.lock().unwrap().push("persist_scan_error");
+            Ok(())
+        }
+
+        fn persist_terminal(
+            &self,
+            _scan_id: Uuid,
+            _state: ScanLifecycleState,
+            _failure_count: u64,
+        ) -> Result<(), CommandError> {
+            self.log.lock().unwrap().push("persist_terminal");
+            Ok(())
+        }
+
+        fn emit(&self, event: &ScanEvent) {
+            let label = match event {
+                ScanEvent::Discovery { .. } => "emit_discovery",
+                ScanEvent::ScannerFailed { .. } => "emit_scanner_failed",
+                ScanEvent::Cancelled { .. } | ScanEvent::Completed { .. } | ScanEvent::Failed { .. } => {
+                    "emit_terminal"
+                }
+                _ => "emit_other",
+            };
+            self.log.lock().unwrap().push(label);
+        }
+
+        fn remove_scan(&self, _scan_id: Uuid) {}
+    }
+
+    fn sample_discovery() -> Discovery {
+        Discovery::unknown("sample", "filesystem.deep", "fingerprint-1".into())
+    }
+
+    fn sample_completed() -> ScanEvent {
+        ScanEvent::Completed {
+            visited: 1,
+            discovered: 1,
+            failure_count: 0,
+            duration_ms: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn persistence_before_notification_discovery() {
+        let log: std::sync::Arc<Mutex<Vec<&'static str>>> = Default::default();
+        let ports = RecordingPorts { log: log.clone() };
+        let (sender, receiver) = mpsc::channel(8);
+        let scan_id = Uuid::new_v4();
+
+        let bridge = tokio::spawn(run_event_bridge(ports, scan_id, receiver));
+
+        sender
+            .send(ScanEvent::Discovery {
+                discovery: sample_discovery(),
+            })
+            .await
+            .unwrap();
+        // A terminal event ends the bridge loop so the test can join it.
+        sender.send(sample_completed()).await.unwrap();
+        drop(sender);
+        bridge.await.unwrap();
+
+        let log = log.lock().unwrap();
+        assert_eq!(&log[0..2], &["persist_discovery", "emit_discovery"]);
+        assert_eq!(&log[2..4], &["persist_terminal", "emit_terminal"]);
+    }
+
+    #[tokio::test]
+    async fn persistence_before_notification_scanner_failed() {
+        let log: std::sync::Arc<Mutex<Vec<&'static str>>> = Default::default();
+        let ports = RecordingPorts { log: log.clone() };
+        let (sender, receiver) = mpsc::channel(8);
+        let scan_id = Uuid::new_v4();
+
+        let bridge = tokio::spawn(run_event_bridge(ports, scan_id, receiver));
+
+        sender
+            .send(ScanEvent::ScannerFailed {
+                scanner_id: "filesystem.deep".into(),
+                code: "permission_denied".into(),
+                message: "denied".into(),
+            })
+            .await
+            .unwrap();
+        sender.send(sample_completed()).await.unwrap();
+        drop(sender);
+        bridge.await.unwrap();
+
+        let log = log.lock().unwrap();
+        assert_eq!(&log[0..2], &["persist_scan_error", "emit_scanner_failed"]);
+        assert_eq!(&log[2..4], &["persist_terminal", "emit_terminal"]);
+    }
+
+    #[tokio::test]
+    async fn persistence_before_notification_terminal() {
+        let log: std::sync::Arc<Mutex<Vec<&'static str>>> = Default::default();
+        let ports = RecordingPorts { log: log.clone() };
+        let (sender, receiver) = mpsc::channel(8);
+        let scan_id = Uuid::new_v4();
+
+        let bridge = tokio::spawn(run_event_bridge(ports, scan_id, receiver));
+
+        sender.send(sample_completed()).await.unwrap();
+        drop(sender);
+        bridge.await.unwrap();
+
+        let log = log.lock().unwrap();
+        assert_eq!(&log[..], &["persist_terminal", "emit_terminal"]);
     }
 }

@@ -10,7 +10,9 @@ pub mod storage;
 pub mod windows;
 
 pub use action::{ActionError, ActionPreview, ActionSource, CommandSpec};
-pub use deep_scan::{DEEP_DIRECTORY_CONCURRENCY, DeepScanContext, DeepScanError, deep_scan};
+pub use deep_scan::{
+    DEEP_DIRECTORY_CONCURRENCY, DeepScanContext, DeepScanError, deep_scan, validate_deep_roots,
+};
 pub use model::*;
 pub use scan::{PythonRootError, QuickScanContext, quick_scan};
 pub use scan_control::{PauseGate, ScanEvent, ScanEventSink, ScanLifecycleState, ScanScope};
