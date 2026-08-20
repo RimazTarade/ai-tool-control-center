@@ -22,6 +22,8 @@ pub enum StoreError {
     InvalidData(#[from] serde_json::Error),
     #[error("discovery not found")]
     NotFound,
+    #[error("finish_scan requires a terminal state (Cancelled, Completed, or Failed), got {0:?}")]
+    NonTerminalFinishState(ScanLifecycleState),
 }
 
 pub struct Store {
@@ -194,10 +196,12 @@ impl Store {
         finished_at: DateTime<Utc>,
         failure_count: u64,
     ) -> Result<(), StoreError> {
-        debug_assert!(matches!(
+        if !matches!(
             state,
             ScanLifecycleState::Cancelled | ScanLifecycleState::Completed | ScanLifecycleState::Failed
-        ));
+        ) {
+            return Err(StoreError::NonTerminalFinishState(state));
+        }
         self.connection.execute(
             "UPDATE scan_runs SET state=?2, finished_at=?3, failure_count=?4 WHERE id=?1",
             params![
@@ -372,6 +376,43 @@ mod tests {
         assert_eq!(row.state, "completed");
         assert_eq!(row.failure_count, 1);
         assert!(row.finished_at.is_some());
+    }
+
+    #[test]
+    fn finish_scan_rejects_non_terminal_states() {
+        let mut store = test_store();
+        let scan_id = Uuid::new_v4();
+        let started = Utc::now();
+
+        store.begin_scan(scan_id, ScanScope::Quick, started).unwrap();
+
+        let running_result = store.finish_scan(
+            scan_id,
+            ScanLifecycleState::Running,
+            started + chrono::Duration::seconds(1),
+            0,
+        );
+        assert!(matches!(
+            running_result,
+            Err(StoreError::NonTerminalFinishState(ScanLifecycleState::Running))
+        ));
+
+        let paused_result = store.finish_scan(
+            scan_id,
+            ScanLifecycleState::Paused,
+            started + chrono::Duration::seconds(1),
+            0,
+        );
+        assert!(matches!(
+            paused_result,
+            Err(StoreError::NonTerminalFinishState(ScanLifecycleState::Paused))
+        ));
+
+        // Row must remain untouched: still running, no finished_at.
+        let row = store.scan_run_for_test(scan_id).unwrap().unwrap();
+        assert_eq!(row.state, "running");
+        assert!(row.finished_at.is_none());
+        assert_eq!(row.failure_count, 0);
     }
 
     #[test]
