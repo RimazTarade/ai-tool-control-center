@@ -457,7 +457,7 @@ fn build_quick_scan_jobs(context: QuickScanContext) -> Vec<ScannerJob> {
                     (root_report.errors, report)
                 });
 
-                let (mut errors, report) = match task.await {
+                let (root_errors, report) = match task.await {
                     Ok(result) => result,
                     Err(_) => {
                         return ScannerTerminal::Failed {
@@ -467,20 +467,18 @@ fn build_quick_scan_jobs(context: QuickScanContext) -> Vec<ScannerJob> {
                     }
                 };
 
-                // `KnownLocationError::root`/`message` may embed real filesystem
-                // paths (including per-user profile paths and resolved shortcut
-                // targets). Scan events and persisted scan errors must never
-                // carry a raw path, so only a stable, path-free count is
-                // reported here — never the error's own text.
-                let known_location_error_count = report.errors.len();
-                for _ in 0..known_location_error_count {
-                    errors.push("known location root unreadable".to_string());
-                }
+                // `root_errors` (from resolving known-folder paths) and
+                // `KnownLocationError::root`/`message` (from walking them) may
+                // both embed real filesystem paths, including per-user profile
+                // paths and resolved shortcut targets. Scan events and
+                // persisted scan errors must never carry a raw path, so only a
+                // stable, path-free issue count is reported here — never
+                // either error source's own text.
+                let issue_count = root_errors.len() + report.errors.len();
 
-                if !errors.is_empty() {
+                if issue_count > 0 {
                     let message = format!(
-                        "{} known-location scan issue(s) occurred; see application logs for detail",
-                        errors.len()
+                        "{issue_count} known-location scan issue(s) occurred; see application logs for detail"
                     );
                     emit_partial_failure(&events, "windows.known_location", message).await;
                 }

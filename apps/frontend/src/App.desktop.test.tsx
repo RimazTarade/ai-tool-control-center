@@ -126,6 +126,30 @@ describe("scan lifecycle controls", () => {
     expect(cancelScan).toHaveBeenCalledWith({ scanId: "scan-1", revision: "scan-r2" });
   });
 
+  it("resyncs the per-scan revision from a pause failure's attached state instead of getting stuck", async () => {
+    const user = userEvent.setup();
+    let emit: (event: unknown) => void = () => undefined;
+    await beginQuickScanFlow(user, (handler) => {
+      emit = handler as (event: unknown) => void;
+    });
+
+    // pause_scan already rotated the revision in memory before persistence
+    // failed, so the error carries the new state instead of an event.
+    vi.mocked(pauseScan).mockRejectedValueOnce({
+      code: "storage_integrity",
+      message: "Local storage is unavailable",
+      state: { scanId: "scan-1", state: "paused", revision: "scan-r2" },
+    });
+    await user.click(await screen.findByRole("button", { name: "Pause" }));
+
+    // The bar picks up the new state/revision, and a subsequent mutation
+    // uses the resynced revision rather than the stale pre-pause one.
+    expect(await screen.findByLabelText(/scan progress/i)).toHaveTextContent("Paused");
+    vi.mocked(resumeScan).mockResolvedValue({ scanId: "scan-1", state: "running", revision: "scan-r3" });
+    await user.click(await screen.findByRole("button", { name: "Resume" }));
+    expect(resumeScan).toHaveBeenCalledWith({ scanId: "scan-1", revision: "scan-r2" });
+  });
+
   it("shows a scanner_failed warning without hiding prior discoveries", async () => {
     const user = userEvent.setup();
     let emit: (event: unknown) => void = () => undefined;

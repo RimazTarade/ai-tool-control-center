@@ -35,7 +35,7 @@ use uuid::Uuid;
 pub struct CommandError {
     pub code: &'static str,
     pub message: String,
-    /// Present only for `storage_integrity` on a pause/resume whose in-memory
+    /// Present only when `persist_lifecycle` fails on a pause/resume whose in-memory
     /// state (and revision) already changed before persistence failed. Lets
     /// the frontend adopt the new revision instead of being permanently
     /// stuck retrying with a now-stale one.

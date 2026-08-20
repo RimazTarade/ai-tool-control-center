@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { bootstrap, cancelScan, pauseScan, pickScanRoots, resumeScan, reviewDiscovery, startScan } from "./api";
-import type { BootstrapState, Discovery, PageName, ScanEvent, ScanLifecycleState, ScanMode, ScanRequest } from "./model";
+import type { BootstrapState, Discovery, PageName, ScanEvent, ScanLifecycleState, ScanMode, ScanRequest, ScanState } from "./model";
 
 const pages: PageName[] = ["Overview", "Inventory", "Review Queue", "Health", "Dependencies", "Activity", "Adapter Packs", "Backups", "Settings"];
 
@@ -315,8 +315,15 @@ export default function App() {
     try {
       const result = await pauseScan({ scanId: activeScan.scanId, revision: activeScan.revision });
       setActiveScan((current) => (current ? { ...current, revision: result.revision, state: result.state } : current));
-    } catch {
-      // the next scan:event will reconcile state; nothing else to do here.
+    } catch (error) {
+      // No scan:event is emitted for this failure path: if the command
+      // already rotated the per-scan revision before persistence failed, it
+      // reports the new revision on the error so we can resync here instead
+      // of being stuck retrying with a now-stale one.
+      const next = (error as { state?: ScanState } | null)?.state;
+      if (next) {
+        setActiveScan((current) => (current ? { ...current, revision: next.revision, state: next.state } : current));
+      }
     }
   }
 
@@ -329,8 +336,13 @@ export default function App() {
     try {
       const result = await resumeScan({ scanId: activeScan.scanId, revision: activeScan.revision });
       setActiveScan((current) => (current ? { ...current, revision: result.revision, state: result.state } : current));
-    } catch {
-      // the next scan:event will reconcile state; nothing else to do here.
+    } catch (error) {
+      // See onPause: resync from the error's attached state, if present,
+      // since no scan:event is emitted for a persistence failure here.
+      const next = (error as { state?: ScanState } | null)?.state;
+      if (next) {
+        setActiveScan((current) => (current ? { ...current, revision: next.revision, state: next.state } : current));
+      }
     }
   }
 
