@@ -347,6 +347,18 @@ where
                                 discovered: count,
                             },
                             Err(error) if error.code() == "scanner_cancelled" => {
+                                if error.termination()
+                                    == Some(crate::python_supervisor::PythonTermination::Forced)
+                                {
+                                    let _ = events
+                                        .scanner_failed(
+                                            "python.config".to_string(),
+                                            "scanner_terminated",
+                                            "Python scanner process tree required forced termination",
+                                        )
+                                        .await;
+                                }
+
                                 ScannerTerminal::Cancelled {
                                     visited: 0,
                                     discovered: forwarded,
@@ -1116,6 +1128,57 @@ mod tests {
 
         assert!(saw_python_discovery);
         assert!(saw_cancelled);
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn python_forced_termination_reports_scanner_terminated_and_cancels_scan() {
+        let job = build_python_config_job_with_runner(
+            Ok(PathBuf::from(r"C:\app")),
+            Vec::new(),
+            move |_app_root, _roots, _timeout, cancellation, _discoveries| async move {
+                cancellation.cancelled().await;
+                Err(crate::python_supervisor::PythonSupervisorError::cancelled_with(
+                    crate::python_supervisor::PythonTermination::Forced,
+                ))
+            },
+        );
+
+        let cancellation = CancellationToken::new();
+        let trigger = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            trigger.cancel();
+        });
+
+        let (sender, mut receiver) = mpsc::channel(16);
+        let events = ScanEventSink::new(sender);
+        run_scanner_jobs(vec![job], 1, events, PauseGate::default(), cancellation).await;
+
+        let mut saw_scanner_terminated = false;
+        let mut saw_cancelled = false;
+        let mut events_in_order = Vec::new();
+
+        while let Ok(event) = receiver.try_recv() {
+            events_in_order.push(match &event {
+                ScanEvent::ScannerFailed { .. } => "scanner_failed",
+                ScanEvent::Cancelled { .. } => "cancelled",
+                _ => "other",
+            });
+
+            match event {
+                ScanEvent::ScannerFailed {
+                    scanner_id, code, ..
+                } if scanner_id == "python.config" && code == "scanner_terminated" => {
+                    saw_scanner_terminated = true;
+                }
+                ScanEvent::Cancelled { .. } => saw_cancelled = true,
+                _ => {}
+            }
+        }
+
+        assert!(saw_scanner_terminated);
+        assert!(saw_cancelled);
+        assert_eq!(events_in_order.last(), Some(&"cancelled"));
     }
     #[cfg(windows)]
     #[tokio::test]

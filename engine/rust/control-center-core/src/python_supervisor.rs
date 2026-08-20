@@ -190,38 +190,64 @@ impl Drop for WindowsJob {
     }
 }
 
+/// Distinguishes a cooperative Python process-tree exit (the child settled
+/// within the 2-second grace period after stdin was closed) from a forced
+/// exit (the Windows Job Object had to be closed because the process tree
+/// did not exit in time).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PythonTermination {
+    Cooperative,
+    Forced,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PythonSupervisorError {
     code: &'static str,
+    termination: Option<PythonTermination>,
 }
 
 impl PythonSupervisorError {
     pub fn protocol() -> Self {
         Self {
             code: "scanner_protocol",
+            termination: None,
         }
     }
 
     pub fn timeout() -> Self {
         Self {
             code: "scanner_timeout",
+            termination: None,
         }
     }
 
     pub fn cancelled() -> Self {
         Self {
             code: "scanner_cancelled",
+            termination: None,
+        }
+    }
+
+    pub fn cancelled_with(termination: PythonTermination) -> Self {
+        Self {
+            code: "scanner_cancelled",
+            termination: Some(termination),
         }
     }
 
     pub fn failed(_detail: &str) -> Self {
         Self {
             code: "scanner_failed",
+            termination: None,
         }
     }
 
     pub fn code(&self) -> &'static str {
         self.code
+    }
+
+    pub fn termination(&self) -> Option<PythonTermination> {
+        self.termination
     }
 }
 
@@ -302,6 +328,30 @@ struct SupervisorControl {
     cancellation: tokio_util::sync::CancellationToken,
 }
 
+/// Called once root cancellation fires and the child's stdin has already
+/// been closed (child stdin is shut down immediately after the scan
+/// request is written, before either select loop below can observe
+/// cancellation). Waits up to 2 seconds for the process tree to exit on
+/// its own; if it does not, closes the Windows Job Object to force
+/// termination and waits for the child to settle.
+#[cfg(windows)]
+async fn await_cancellation_grace_period(
+    child: &mut tokio::process::Child,
+    job: WindowsJob,
+) -> PythonTermination {
+    if tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+        .await
+        .is_err()
+    {
+        drop(job);
+        let _ = child.wait().await;
+        PythonTermination::Forced
+    } else {
+        drop(job);
+        PythonTermination::Cooperative
+    }
+}
+
 #[cfg(windows)]
 async fn run_supervised_process<F>(
     program: &Path,
@@ -378,16 +428,9 @@ where
     let count = tokio::select! {
         result = &mut consume => result?,
         _ = control.cancellation.cancelled() => {
-            if tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
-                .await
-                .is_err()
-            {
-                drop(job);
-                let _ = child.wait().await;
-            }
-
+            let termination = await_cancellation_grace_period(&mut child, job).await;
             let _ = stderr_task.await;
-            return Err(PythonSupervisorError::cancelled());
+            return Err(PythonSupervisorError::cancelled_with(termination));
         }
         _ = tokio::time::sleep_until(deadline) => {
             drop(job);
@@ -402,16 +445,9 @@ where
             result.map_err(|_| PythonSupervisorError::failed("child wait failed"))?
         }
         _ = control.cancellation.cancelled() => {
-            if tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
-                .await
-                .is_err()
-            {
-                drop(job);
-                let _ = child.wait().await;
-            }
-
+            let termination = await_cancellation_grace_period(&mut child, job).await;
             let _ = stderr_task.await;
-            return Err(PythonSupervisorError::cancelled());
+            return Err(PythonSupervisorError::cancelled_with(termination));
         }
         _ = tokio::time::sleep_until(deadline) => {
             drop(job);
@@ -1407,6 +1443,96 @@ Start-Sleep -Seconds 30
         assert!(
             !output.contains(&pid.to_string()),
             "descendant process {pid} survived supervisor cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_past_grace_period_reports_forced_termination() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("scanner-cancel-forced-descendant.ps1");
+        let pid_file = temp.path().join("cancel-forced-descendant.pid");
+
+        // This child ignores stdin shutdown: it never reads stdin again after
+        // the initial ReadLine, and keeps its descendant alive well past the
+        // 2-second grace period so the supervisor must fall back to closing
+        // the Windows Job Object.
+        std::fs::write(
+            &script,
+            format!(
+                r#"$null = [Console]::In.ReadLine()
+$child = Start-Process ping.exe -ArgumentList '127.0.0.1','-n','30' -PassThru
+Set-Content -Path '{}' -Value $child.Id
+Start-Sleep -Seconds 30
+"#,
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+
+        let powershell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+
+        let args = vec![
+            OsString::from("-NoProfile"),
+            OsString::from("-File"),
+            script.into_os_string(),
+        ];
+
+        let request = r#"{"protocol_version":1,"request_id":"req-cancel-forced-descendant","operation":"scan","roots":[]}
+"#;
+
+        let cancellation = CancellationToken::new();
+        let trigger = cancellation.clone();
+
+        let pid_wait = pid_file.clone();
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                if pid_wait.is_file() {
+                    trigger.cancel();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        });
+
+        let error = run_supervised_process(
+            &powershell,
+            &args,
+            temp.path(),
+            &[],
+            request,
+            SupervisorControl {
+                timeout: Duration::from_secs(10),
+                cancellation,
+            },
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), "scanner_cancelled");
+        assert_eq!(error.termination(), Some(PythonTermination::Forced));
+
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let output = std::process::Command::new("tasklist.exe")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .unwrap();
+
+        let output = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !output.contains(&pid.to_string()),
+            "descendant process {pid} survived forced supervisor cancellation"
         );
     }
 }
