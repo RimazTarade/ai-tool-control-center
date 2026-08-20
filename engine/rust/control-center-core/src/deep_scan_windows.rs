@@ -56,10 +56,10 @@ impl DirectoryIdentity {
 #[cfg(windows)]
 pub(crate) fn classify_root(path: &Path) -> io::Result<RootLocation> {
     use std::path::{Component, Prefix};
+    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
     use windows::Win32::System::WindowsProgramming::{
         DRIVE_CDROM, DRIVE_FIXED, DRIVE_RAMDISK, DRIVE_REMOTE, DRIVE_REMOVABLE,
     };
-    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
     use windows::core::PCWSTR;
 
     let prefix = match path.components().next() {
@@ -136,8 +136,8 @@ pub(crate) fn entry_policy(path: &Path) -> io::Result<EntryPolicy> {
 #[cfg(windows)]
 fn classify_attributes(attributes: u32) -> EntryPolicy {
     use windows::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
-        FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
+        FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_ATTRIBUTE_REPARSE_POINT,
     };
 
     let placeholder = attributes & FILE_ATTRIBUTE_OFFLINE.0 != 0
@@ -219,8 +219,8 @@ mod tests {
 
     #[cfg(windows)]
     use windows::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
-        FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
+        FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_ATTRIBUTE_REPARSE_POINT,
     };
 
     #[cfg(windows)]

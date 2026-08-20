@@ -13,8 +13,8 @@ use crate::runtime_root;
 use chrono::{DateTime, Utc};
 use control_center_core::{
     Discovery, PauseGate, QuickScanContext, ScanEvent, ScanEventSink, ScanLifecycleState,
-    ScanScope, Store, deep_scan, deep_scan::DeepScanContext, deep_scan::DeepScanError,
-    quick_scan, validate_deep_roots,
+    ScanScope, Store, deep_scan, deep_scan::DeepScanContext, deep_scan::DeepScanError, quick_scan,
+    validate_deep_roots,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, sync::Mutex};
@@ -292,7 +292,9 @@ impl ScanRegistry {
             .scans
             .lock()
             .map_err(|_| CommandError::storage_integrity("Scan control state is unavailable"))?;
-        let active = scans.get_mut(&id).ok_or_else(CommandError::scan_not_found)?;
+        let active = scans
+            .get_mut(&id)
+            .ok_or_else(CommandError::scan_not_found)?;
 
         if presented_revision != active.revision.as_str() {
             return Err(CommandError::conflict());
@@ -458,9 +460,8 @@ fn persist_scan_error(
     let state = app
         .try_state::<AppState>()
         .ok_or_else(|| CommandError::storage_integrity("Local storage is unavailable"))?;
-    state.with_store(|store| {
-        store.record_scan_error(scan_id, scanner_id, code, message, Utc::now())
-    })
+    state
+        .with_store(|store| store.record_scan_error(scan_id, scanner_id, code, message, Utc::now()))
 }
 
 fn persist_terminal(
@@ -791,9 +792,11 @@ pub(crate) async fn start_scan(
     // id/revision/token generation, `scan_runs` persistence, workspace
     // revision rotation and registry insert, all atomically.
     let scope = request.mode;
-    let admitted = state.scans.admit(&request.revision, scope, |scan_id, started_at| {
-        state.with_store(|store| store.begin_scan(scan_id, scope, started_at))
-    })?;
+    let admitted = state
+        .scans
+        .admit(&request.revision, scope, |scan_id, started_at| {
+            state.with_store(|store| store.begin_scan(scan_id, scope, started_at))
+        })?;
 
     let scan_id = Uuid::parse_str(&admitted.handle.scan_id)
         .map_err(|_| CommandError::invalid_request("Invalid scan id"))?;
@@ -832,7 +835,8 @@ fn persist_lifecycle(
     scan_id: &str,
     lifecycle: ScanLifecycleState,
 ) -> Result<(), CommandError> {
-    let id = Uuid::parse_str(scan_id).map_err(|_| CommandError::invalid_request("Invalid scan id"))?;
+    let id =
+        Uuid::parse_str(scan_id).map_err(|_| CommandError::invalid_request("Invalid scan id"))?;
     state.with_store(|store| store.set_scan_state(id, lifecycle))
 }
 
@@ -940,7 +944,10 @@ mod tests {
         // The stale attempt must not have resumed the gate or rotated again.
         assert!(admitted.pause_gate.is_paused());
         assert_eq!(
-            registry.state_of(&admitted.handle.scan_id).unwrap().revision,
+            registry
+                .state_of(&admitted.handle.scan_id)
+                .unwrap()
+                .revision,
             paused.state.revision
         );
     }
@@ -1019,7 +1026,10 @@ mod tests {
             "scan_not_found"
         );
         assert_eq!(
-            registry.cancel("not-a-uuid".into(), "whatever").unwrap_err().code,
+            registry
+                .cancel("not-a-uuid".into(), "whatever")
+                .unwrap_err()
+                .code,
             "invalid_request"
         );
     }
@@ -1087,9 +1097,9 @@ mod tests {
             let label = match event {
                 ScanEvent::Discovery { .. } => "emit_discovery",
                 ScanEvent::ScannerFailed { .. } => "emit_scanner_failed",
-                ScanEvent::Cancelled { .. } | ScanEvent::Completed { .. } | ScanEvent::Failed { .. } => {
-                    "emit_terminal"
-                }
+                ScanEvent::Cancelled { .. }
+                | ScanEvent::Completed { .. }
+                | ScanEvent::Failed { .. } => "emit_terminal",
                 _ => "emit_other",
             };
             self.log.lock().unwrap().push(label);

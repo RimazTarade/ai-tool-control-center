@@ -10,13 +10,13 @@
 //! prevents cycles via the stable directory identity from
 //! [`crate::deep_scan_windows`].
 
+use crate::Discovery;
 use crate::deep_scan_windows::{
     DirectoryIdentity, EntryPolicy, RootLocation, classify_root, entry_policy,
     stable_directory_identity,
 };
 use crate::scan::{fingerprint, looks_relevant, quick_excluded_names};
 use crate::scan_control::{PauseGate, ScanEvent, ScanEventSink, ScanScope};
-use crate::Discovery;
 use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -439,8 +439,7 @@ async fn run_deep_scan(
         let _ = events
             .critical(ScanEvent::Failed {
                 code: "deep_scan_coordinator_failed".into(),
-                message: "Deep scan traversal stopped due to an internal coordinator error"
-                    .into(),
+                message: "Deep scan traversal stopped due to an internal coordinator error".into(),
                 failure_count,
                 duration_ms,
             })
@@ -472,8 +471,8 @@ async fn run_deep_scan(
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::mpsc;
 
@@ -572,7 +571,11 @@ mod tests {
         }
 
         fn was_read(&self, path: &Path) -> bool {
-            self.read_log.lock().unwrap().iter().any(|logged| logged == path)
+            self.read_log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|logged| logged == path)
         }
 
         fn find(&self, parent: &Path, name: &str) -> Option<FakeEntry> {
@@ -611,11 +614,15 @@ mod tests {
 
         fn entry_policy(&self, path: &Path) -> io::Result<EntryPolicy> {
             let parent = path.parent().unwrap_or_else(|| Path::new(""));
-            let name = path.file_name().and_then(|value| value.to_str()).unwrap_or_default();
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
             match self.find(parent, name) {
-                Some(entry) if entry.metadata_error => {
-                    Err(io::Error::new(io::ErrorKind::Other, "simulated metadata error"))
-                }
+                Some(entry) if entry.metadata_error => Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "simulated metadata error",
+                )),
                 Some(entry) => Ok(EntryPolicy {
                     reparse_point: entry.reparse,
                     placeholder: entry.placeholder,
@@ -626,7 +633,10 @@ mod tests {
 
         fn directory_identity(&self, path: &Path) -> io::Result<DirectoryIdentity> {
             let parent = path.parent().unwrap_or_else(|| Path::new(""));
-            let name = path.file_name().and_then(|value| value.to_str()).unwrap_or_default();
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
             self.find(parent, name)
                 .and_then(|entry| entry.identity)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no fake identity"))
@@ -734,7 +744,11 @@ mod tests {
             .expect("scan task must not panic");
         drop(drain);
 
-        assert_eq!(fake.read_starts(), 13, "root + 12 children must all be read");
+        assert_eq!(
+            fake.read_starts(),
+            13,
+            "root + 12 children must all be read"
+        );
     }
 
     #[tokio::test]
@@ -780,7 +794,11 @@ mod tests {
 
         let terminal = rx.recv().await.expect("expected a terminal event");
         assert!(matches!(terminal, ScanEvent::Cancelled { .. }));
-        assert_eq!(fake.read_starts(), 0, "cancellation while paused must launch nothing");
+        assert_eq!(
+            fake.read_starts(),
+            0,
+            "cancellation while paused must launch nothing"
+        );
 
         scan_task.await.unwrap();
     }
@@ -875,9 +893,11 @@ mod tests {
         .await;
         let received = drain.await.unwrap();
 
-        assert!(!received
-            .iter()
-            .any(|event| matches!(event, ScanEvent::Discovery { .. })));
+        assert!(
+            !received
+                .iter()
+                .any(|event| matches!(event, ScanEvent::Discovery { .. }))
+        );
     }
 
     #[tokio::test]
@@ -915,7 +935,10 @@ mod tests {
 
         let read_a = fake.was_read(&root.join("a"));
         let read_b = fake.was_read(&root.join("b"));
-        assert!(read_a ^ read_b, "exactly one of the two same-identity directories should be read");
+        assert!(
+            read_a ^ read_b,
+            "exactly one of the two same-identity directories should be read"
+        );
     }
 
     #[tokio::test]
@@ -1106,7 +1129,10 @@ mod tests {
         let terminal = received.last().expect("expected a terminal event");
         match terminal {
             ScanEvent::Completed { failure_count, .. } => {
-                assert!(*failure_count >= 1, "failure_count must reflect the metadata error");
+                assert!(
+                    *failure_count >= 1,
+                    "failure_count must reflect the metadata error"
+                );
             }
             other => panic!("expected Completed terminal event, got {other:?}"),
         }
@@ -1120,7 +1146,10 @@ mod tests {
         tree.insert(root.join("panics"), Vec::new());
         tree.insert(root.join("ok"), Vec::new());
 
-        let fake = Arc::new(FakeDeepScanIo::with_panic_on_read(tree, root.join("panics")));
+        let fake = Arc::new(FakeDeepScanIo::with_panic_on_read(
+            tree,
+            root.join("panics"),
+        ));
         let context = DeepScanContext {
             roots: vec![root.clone()],
             follow_reparse_points: false,
@@ -1140,7 +1169,10 @@ mod tests {
         .await;
         let received = drain.await.unwrap();
 
-        assert!(fake.was_read(&root.join("ok")), "traversal must continue past the panicking directory");
+        assert!(
+            fake.was_read(&root.join("ok")),
+            "traversal must continue past the panicking directory"
+        );
 
         let saw_failure = received.iter().any(|event| {
             matches!(
@@ -1149,14 +1181,19 @@ mod tests {
                     if scanner_id == "filesystem.deep" && code == "directory_read_panicked"
             )
         });
-        assert!(saw_failure, "expected a ScannerFailed event for the panicking directory");
+        assert!(
+            saw_failure,
+            "expected a ScannerFailed event for the panicking directory"
+        );
 
         let terminal = received.last().expect("expected a terminal event");
         match terminal {
             ScanEvent::Completed { failure_count, .. } => {
                 assert!(*failure_count >= 1);
             }
-            other => panic!("expected Completed terminal event (panic must not fail the whole scan), got {other:?}"),
+            other => panic!(
+                "expected Completed terminal event (panic must not fail the whole scan), got {other:?}"
+            ),
         }
     }
 }

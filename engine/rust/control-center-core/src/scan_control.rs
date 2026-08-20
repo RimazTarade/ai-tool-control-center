@@ -166,7 +166,10 @@ impl ScanEventSink {
     /// Lossless send for use from a blocking (non-async) context, such as
     /// a `spawn_blocking` filesystem walk. Blocks the current thread until
     /// channel capacity is available rather than dropping the event.
-    pub fn blocking_critical(&self, event: ScanEvent) -> Result<(), mpsc::error::SendError<ScanEvent>> {
+    pub fn blocking_critical(
+        &self,
+        event: ScanEvent,
+    ) -> Result<(), mpsc::error::SendError<ScanEvent>> {
         self.tx.blocking_send(event)
     }
 
@@ -293,7 +296,13 @@ mod tests {
 
         // Drain the one buffered progress event to free capacity.
         let first = rx.recv().await.unwrap();
-        assert!(matches!(first, ScanEvent::Progress { completed_units: 1, .. }));
+        assert!(matches!(
+            first,
+            ScanEvent::Progress {
+                completed_units: 1,
+                ..
+            }
+        ));
 
         let sink_clone = sink.clone();
         let sender = tokio::spawn(async move {

@@ -82,7 +82,7 @@ describe("run scan dialog", () => {
 });
 
 describe("scan lifecycle controls", () => {
-  async function startQuickScan(user: ReturnType<typeof userEvent.setup>, onEvent: (event: unknown) => void) {
+  async function beginQuickScanFlow(user: ReturnType<typeof userEvent.setup>, onEvent: (event: unknown) => void) {
     vi.mocked(startScan).mockImplementation(async (_request, handler) => {
       onEvent(handler);
       return {
@@ -98,7 +98,7 @@ describe("scan lifecycle controls", () => {
   it("shows Paused after a paused event", async () => {
     const user = userEvent.setup();
     let emit: (event: unknown) => void = () => undefined;
-    await startQuickScan(user, (handler) => {
+    await beginQuickScanFlow(user, (handler) => {
       emit = handler as (event: unknown) => void;
     });
 
@@ -110,7 +110,7 @@ describe("scan lifecycle controls", () => {
   it("calls resumeScan with the current revision and stores the returned revision", async () => {
     const user = userEvent.setup();
     let emit: (event: unknown) => void = () => undefined;
-    await startQuickScan(user, (handler) => {
+    await beginQuickScanFlow(user, (handler) => {
       emit = handler as (event: unknown) => void;
     });
     emit({ kind: "paused" });
@@ -129,7 +129,7 @@ describe("scan lifecycle controls", () => {
   it("shows a scanner_failed warning without hiding prior discoveries", async () => {
     const user = userEvent.setup();
     let emit: (event: unknown) => void = () => undefined;
-    await startQuickScan(user, (handler) => {
+    await beginQuickScanFlow(user, (handler) => {
       emit = handler as (event: unknown) => void;
     });
     emit({ kind: "discovery", discovery: { id: "d1", suggested_name: "Found tool", suggested_type: "runtime", source_scanner: "s", confidence: "high", evidence: [], observed_at: "x", health_state: "unknown" } });
@@ -142,7 +142,7 @@ describe("scan lifecycle controls", () => {
   it("removes active controls on terminal but leaves a notice, and refreshes workspace revision", async () => {
     const user = userEvent.setup();
     let emit: (event: unknown) => void = () => undefined;
-    await startQuickScan(user, (handler) => {
+    await beginQuickScanFlow(user, (handler) => {
       emit = handler as (event: unknown) => void;
     });
 

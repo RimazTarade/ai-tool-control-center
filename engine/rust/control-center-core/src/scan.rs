@@ -106,8 +106,7 @@ enum ScannerTerminal {
 }
 
 type ScannerFuture = Pin<Box<dyn Future<Output = ScannerTerminal> + Send>>;
-type ScannerRunner =
-    Box<dyn FnOnce(ScanEventSink, CancellationToken) -> ScannerFuture + Send>;
+type ScannerRunner = Box<dyn FnOnce(ScanEventSink, CancellationToken) -> ScannerFuture + Send>;
 
 struct ScannerJob {
     scanner_id: String,
@@ -650,7 +649,12 @@ impl ScanCoordinatorState {
     /// carrying the accumulated failure count and elapsed duration.
     /// Cancellation of the root token wins a race with child settlement
     /// when choosing the final terminal state.
-    async fn settle(&mut self, scanner_id: &str, terminal: ScannerTerminal, events: &ScanEventSink) {
+    async fn settle(
+        &mut self,
+        scanner_id: &str,
+        terminal: ScannerTerminal,
+        events: &ScanEventSink,
+    ) {
         if !self.settlement.mark_settled(scanner_id) {
             return;
         }
@@ -672,7 +676,9 @@ impl ScanCoordinatorState {
                 self.cancelled = true;
             }
             ScannerTerminal::Failed { code, message } => {
-                let _ = events.scanner_failed(scanner_id.to_string(), code, message).await;
+                let _ = events
+                    .scanner_failed(scanner_id.to_string(), code, message)
+                    .await;
             }
         }
 
@@ -722,7 +728,14 @@ pub async fn quick_scan(
     #[cfg(windows)]
     {
         let jobs = build_quick_scan_jobs(context);
-        run_scanner_jobs(jobs, QUICK_SCAN_CONCURRENCY, events, pause_gate, cancellation).await;
+        run_scanner_jobs(
+            jobs,
+            QUICK_SCAN_CONCURRENCY,
+            events,
+            pause_gate,
+            cancellation,
+        )
+        .await;
     }
 
     #[cfg(not(windows))]
@@ -757,7 +770,9 @@ pub async fn quick_scan(
             },
         };
 
-        coordinator.settle(SCANNER_ID, terminal, &terminal_events).await;
+        coordinator
+            .settle(SCANNER_ID, terminal, &terminal_events)
+            .await;
     }
 }
 
@@ -970,7 +985,14 @@ mod tests {
 
         let (sender, mut receiver) = mpsc::channel(16);
         let events = ScanEventSink::new(sender);
-        run_scanner_jobs(vec![job], 1, events, PauseGate::default(), CancellationToken::new()).await;
+        run_scanner_jobs(
+            vec![job],
+            1,
+            events,
+            PauseGate::default(),
+            CancellationToken::new(),
+        )
+        .await;
 
         let mut saw_discovery = false;
         let mut saw_completed = false;
@@ -1009,7 +1031,14 @@ mod tests {
 
         let (sender, mut receiver) = mpsc::channel(16);
         let events = ScanEventSink::new(sender);
-        run_scanner_jobs(vec![job], 1, events, PauseGate::default(), CancellationToken::new()).await;
+        run_scanner_jobs(
+            vec![job],
+            1,
+            events,
+            PauseGate::default(),
+            CancellationToken::new(),
+        )
+        .await;
 
         let mut saw_completed = false;
         let mut saw_python_failure = false;
@@ -1112,7 +1141,14 @@ mod tests {
 
         let (sender, mut receiver) = mpsc::channel(16);
         let events = ScanEventSink::new(sender);
-        run_scanner_jobs(vec![job, native_job], 2, events, PauseGate::default(), CancellationToken::new()).await;
+        run_scanner_jobs(
+            vec![job, native_job],
+            2,
+            events,
+            PauseGate::default(),
+            CancellationToken::new(),
+        )
+        .await;
 
         let mut saw_python_discovery = false;
         let mut saw_cancelled = false;
@@ -1144,9 +1180,11 @@ mod tests {
             Vec::new(),
             move |_app_root, _roots, _timeout, cancellation, _discoveries| async move {
                 cancellation.cancelled().await;
-                Err(crate::python_supervisor::PythonSupervisorError::cancelled_with(
-                    crate::python_supervisor::PythonTermination::Forced,
-                ))
+                Err(
+                    crate::python_supervisor::PythonSupervisorError::cancelled_with(
+                        crate::python_supervisor::PythonTermination::Forced,
+                    ),
+                )
             },
         );
 
@@ -1271,7 +1309,14 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(16);
         let events = ScanEventSink::new(sender);
         let run = tokio::spawn(async move {
-            run_scanner_jobs(vec![job], 1, events, PauseGate::default(), CancellationToken::new()).await;
+            run_scanner_jobs(
+                vec![job],
+                1,
+                events,
+                PauseGate::default(),
+                CancellationToken::new(),
+            )
+            .await;
         });
 
         let mut found = false;
@@ -1342,7 +1387,14 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(16);
         let events = ScanEventSink::new(sender);
 
-        run_scanner_jobs(jobs, 2, events, PauseGate::default(), CancellationToken::new()).await;
+        run_scanner_jobs(
+            jobs,
+            2,
+            events,
+            PauseGate::default(),
+            CancellationToken::new(),
+        )
+        .await;
 
         let mut saw_failure = false;
         let mut saw_completed = false;
@@ -1401,7 +1453,14 @@ mod tests {
         let events = ScanEventSink::new(sender);
 
         let run = tokio::spawn(async move {
-            run_scanner_jobs(jobs, 2, events, PauseGate::default(), CancellationToken::new()).await;
+            run_scanner_jobs(
+                jobs,
+                2,
+                events,
+                PauseGate::default(),
+                CancellationToken::new(),
+            )
+            .await;
         });
 
         tokio::time::timeout(Duration::from_millis(100), async {
@@ -1513,7 +1572,14 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(16);
         let events = ScanEventSink::new(sender);
 
-        run_scanner_jobs(jobs, 2, events, PauseGate::default(), CancellationToken::new()).await;
+        run_scanner_jobs(
+            jobs,
+            2,
+            events,
+            PauseGate::default(),
+            CancellationToken::new(),
+        )
+        .await;
 
         let mut saw_timeout = false;
         let mut saw_completed = false;
@@ -1577,7 +1643,14 @@ mod tests {
         let (sender, _receiver) = mpsc::channel(16);
         let events = ScanEventSink::new(sender);
 
-        run_scanner_jobs(jobs, 2, events, PauseGate::default(), CancellationToken::new()).await;
+        run_scanner_jobs(
+            jobs,
+            2,
+            events,
+            PauseGate::default(),
+            CancellationToken::new(),
+        )
+        .await;
 
         assert_eq!(active.load(Ordering::SeqCst), 0);
         assert_eq!(peak.load(Ordering::SeqCst), 2);
@@ -1752,7 +1825,14 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(16);
         let events = ScanEventSink::new(sender);
 
-        run_scanner_jobs(jobs, 2, events, PauseGate::default(), CancellationToken::new()).await;
+        run_scanner_jobs(
+            jobs,
+            2,
+            events,
+            PauseGate::default(),
+            CancellationToken::new(),
+        )
+        .await;
 
         let mut scanner_ids = Vec::new();
 
@@ -1807,7 +1887,14 @@ mod tests {
         });
 
         let run = tokio::spawn(async move {
-            run_scanner_jobs(vec![job], 1, events, PauseGate::default(), CancellationToken::new()).await;
+            run_scanner_jobs(
+                vec![job],
+                1,
+                events,
+                PauseGate::default(),
+                CancellationToken::new(),
+            )
+            .await;
         });
 
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1928,7 +2015,14 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(16);
         let events = ScanEventSink::new(sender);
         let run = tokio::spawn(async move {
-            run_scanner_jobs(vec![job], 1, events, PauseGate::default(), CancellationToken::new()).await;
+            run_scanner_jobs(
+                vec![job],
+                1,
+                events,
+                PauseGate::default(),
+                CancellationToken::new(),
+            )
+            .await;
         });
 
         let mut completed = false;

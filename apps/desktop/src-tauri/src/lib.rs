@@ -44,8 +44,8 @@ fn review_discovery(
     decision: String,
     state: State<'_, AppState>,
 ) -> Result<(), CommandError> {
-    let id = Uuid::parse_str(&id)
-        .map_err(|_| CommandError::invalid_request("Invalid discovery id"))?;
+    let id =
+        Uuid::parse_str(&id).map_err(|_| CommandError::invalid_request("Invalid discovery id"))?;
     let decision = match decision.as_str() {
         "import" => ReviewDecision::Import,
         "ignore" => ReviewDecision::Ignore,

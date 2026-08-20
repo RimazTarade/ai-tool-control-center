@@ -1,8 +1,8 @@
 use crate::{Discovery, ReviewState, ScanLifecycleState, ScanScope};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, params};
 #[cfg(test)]
 use rusqlite::OptionalExtension;
+use rusqlite::{Connection, params};
 use std::path::Path;
 use thiserror::Error;
 use uuid::Uuid;
@@ -172,7 +172,11 @@ impl Store {
         self.connection.execute(
             "INSERT INTO scan_runs (id, scope, state, started_at, finished_at, failure_count)
              VALUES (?1, ?2, 'running', ?3, NULL, 0)",
-            params![scan_id.to_string(), scan_scope_str(scope), started_at.to_rfc3339()],
+            params![
+                scan_id.to_string(),
+                scan_scope_str(scope),
+                started_at.to_rfc3339()
+            ],
         )?;
         Ok(())
     }
@@ -198,7 +202,9 @@ impl Store {
     ) -> Result<(), StoreError> {
         if !matches!(
             state,
-            ScanLifecycleState::Cancelled | ScanLifecycleState::Completed | ScanLifecycleState::Failed
+            ScanLifecycleState::Cancelled
+                | ScanLifecycleState::Completed
+                | ScanLifecycleState::Failed
         ) {
             return Err(StoreError::NonTerminalFinishState(state));
         }
@@ -361,7 +367,9 @@ mod tests {
         let scan_id = Uuid::new_v4();
         let started = Utc::now();
 
-        store.begin_scan(scan_id, ScanScope::Quick, started).unwrap();
+        store
+            .begin_scan(scan_id, ScanScope::Quick, started)
+            .unwrap();
         store
             .finish_scan(
                 scan_id,
@@ -384,7 +392,9 @@ mod tests {
         let scan_id = Uuid::new_v4();
         let started = Utc::now();
 
-        store.begin_scan(scan_id, ScanScope::Quick, started).unwrap();
+        store
+            .begin_scan(scan_id, ScanScope::Quick, started)
+            .unwrap();
 
         let running_result = store.finish_scan(
             scan_id,
@@ -394,7 +404,9 @@ mod tests {
         );
         assert!(matches!(
             running_result,
-            Err(StoreError::NonTerminalFinishState(ScanLifecycleState::Running))
+            Err(StoreError::NonTerminalFinishState(
+                ScanLifecycleState::Running
+            ))
         ));
 
         let paused_result = store.finish_scan(
@@ -405,7 +417,9 @@ mod tests {
         );
         assert!(matches!(
             paused_result,
-            Err(StoreError::NonTerminalFinishState(ScanLifecycleState::Paused))
+            Err(StoreError::NonTerminalFinishState(
+                ScanLifecycleState::Paused
+            ))
         ));
 
         // Row must remain untouched: still running, no finished_at.

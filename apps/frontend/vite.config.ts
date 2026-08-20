@@ -7,5 +7,10 @@ export default defineConfig({
   server: { host: "127.0.0.1", port: 1420, strictPort: true },
   envPrefix: ["VITE_", "TAURI_"],
   build: { target: "es2022", sourcemap: false },
-  test: { environment: "jsdom", setupFiles: "./src/test-setup.ts", css: true },
+  test: {
+    environment: "jsdom",
+    setupFiles: "./src/test-setup.ts",
+    css: true,
+    exclude: ["**/node_modules/**", "**/dist/**", "./e2e/**"],
+  },
 });
