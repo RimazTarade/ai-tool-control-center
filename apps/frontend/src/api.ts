@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { BootstrapState, Discovery } from "./model";
+import type { BootstrapState, Discovery, ScanEvent, ScanHandle, ScanMutationRequest, ScanRequest, ScanState } from "./model";
 
 const synthetic: Discovery[] = [
   {
@@ -25,31 +25,41 @@ const synthetic: Discovery[] = [
   },
 ];
 
-const isDesktop = () => "__TAURI_INTERNALS__" in window;
+export const isDesktop = () => "__TAURI_INTERNALS__" in window;
 
 export async function bootstrap(): Promise<BootstrapState> {
   if (isDesktop()) return invoke<BootstrapState>("bootstrap_state");
-  return { mode: "demo", pending: synthetic, inventory: [] };
+  return { mode: "demo", pending: synthetic, inventory: [], scanRevision: "demo-revision" };
 }
 
-export async function review(id: string, decision: "import" | "ignore" | "unknown"): Promise<void> {
+export async function reviewDiscovery(id: string, decision: "import" | "ignore" | "unknown"): Promise<void> {
   if (isDesktop()) await invoke("review_discovery", { id, decision });
 }
 
-export type ScanEvent = { kind: string; scanner_id?: string; visited?: number; discovered?: number; message?: string };
+export const pickScanRoots = () => invoke<string[]>("pick_scan_roots");
 
-export async function startQuickScan(onEvent: (event: ScanEvent) => void): Promise<{ id: string; unlisten: UnlistenFn } | null> {
-  if (!isDesktop()) return null;
-  const unlisten = await listen<ScanEvent>("scan:event", (event) => onEvent(event.payload));
+/// Attaches the `scan:event` listener before invoking `start_scan` so an
+/// immediate `started` event emitted synchronously by the backend cannot be
+/// missed by the frontend.
+export async function startScan(
+  request: ScanRequest,
+  onEvent: (event: ScanEvent) => void,
+): Promise<{ handle: ScanHandle; unlisten: UnlistenFn }> {
+  const unlisten = await listen<ScanEvent>("scan:event", ({ payload }) => {
+    onEvent(payload);
+  });
+
   try {
-    const id = await invoke<string>("start_quick_scan");
-    return { id, unlisten };
+    const handle = await invoke<ScanHandle>("start_scan", { request });
+    return { handle, unlisten };
   } catch (error) {
     unlisten();
     throw error;
   }
 }
 
-export async function cancelQuickScan(id: string): Promise<void> {
-  if (isDesktop()) await invoke("cancel_scan", { id });
-}
+export const pauseScan = (request: ScanMutationRequest) => invoke<ScanState>("pause_scan", { request });
+
+export const resumeScan = (request: ScanMutationRequest) => invoke<ScanState>("resume_scan", { request });
+
+export const cancelScan = (request: ScanMutationRequest) => invoke<ScanState>("cancel_scan", { request });
