@@ -1,4 +1,4 @@
-use crate::scan_control::{PauseGate, ScanEvent, ScanEventSink};
+use crate::scan_control::{PauseGate, ScanEvent, ScanEventSink, ScanScope};
 use crate::{Discovery, Evidence};
 use sha2::{Digest, Sha256};
 use std::{
@@ -700,6 +700,13 @@ pub async fn quick_scan(
     pause_gate: PauseGate,
     cancellation: CancellationToken,
 ) {
+    let _ = events
+        .critical(ScanEvent::Started {
+            scope: ScanScope::Quick,
+            scanner_count: QUICK_SCAN_SCANNER_IDS.len(),
+        })
+        .await;
+
     #[cfg(windows)]
     {
         let jobs = build_quick_scan_jobs(context);
@@ -869,6 +876,49 @@ mod tests {
         let scanner_ids: Vec<&str> = jobs.iter().map(|job| job.scanner_id.as_str()).collect();
 
         assert_eq!(scanner_ids, quick_scan_scanner_ids());
+    }
+
+    #[tokio::test]
+    async fn quick_scan_emits_started_with_public_scope_and_scanner_count() {
+        let (sender, mut receiver) = mpsc::channel(64);
+        let events = ScanEventSink::new(sender);
+
+        let context = QuickScanContext {
+            roots: Vec::new(),
+            python_app_root: Err(PythonRootError),
+        };
+
+        // Cancel immediately so any real scanner jobs (windows registry,
+        // process, service, tcp, ...) short-circuit rather than running
+        // against the live system. We only care that `Started` is the
+        // first event on the wire, emitted before any scanner starts.
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let scan_task = tokio::spawn(quick_scan(
+            context,
+            events,
+            PauseGate::default(),
+            cancellation,
+        ));
+
+        let first = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("timed out waiting for first scan event")
+            .expect("expected at least one event");
+
+        match first {
+            ScanEvent::Started {
+                scope,
+                scanner_count,
+            } => {
+                assert_eq!(scope, ScanScope::Quick);
+                assert_eq!(scanner_count, 8);
+            }
+            other => panic!("expected ScanEvent::Started first, got {other:?}"),
+        }
+
+        scan_task.abort();
     }
 
     #[cfg(windows)]
