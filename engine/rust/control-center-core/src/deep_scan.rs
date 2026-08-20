@@ -164,9 +164,10 @@ fn apply_policy(
     io: &dyn DeepScanIo,
     identities_seen: &mut HashSet<DirectoryIdentity>,
     metadata_error_codes: &mut HashSet<&'static str>,
-) -> (Vec<DirectoryWork>, Vec<Discovery>) {
+) -> (Vec<DirectoryWork>, Vec<Discovery>, Vec<&'static str>) {
     let mut children = Vec::new();
     let mut discoveries = Vec::new();
+    let mut new_error_codes = Vec::new();
 
     for entry in entries {
         if is_excluded(&entry.file_name) {
@@ -176,7 +177,9 @@ fn apply_policy(
         let policy = match io.entry_policy(&entry.path) {
             Ok(policy) => policy,
             Err(_) => {
-                metadata_error_codes.insert("entry_metadata_unavailable");
+                if metadata_error_codes.insert("entry_metadata_unavailable") {
+                    new_error_codes.push("entry_metadata_unavailable");
+                }
                 continue;
             }
         };
@@ -194,7 +197,9 @@ fn apply_policy(
                 let identity = match io.directory_identity(&entry.path) {
                     Ok(identity) => identity,
                     Err(_) => {
-                        metadata_error_codes.insert("entry_metadata_unavailable");
+                        if metadata_error_codes.insert("entry_metadata_unavailable") {
+                            new_error_codes.push("entry_metadata_unavailable");
+                        }
                         continue;
                     }
                 };
@@ -219,7 +224,7 @@ fn apply_policy(
         }
     }
 
-    (children, discoveries)
+    (children, discoveries, new_error_codes)
 }
 
 /// Runs Deep Scan traversal against a real filesystem.
@@ -285,6 +290,7 @@ async fn run_deep_scan(
     let mut join_set: JoinSet<DirTaskResult> = JoinSet::new();
     let mut identities_seen: HashSet<DirectoryIdentity> = HashSet::new();
     let mut reported_error_codes: HashSet<&'static str> = HashSet::new();
+    let mut metadata_error_codes: HashSet<&'static str> = HashSet::new();
     let mut visited: u64 = 0;
     let mut discovered: u64 = 0;
     let mut stop_launching = false;
@@ -322,11 +328,22 @@ async fn run_deep_scan(
         let DirTaskResult { work, outcome } = match joined {
             Ok(result) => result,
             Err(_) => {
-                // A directory-read task panicked or was aborted: this is a
-                // coordinator invariant failure, not a per-directory
-                // filesystem error.
-                coordinator_failed = true;
-                break;
+                // A directory-read task panicked or was aborted. Isolate the
+                // failure to this one directory (mirroring how Quick Scan
+                // isolates a single scanner panic) rather than aborting the
+                // entire traversal and discarding everything found so far.
+                visited += 1;
+                let code = "directory_read_panicked";
+                if reported_error_codes.insert(code) {
+                    let _ = events
+                        .scanner_failed(
+                            SCANNER_ID,
+                            code,
+                            format!("Skipped a directory that could not be read ({code})"),
+                        )
+                        .await;
+                }
+                continue;
             }
         };
 
@@ -344,14 +361,33 @@ async fn run_deep_scan(
 
         match outcome {
             Ok(entries) => {
-                let (children, discoveries) = apply_policy(
+                let (children, discoveries, new_metadata_error_codes) = apply_policy(
                     entries,
                     &work,
                     &context,
                     io.as_ref(),
                     &mut identities_seen,
-                    &mut reported_error_codes,
+                    &mut metadata_error_codes,
                 );
+
+                for code in new_metadata_error_codes {
+                    if events
+                        .scanner_failed(
+                            SCANNER_ID,
+                            code,
+                            format!("Skipped an entry whose metadata could not be read ({code})"),
+                        )
+                        .await
+                        .is_err()
+                    {
+                        coordinator_failed = true;
+                        break;
+                    }
+                }
+
+                if coordinator_failed {
+                    break;
+                }
 
                 for child in children {
                     queue.push_back(child);
@@ -458,6 +494,7 @@ mod tests {
         reparse: bool,
         placeholder: bool,
         identity: Option<DirectoryIdentity>,
+        metadata_error: bool,
     }
 
     fn dir(name: &str) -> FakeEntry {
@@ -467,6 +504,7 @@ mod tests {
             reparse: false,
             placeholder: false,
             identity: None,
+            metadata_error: false,
         }
     }
 
@@ -477,6 +515,7 @@ mod tests {
             reparse: false,
             placeholder: false,
             identity: None,
+            metadata_error: false,
         }
     }
 
@@ -486,6 +525,7 @@ mod tests {
         max_active_reads: AtomicUsize,
         read_starts: AtomicUsize,
         read_log: Mutex<Vec<PathBuf>>,
+        panic_on_read: Option<PathBuf>,
     }
 
     impl FakeDeepScanIo {
@@ -496,6 +536,18 @@ mod tests {
                 max_active_reads: AtomicUsize::new(0),
                 read_starts: AtomicUsize::new(0),
                 read_log: Mutex::new(Vec::new()),
+                panic_on_read: None,
+            }
+        }
+
+        fn with_panic_on_read(tree: HashMap<PathBuf, Vec<FakeEntry>>, panic_path: PathBuf) -> Self {
+            Self {
+                tree,
+                active_reads: AtomicUsize::new(0),
+                max_active_reads: AtomicUsize::new(0),
+                read_starts: AtomicUsize::new(0),
+                read_log: Mutex::new(Vec::new()),
+                panic_on_read: Some(panic_path),
             }
         }
 
@@ -534,6 +586,10 @@ mod tests {
 
             self.active_reads.fetch_sub(1, Ordering::SeqCst);
 
+            if self.panic_on_read.as_deref() == Some(path) {
+                panic!("simulated directory read panic");
+            }
+
             let entries = self.tree.get(path).cloned().unwrap_or_default();
             Ok(entries
                 .into_iter()
@@ -549,6 +605,9 @@ mod tests {
             let parent = path.parent().unwrap_or_else(|| Path::new(""));
             let name = path.file_name().and_then(|value| value.to_str()).unwrap_or_default();
             match self.find(parent, name) {
+                Some(entry) if entry.metadata_error => {
+                    Err(io::Error::new(io::ErrorKind::Other, "simulated metadata error"))
+                }
                 Some(entry) => Ok(EntryPolicy {
                     reparse_point: entry.reparse,
                     placeholder: entry.placeholder,
@@ -980,5 +1039,116 @@ mod tests {
             })
             .expect("expected a discovery");
         assert_eq!(discovery.source_scanner, "filesystem.deep");
+    }
+
+    #[tokio::test]
+    async fn entry_metadata_errors_surface_one_scanner_failed_event_per_distinct_code() {
+        let root = PathBuf::from(r"C:\FakeRoot");
+        let mut bad_one = file("bad-one.txt");
+        bad_one.metadata_error = true;
+        let mut bad_two = file("bad-two.txt");
+        bad_two.metadata_error = true;
+
+        let mut tree = HashMap::new();
+        tree.insert(root.clone(), vec![bad_one, bad_two]);
+
+        let fake = Arc::new(FakeDeepScanIo::new(tree));
+        let context = DeepScanContext {
+            roots: vec![root],
+            follow_reparse_points: false,
+            network_consent: false,
+        };
+        let (tx, rx) = mpsc::channel(64);
+        let events = ScanEventSink::new(tx);
+        let drain = drain_events(rx);
+
+        run_deep_scan(
+            context,
+            events,
+            CancellationToken::new(),
+            PauseGate::default(),
+            fake.clone(),
+        )
+        .await;
+        let received = drain.await.unwrap();
+
+        let failures: Vec<_> = received
+            .iter()
+            .filter_map(|event| match event {
+                ScanEvent::ScannerFailed {
+                    scanner_id,
+                    code,
+                    message,
+                } => Some((scanner_id.clone(), code.clone(), message.clone())),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            failures.len(),
+            1,
+            "two entries with the same stable error code must emit only one event, got {failures:?}"
+        );
+        let (scanner_id, code, message) = &failures[0];
+        assert_eq!(scanner_id, "filesystem.deep");
+        assert_eq!(code, "entry_metadata_unavailable");
+        assert!(!message.to_ascii_lowercase().contains("fakeroot"));
+        assert!(!message.contains('\\'));
+
+        let terminal = received.last().expect("expected a terminal event");
+        match terminal {
+            ScanEvent::Completed { failure_count, .. } => {
+                assert!(*failure_count >= 1, "failure_count must reflect the metadata error");
+            }
+            other => panic!("expected Completed terminal event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn directory_read_panic_is_isolated_and_scan_still_completes() {
+        let root = PathBuf::from(r"C:\FakeRoot");
+        let mut tree = HashMap::new();
+        tree.insert(root.clone(), vec![dir("panics"), dir("ok")]);
+        tree.insert(root.join("panics"), Vec::new());
+        tree.insert(root.join("ok"), Vec::new());
+
+        let fake = Arc::new(FakeDeepScanIo::with_panic_on_read(tree, root.join("panics")));
+        let context = DeepScanContext {
+            roots: vec![root.clone()],
+            follow_reparse_points: false,
+            network_consent: false,
+        };
+        let (tx, rx) = mpsc::channel(64);
+        let events = ScanEventSink::new(tx);
+        let drain = drain_events(rx);
+
+        run_deep_scan(
+            context,
+            events,
+            CancellationToken::new(),
+            PauseGate::default(),
+            fake.clone(),
+        )
+        .await;
+        let received = drain.await.unwrap();
+
+        assert!(fake.was_read(&root.join("ok")), "traversal must continue past the panicking directory");
+
+        let saw_failure = received.iter().any(|event| {
+            matches!(
+                event,
+                ScanEvent::ScannerFailed { scanner_id, code, .. }
+                    if scanner_id == "filesystem.deep" && code == "directory_read_panicked"
+            )
+        });
+        assert!(saw_failure, "expected a ScannerFailed event for the panicking directory");
+
+        let terminal = received.last().expect("expected a terminal event");
+        match terminal {
+            ScanEvent::Completed { failure_count, .. } => {
+                assert!(*failure_count >= 1);
+            }
+            other => panic!("expected Completed terminal event (panic must not fail the whole scan), got {other:?}"),
+        }
     }
 }
