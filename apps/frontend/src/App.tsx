@@ -1,31 +1,81 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { bootstrap, cancelQuickScan, review, startQuickScan } from "./api";
-import type { BootstrapState, Discovery, PageName } from "./model";
+import { bootstrap, cancelScan, pauseScan, pickScanRoots, resumeScan, reviewDiscovery, startScan } from "./api";
+import type { BootstrapState, Discovery, PageName, ScanEvent, ScanLifecycleState, ScanMode, ScanRequest } from "./model";
 
 const pages: PageName[] = ["Overview", "Inventory", "Review Queue", "Health", "Dependencies", "Activity", "Adapter Packs", "Backups", "Settings"];
 
+type ScanDraft = {
+  open: boolean;
+  mode: ScanMode;
+  roots: string[];
+  followReparsePoints: boolean;
+  networkConsent: boolean;
+};
+
+type ScanWarning = { scannerId: string; code: string; message: string };
+
+type ActiveScan = {
+  scanId: string;
+  scope: ScanMode;
+  state: ScanLifecycleState;
+  revision: string;
+  cancelling: boolean;
+  scannerId?: string;
+  completedUnits: number;
+  totalUnits: number | null;
+  currentLocation: string | null;
+  warnings: ScanWarning[];
+};
+
+type TerminalNotice = {
+  kind: "completed" | "cancelled" | "failed";
+  message?: string;
+  counts?: { visited: number; discovered: number; failureCount: number };
+};
+
+const defaultScanDraft: ScanDraft = {
+  open: false,
+  mode: "quick",
+  roots: [],
+  followReparsePoints: false,
+  networkConsent: false,
+};
+
 export default function App() {
   const [page, setPage] = useState<PageName>("Overview");
-  const [state, setState] = useState<BootstrapState>({ mode: "demo", pending: [], inventory: [] });
+  const [state, setState] = useState<BootstrapState>({ mode: "demo", pending: [], inventory: [], scanRevision: "" });
+  const [workspaceRevision, setWorkspaceRevision] = useState("");
   const [query, setQuery] = useState("");
-  const [scan, setScan] = useState<{ active: boolean; paused: boolean; progress: number; visited: number; id?: string; scannerId?: string; notice?: string }>({ active: false, paused: false, progress: 0, visited: 0 });
-  const stopListening = useRef<null | (() => void)>(null);
+  const [scanDraft, setScanDraft] = useState<ScanDraft>(defaultScanDraft);
+  const [starting, setStarting] = useState(false);
+  const [startError, setStartError] = useState<string | undefined>();
+  const [networkConfirmPending, setNetworkConfirmPending] = useState(false);
+  const [activeScan, setActiveScan] = useState<ActiveScan | null>(null);
+  const [terminalNotice, setTerminalNotice] = useState<TerminalNotice | null>(null);
 
-  useEffect(() => { void bootstrap().then(setState); }, []);
-  useEffect(() => () => stopListening.current?.(), []);
+  const stopListening = useRef<null | (() => void)>(null);
+  const demoTimer = useRef<number | null>(null);
+  const demoStep = useRef(0);
+
   useEffect(() => {
-    if (state.mode !== "demo" || !scan.active || scan.paused) return;
-    const timer = window.setInterval(() => setScan((current) => {
-      const progress = Math.min(100, current.progress + 4);
-      return { ...current, progress, active: progress < 100 };
-    }), 120);
-    return () => window.clearInterval(timer);
-  }, [scan.active, scan.paused, state.mode]);
+    void bootstrap().then((result) => {
+      setState(result);
+      setWorkspaceRevision(result.scanRevision);
+    });
+  }, []);
+
+  useEffect(
+    () => () => {
+      stopListening.current?.();
+      if (demoTimer.current) window.clearTimeout(demoTimer.current);
+    },
+    [],
+  );
 
   const visible = useMemo(() => state.pending.filter((item) => item.suggested_name.toLowerCase().includes(query.toLowerCase())), [query, state.pending]);
 
   async function decide(item: Discovery, decision: "import" | "ignore" | "unknown") {
-    await review(item.id, decision);
+    await reviewDiscovery(item.id, decision);
     setState((current) => ({
       ...current,
       pending: current.pending.filter((candidate) => candidate.id !== item.id),
@@ -33,46 +83,233 @@ export default function App() {
     }));
   }
 
-  async function runScan() {
-    if (scan.active) return;
-    setScan({ active: true, paused: false, progress: 0, visited: 0 });
-    if (state.mode === "demo") return;
-    let endedBeforeStartReturned = false;
-    try {
-      const running = await startQuickScan((event) => {
-        if (event.kind === "progress") setScan((current) => ({ ...current, scannerId: event.scanner_id ?? current.scannerId, visited: event.visited ?? current.visited }));
-        if (event.kind === "scanner_failed") setScan((current) => ({ ...current, notice: event.message ?? "Part of the scan could not complete." }));
-        if (["completed", "cancelled", "failed"].includes(event.kind)) {
-          endedBeforeStartReturned = true;
-          stopListening.current?.();
-          stopListening.current = null;
-          setScan((current) => ({ ...current, active: false, progress: event.kind === "completed" ? 100 : current.progress, notice: event.kind === "failed" ? (event.message ?? "The scan could not complete.") : current.notice }));
-          void bootstrap().then(setState);
-        }
-      });
-      if (running) {
-        if (endedBeforeStartReturned) {
-          running.unlisten();
-        } else {
-          stopListening.current = running.unlisten;
-          setScan((current) => ({ ...current, id: running.id }));
-        }
-      }
-    } catch {
-      setScan((current) => ({ ...current, active: false, notice: "The quick scan could not start." }));
+  function openDialog() {
+    setScanDraft({ ...defaultScanDraft, open: true });
+    setStartError(undefined);
+    setNetworkConfirmPending(false);
+  }
+
+  function closeDialog() {
+    setScanDraft({ ...defaultScanDraft, open: false });
+    setStartError(undefined);
+    setNetworkConfirmPending(false);
+  }
+
+  async function selectFolders() {
+    const roots = await pickScanRoots();
+    setScanDraft((current) => ({ ...current, roots }));
+  }
+
+  function buildRequest(networkConsent: boolean): ScanRequest {
+    return {
+      mode: scanDraft.mode,
+      roots: scanDraft.mode === "deep" ? scanDraft.roots : [],
+      followReparsePoints: scanDraft.mode === "deep" && scanDraft.followReparsePoints,
+      networkConsent: scanDraft.mode === "deep" && networkConsent,
+      revision: workspaceRevision,
+    };
+  }
+
+  function handleScanEvent(event: ScanEvent) {
+    switch (event.kind) {
+      case "progress":
+        setActiveScan((current) =>
+          current
+            ? {
+                ...current,
+                scannerId: event.scanner_id ?? current.scannerId,
+                completedUnits: event.completed_units,
+                totalUnits: event.total_units ?? null,
+                currentLocation: event.current_location ?? current.currentLocation,
+              }
+            : current,
+        );
+        break;
+      case "scanner_failed":
+        setActiveScan((current) =>
+          current
+            ? { ...current, warnings: [...current.warnings, { scannerId: event.scanner_id, code: event.code, message: event.message }] }
+            : current,
+        );
+        break;
+      case "paused":
+        setActiveScan((current) => (current ? { ...current, state: "paused" } : current));
+        break;
+      case "resumed":
+        setActiveScan((current) => (current ? { ...current, state: "running" } : current));
+        break;
+      case "completed":
+        void handleTerminal({ kind: "completed", counts: { visited: event.visited, discovered: event.discovered, failureCount: event.failure_count } });
+        break;
+      case "cancelled":
+        void handleTerminal({ kind: "cancelled", counts: { visited: event.visited, discovered: event.discovered, failureCount: event.failure_count } });
+        break;
+      case "failed":
+        void handleTerminal({ kind: "failed", message: event.message });
+        break;
+      default:
+        break;
     }
   }
 
-  async function cancelScan() {
-    let notice: string | undefined;
+  async function handleTerminal(notice: TerminalNotice) {
+    setTerminalNotice(notice);
+    setActiveScan(null);
+    stopListening.current?.();
+    stopListening.current = null;
+    if (demoTimer.current) {
+      window.clearTimeout(demoTimer.current);
+      demoTimer.current = null;
+    }
+    const result = await bootstrap();
+    setWorkspaceRevision(result.scanRevision);
+    setState(result);
+  }
+
+  async function attemptStart(request: ScanRequest) {
+    setStarting(true);
+    setStartError(undefined);
     try {
-      if (scan.id) await cancelQuickScan(scan.id);
-    } catch {
-      notice = "Cancellation could not be confirmed.";
+      if (state.mode === "demo") {
+        startDemoScan(request);
+      } else {
+        const { handle, unlisten } = await startScan(request, handleScanEvent);
+        stopListening.current = unlisten;
+        setActiveScan({
+          scanId: handle.scanId,
+          scope: handle.scope,
+          state: handle.state,
+          revision: handle.revision,
+          cancelling: false,
+          completedUnits: 0,
+          totalUnits: null,
+          currentLocation: null,
+          warnings: [],
+        });
+        closeDialog();
+      }
+    } catch (error) {
+      const code = (error as { code?: string } | null)?.code;
+      if (code === "network_consent_required" && request.mode === "deep") {
+        setNetworkConfirmPending(true);
+      } else {
+        setStartError("The scan could not start.");
+      }
     } finally {
-      stopListening.current?.();
-      stopListening.current = null;
-      setScan({ active: false, paused: false, progress: 0, visited: 0, notice });
+      setStarting(false);
+    }
+  }
+
+  function runScan() {
+    void attemptStart(buildRequest(scanDraft.networkConsent));
+  }
+
+  function confirmNetworkConsent() {
+    setScanDraft((current) => ({ ...current, networkConsent: true }));
+    setNetworkConfirmPending(false);
+    void attemptStart(buildRequest(true));
+  }
+
+  function cancelNetworkConsent() {
+    setNetworkConfirmPending(false);
+  }
+
+  function startDemoScan(request: ScanRequest) {
+    demoStep.current = 0;
+    setActiveScan({
+      scanId: `demo-scan-${Date.now()}`,
+      scope: request.mode,
+      state: "running",
+      revision: "demo-revision",
+      cancelling: false,
+      completedUnits: 0,
+      totalUnits: 5,
+      currentLocation: null,
+      warnings: [],
+    });
+    closeDialog();
+    runDemoTick();
+  }
+
+  function runDemoTick() {
+    demoTimer.current = window.setTimeout(() => {
+      demoStep.current += 1;
+      const step = demoStep.current;
+      if (step === 3) {
+        handleScanEvent({ kind: "scanner_failed", scanner_id: "demo.scanner", code: "demo_recoverable", message: "A demo location could not be read." });
+        runDemoTick();
+        return;
+      }
+      if (step >= 6) {
+        handleScanEvent({ kind: "completed", visited: 5, discovered: 2, failure_count: 1, duration_ms: step * 220 });
+        return;
+      }
+      handleScanEvent({ kind: "progress", scanner_id: "demo.scanner", completed_units: step, total_units: 5, current_location: `Example location ${step}` });
+      runDemoTick();
+    }, 220);
+  }
+
+  function pauseDemo() {
+    if (demoTimer.current) {
+      window.clearTimeout(demoTimer.current);
+      demoTimer.current = null;
+    }
+    handleScanEvent({ kind: "paused" });
+  }
+
+  function resumeDemo() {
+    handleScanEvent({ kind: "resumed" });
+    runDemoTick();
+  }
+
+  function cancelDemo() {
+    if (demoTimer.current) {
+      window.clearTimeout(demoTimer.current);
+      demoTimer.current = null;
+    }
+    handleScanEvent({ kind: "cancelled", visited: demoStep.current, discovered: 0, failure_count: 0, duration_ms: demoStep.current * 220 });
+  }
+
+  async function onPause() {
+    if (!activeScan) return;
+    if (state.mode === "demo") {
+      pauseDemo();
+      return;
+    }
+    try {
+      const result = await pauseScan({ scanId: activeScan.scanId, revision: activeScan.revision });
+      setActiveScan((current) => (current ? { ...current, revision: result.revision, state: result.state } : current));
+    } catch {
+      // the next scan:event will reconcile state; nothing else to do here.
+    }
+  }
+
+  async function onResume() {
+    if (!activeScan) return;
+    if (state.mode === "demo") {
+      resumeDemo();
+      return;
+    }
+    try {
+      const result = await resumeScan({ scanId: activeScan.scanId, revision: activeScan.revision });
+      setActiveScan((current) => (current ? { ...current, revision: result.revision, state: result.state } : current));
+    } catch {
+      // the next scan:event will reconcile state; nothing else to do here.
+    }
+  }
+
+  async function onCancel() {
+    if (!activeScan) return;
+    if (state.mode === "demo") {
+      cancelDemo();
+      return;
+    }
+    setActiveScan((current) => (current ? { ...current, cancelling: true } : current));
+    try {
+      const result = await cancelScan({ scanId: activeScan.scanId, revision: activeScan.revision });
+      setActiveScan((current) => (current ? { ...current, revision: result.revision } : current));
+    } catch {
+      // the next scan:event will reconcile state; nothing else to do here.
     }
   }
 
@@ -90,12 +327,95 @@ export default function App() {
           <div><p className="eyebrow">Workspace / {page}</p><h1>{page}</h1></div>
           <div className="header-actions">
             <label className="search"><span>⌕</span><input aria-label="Search discoveries" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search local tools" /></label>
-            <button className="scan" disabled={scan.active} onClick={() => void runScan()}>Run quick scan</button>
+            <button className="scan" disabled={!!activeScan} onClick={openDialog}>Run scan</button>
           </div>
         </header>
         {state.mode === "demo" && <div className="demo" role="status">Demo mode · all records are synthetic and do not describe this computer.</div>}
-        {scan.active && <section className="scanbar" aria-label="Scan progress"><div><strong>{scan.paused ? "Scan paused" : "Scanning local sources"}</strong><span>{state.mode === "demo" ? `${scan.progress}%` : `${scan.scannerId ? `${scan.scannerId} | ` : ""}${scan.visited} locations checked`}</span></div>{state.mode === "demo" ? <progress value={scan.progress} max="100" /> : <progress />}<footer>{state.mode === "demo" && <button onClick={() => setScan((current) => ({ ...current, paused: !current.paused }))}>{scan.paused ? "Resume" : "Pause"}</button>}<button disabled={state.mode === "desktop" && !scan.id} onClick={() => void cancelScan()}>Cancel</button></footer></section>}
-        {scan.notice && <div className="scan-warning" role="alert">{scan.notice}</div>}
+        {scanDraft.open && (
+          <div className="modal-overlay">
+            <div className="modal" role="dialog" aria-label="Run scan">
+              <h2>Run scan</h2>
+              <fieldset className="scan-mode">
+                <legend>Scan type</legend>
+                <label>
+                  <input type="radio" name="scanMode" checked={scanDraft.mode === "quick"} onChange={() => setScanDraft((current) => ({ ...current, mode: "quick" }))} />
+                  Quick
+                </label>
+                <label>
+                  <input type="radio" name="scanMode" checked={scanDraft.mode === "deep"} onChange={() => setScanDraft((current) => ({ ...current, mode: "deep" }))} />
+                  Deep
+                </label>
+              </fieldset>
+              {scanDraft.mode === "deep" && (
+                <div className="deep-options">
+                  <button type="button" onClick={() => void selectFolders()}>Select folders</button>
+                  <div className="roots-list">
+                    {scanDraft.roots.length === 0 ? (
+                      <p className="empty-roots">No folders selected.</p>
+                    ) : (
+                      <ul>{scanDraft.roots.map((root) => <li key={root}>{root}</li>)}</ul>
+                    )}
+                  </div>
+                  <label className="checkbox-row">
+                    <input
+                      type="checkbox"
+                      checked={scanDraft.followReparsePoints}
+                      onChange={(event) => setScanDraft((current) => ({ ...current, followReparsePoints: event.target.checked }))}
+                    />
+                    Follow symbolic links and junctions
+                  </label>
+                </div>
+              )}
+              {networkConfirmPending && (
+                <div className="network-confirm" role="alertdialog" aria-label="Network location confirmation">
+                  <p>One or more selected roots are on a network location. Allow this Deep Scan to read those network roots once?</p>
+                  <div>
+                    <button type="button" onClick={confirmNetworkConsent}>Allow</button>
+                    <button type="button" className="quiet" onClick={cancelNetworkConsent}>Cancel</button>
+                  </div>
+                </div>
+              )}
+              {startError && <p role="alert">{startError}</p>}
+              <div className="modal-actions">
+                <button type="button" className="quiet" onClick={closeDialog}>Close</button>
+                <button type="button" disabled={starting || (scanDraft.mode === "deep" && scanDraft.roots.length === 0)} onClick={runScan}>Run</button>
+              </div>
+            </div>
+          </div>
+        )}
+        {activeScan && (
+          <section className="scanbar" aria-label="Scan progress">
+            <div>
+              <strong>
+                {activeScan.scope === "deep" ? "Deep scan" : "Quick scan"} ·{" "}
+                {activeScan.cancelling ? "Cancelling" : activeScan.state === "paused" ? "Paused" : "Running"}
+              </strong>
+              <span>
+                {activeScan.scannerId ? `${activeScan.scannerId} · ` : ""}
+                {activeScan.completedUnits}
+                {activeScan.totalUnits != null ? ` / ${activeScan.totalUnits}` : ""}
+                {activeScan.currentLocation ? ` · ${activeScan.currentLocation}` : ""}
+              </span>
+            </div>
+            <footer>
+              {activeScan.state === "running" && !activeScan.cancelling && <button onClick={() => void onPause()}>Pause</button>}
+              {activeScan.state === "paused" && !activeScan.cancelling && <button onClick={() => void onResume()}>Resume</button>}
+              <button disabled={activeScan.cancelling} onClick={() => void onCancel()}>Cancel</button>
+            </footer>
+            {activeScan.warnings.map((warning, index) => (
+              <p key={`${warning.scannerId}-${warning.code}-${index}`} role="alert" className="scan-warning-inline">
+                {warning.scannerId} · {warning.code}: {warning.message}
+              </p>
+            ))}
+          </section>
+        )}
+        {terminalNotice && (
+          <div className="scan-notice" role="status">
+            {terminalNotice.kind === "failed"
+              ? terminalNotice.message ?? "The scan could not complete."
+              : `Scan ${terminalNotice.kind}: ${terminalNotice.counts?.discovered ?? 0} discoveries, ${terminalNotice.counts?.visited ?? 0} visited, ${terminalNotice.counts?.failureCount ?? 0} failures.`}
+          </div>
+        )}
         {page === "Overview" ? <Overview state={state} onReview={() => setPage("Review Queue")} /> : page === "Review Queue" ? <ReviewQueue items={visible} decide={decide} /> : page === "Inventory" ? <Inventory items={state.inventory} /> : <EmptyPage name={page} />}
       </main>
     </div>

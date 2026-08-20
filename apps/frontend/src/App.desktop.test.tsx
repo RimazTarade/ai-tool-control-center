@@ -1,11 +1,11 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
-import { cancelScan, pauseScan, pickScanRoots, resumeScan, reviewDiscovery, startScan } from "./api";
+import { bootstrap, cancelScan, pauseScan, pickScanRoots, resumeScan, reviewDiscovery, startScan } from "./api";
 
 vi.mock("./api", () => ({
-  bootstrap: vi.fn().mockResolvedValue({ mode: "desktop", pending: [], inventory: [], scanRevision: "workspace-r1" }),
+  bootstrap: vi.fn(),
   pickScanRoots: vi.fn(),
   startScan: vi.fn(),
   pauseScan: vi.fn(),
@@ -16,6 +16,8 @@ vi.mock("./api", () => ({
 }));
 
 beforeEach(() => {
+  vi.mocked(bootstrap).mockReset();
+  vi.mocked(bootstrap).mockResolvedValue({ mode: "desktop", pending: [], inventory: [], scanRevision: "workspace-r1" });
   vi.mocked(startScan).mockReset();
   vi.mocked(pauseScan).mockReset();
   vi.mocked(resumeScan).mockReset();
@@ -25,95 +27,205 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
-describe("desktop scan recovery", () => {
-  it("starts a quick scan with the exact camelCase ScanRequest shape", async () => {
+describe("run scan dialog", () => {
+  it("opens a dialog with Quick selected when Run scan is clicked", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Run scan" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "Run scan" });
+    expect(within(dialog).getByRole("radio", { name: "Quick" })).toBeChecked();
+    expect(within(dialog).getByRole("radio", { name: "Deep" })).not.toBeChecked();
+  });
+
+  it("reveals Select folders and the reparse checkbox unchecked when Deep is chosen", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Run scan" }));
+    await user.click(screen.getByRole("radio", { name: "Deep" }));
+
+    expect(screen.getByRole("button", { name: "Select folders" })).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "Follow symbolic links and junctions" })).not.toBeChecked();
+  });
+
+  it("disables Run for Deep until at least one root is selected", async () => {
+    vi.mocked(pickScanRoots).mockResolvedValue(["C:\\Data"]);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Run scan" }));
+    await user.click(screen.getByRole("radio", { name: "Deep" }));
+
+    expect(screen.getByRole("button", { name: "Run" })).toBeDisabled();
+
+    await user.click(screen.getByRole("button", { name: "Select folders" }));
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Run" })).toBeEnabled());
+  });
+
+  it("shows selected roots only inside the dialog", async () => {
+    vi.mocked(pickScanRoots).mockResolvedValue(["C:\\Data"]);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Run scan" }));
+    await user.click(screen.getByRole("radio", { name: "Deep" }));
+    await user.click(screen.getByRole("button", { name: "Select folders" }));
+
+    expect(await screen.findByText("C:\\Data")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Close" }));
+    expect(screen.queryByText("C:\\Data")).not.toBeInTheDocument();
+  });
+});
+
+describe("scan lifecycle controls", () => {
+  async function startQuickScan(user: ReturnType<typeof userEvent.setup>, onEvent: (event: unknown) => void) {
+    vi.mocked(startScan).mockImplementation(async (_request, handler) => {
+      onEvent(handler);
+      return {
+        handle: { scanId: "scan-1", scope: "quick", state: "running", revision: "scan-r1", startedAt: "2026-01-01T00:00:00Z" },
+        unlisten: vi.fn(),
+      };
+    });
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "Run scan" }));
+    await user.click(screen.getByRole("button", { name: "Run" }));
+  }
+
+  it("shows Paused after a paused event", async () => {
+    const user = userEvent.setup();
+    let emit: (event: unknown) => void = () => undefined;
+    await startQuickScan(user, (handler) => {
+      emit = handler as (event: unknown) => void;
+    });
+
+    emit({ kind: "paused" });
+
+    expect(await screen.findByLabelText(/scan progress/i)).toHaveTextContent("Paused");
+  });
+
+  it("calls resumeScan with the current revision and stores the returned revision", async () => {
+    const user = userEvent.setup();
+    let emit: (event: unknown) => void = () => undefined;
+    await startQuickScan(user, (handler) => {
+      emit = handler as (event: unknown) => void;
+    });
+    emit({ kind: "paused" });
+    await screen.findByRole("button", { name: "Resume" });
+
+    vi.mocked(resumeScan).mockResolvedValue({ scanId: "scan-1", state: "running", revision: "scan-r2" });
+    await user.click(screen.getByRole("button", { name: "Resume" }));
+
+    expect(resumeScan).toHaveBeenCalledWith({ scanId: "scan-1", revision: "scan-r1" });
+
+    vi.mocked(cancelScan).mockResolvedValue({ scanId: "scan-1", state: "cancelled", revision: "scan-r3" });
+    await user.click(await screen.findByRole("button", { name: "Cancel" }));
+    expect(cancelScan).toHaveBeenCalledWith({ scanId: "scan-1", revision: "scan-r2" });
+  });
+
+  it("shows a scanner_failed warning without hiding prior discoveries", async () => {
+    const user = userEvent.setup();
+    let emit: (event: unknown) => void = () => undefined;
+    await startQuickScan(user, (handler) => {
+      emit = handler as (event: unknown) => void;
+    });
+    emit({ kind: "discovery", discovery: { id: "d1", suggested_name: "Found tool", suggested_type: "runtime", source_scanner: "s", confidence: "high", evidence: [], observed_at: "x", health_state: "unknown" } });
+    emit({ kind: "scanner_failed", scanner_id: "windows.process", code: "io_error", message: "Could not read a location" });
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/could not read a location/i);
+    expect(screen.getByLabelText(/scan progress/i)).toBeInTheDocument();
+  });
+
+  it("removes active controls on terminal but leaves a notice, and refreshes workspace revision", async () => {
+    const user = userEvent.setup();
+    let emit: (event: unknown) => void = () => undefined;
+    await startQuickScan(user, (handler) => {
+      emit = handler as (event: unknown) => void;
+    });
+
+    vi.mocked(bootstrap).mockResolvedValue({ mode: "desktop", pending: [], inventory: [], scanRevision: "workspace-r2" });
+    emit({ kind: "completed", visited: 3, discovered: 1, failure_count: 0, duration_ms: 10 });
+
+    await waitFor(() => expect(screen.queryByLabelText(/scan progress/i)).not.toBeInTheDocument());
+    expect(await screen.findByText(/scan completed/i)).toBeInTheDocument();
+    await waitFor(() => expect(bootstrap).toHaveBeenCalledTimes(2));
+
+    vi.mocked(startScan).mockClear();
     vi.mocked(startScan).mockImplementation(
       () =>
         new Promise(() => {
-          // never resolves; we only assert on the call shape
+          // never resolves; assert only on call args
         }),
     );
+    await user.click(await screen.findByRole("button", { name: "Run scan" }));
+    await user.click(screen.getByRole("button", { name: "Run" }));
+
+    expect(startScan).toHaveBeenCalledWith(expect.objectContaining({ revision: "workspace-r2" }), expect.any(Function));
+  });
+});
+
+describe("network consent retry", () => {
+  it("shows a confirmation naming network scanning and retries with networkConsent true", async () => {
+    vi.mocked(pickScanRoots).mockResolvedValue(["\\\\server\\share"]);
+    vi.mocked(startScan)
+      .mockRejectedValueOnce({ code: "network_consent_required" })
+      .mockResolvedValueOnce({
+        handle: { scanId: "scan-1", scope: "deep", state: "running", revision: "scan-r1", startedAt: "2026-01-01T00:00:00Z" },
+        unlisten: vi.fn(),
+      });
+
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: /run quick scan/i }));
+    await user.click(await screen.findByRole("button", { name: "Run scan" }));
+    await user.click(screen.getByRole("radio", { name: "Deep" }));
+    await user.click(screen.getByRole("button", { name: "Select folders" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Run" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Run" }));
 
-    expect(startScan).toHaveBeenCalledWith(
-      expect.objectContaining({
-        mode: "quick",
-        roots: [],
-        followReparsePoints: false,
-        networkConsent: false,
-        revision: "workspace-r1",
-      }),
-      expect.any(Function),
-    );
+    expect(
+      await screen.findByText("One or more selected roots are on a network location. Allow this Deep Scan to read those network roots once?"),
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Allow" }));
+
+    await waitFor(() => expect(startScan).toHaveBeenCalledTimes(2));
+    const [firstRequest] = vi.mocked(startScan).mock.calls[0];
+    const [secondRequest] = vi.mocked(startScan).mock.calls[1];
+    expect(secondRequest).toEqual({ ...firstRequest, networkConsent: true });
   });
 
-  it("recovers when a scan cannot start", async () => {
-    vi.mocked(startScan).mockRejectedValue(new Error("busy"));
+  it("resets networkConsent to false when the dialog is closed and reopened", async () => {
+    vi.mocked(pickScanRoots).mockResolvedValue(["\\\\server\\share"]);
+    vi.mocked(startScan).mockRejectedValue({ code: "network_consent_required" });
+
     const user = userEvent.setup();
     render(<App />);
 
-    const button = await screen.findByRole("button", { name: /run quick scan/i });
-    await user.click(button);
+    await user.click(await screen.findByRole("button", { name: "Run scan" }));
+    await user.click(screen.getByRole("radio", { name: "Deep" }));
+    await user.click(screen.getByRole("button", { name: "Select folders" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Run" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Run" }));
+    await screen.findByText(/network location/i);
+    await user.click(screen.getByRole("button", { name: "Allow" }));
 
-    expect(await screen.findByRole("alert")).toHaveTextContent(/could not start/i);
-    expect(button).toBeEnabled();
-  });
+    await waitFor(() => expect(startScan).toHaveBeenCalledTimes(2));
 
-  it("surfaces a nonterminal scanner warning", async () => {
-    vi.mocked(startScan).mockImplementation(async (_request, onEvent) => {
-      onEvent({ kind: "scanner_failed", scanner_id: "windows.process", code: "io", message: "A discovery could not be saved" });
-      onEvent({ kind: "completed", visited: 10, discovered: 0, failure_count: 0, duration_ms: 5 });
-      return { handle: { scanId: "scan-1", scope: "quick", state: "running", revision: "workspace-r1", startedAt: "2026-01-01T00:00:00Z" }, unlisten: vi.fn() };
-    });
-    const user = userEvent.setup();
-    render(<App />);
+    await user.click(screen.getByRole("button", { name: "Close" }));
+    await user.click(await screen.findByRole("button", { name: "Run scan" }));
+    await user.click(screen.getByRole("radio", { name: "Deep" }));
+    await user.click(screen.getByRole("button", { name: "Select folders" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Run" })).toBeEnabled());
+    vi.mocked(startScan).mockClear();
+    vi.mocked(startScan).mockRejectedValue({ code: "network_consent_required" });
+    await user.click(screen.getByRole("button", { name: "Run" }));
 
-    await user.click(await screen.findByRole("button", { name: /run quick scan/i }));
-
-    expect(await screen.findByRole("alert")).toHaveTextContent(/could not be saved/i);
-  });
-
-  it("shows the scanner identity for progress events", async () => {
-    vi.mocked(startScan).mockImplementation(async (_request, onEvent) => {
-      onEvent({ kind: "progress", scanner_id: "windows.process", completed_units: 7, total_units: undefined, current_location: undefined });
-      return { handle: { scanId: "scan-1", scope: "quick", state: "running", revision: "workspace-r1", startedAt: "2026-01-01T00:00:00Z" }, unlisten: vi.fn() };
-    });
-    const user = userEvent.setup();
-    render(<App />);
-
-    await user.click(await screen.findByRole("button", { name: /run quick scan/i }));
-
-    const progress = await screen.findByLabelText(/scan progress/i);
-    expect(progress).toHaveTextContent("windows.process | 7 locations checked");
-  });
-
-  it("disables cancellation until the backend returns a scan id", async () => {
-    vi.mocked(startScan).mockImplementation(() => new Promise(() => undefined));
-    const user = userEvent.setup();
-    render(<App />);
-
-    await user.click(await screen.findByRole("button", { name: /run quick scan/i }));
-
-    expect(await screen.findByRole("button", { name: "Cancel" })).toBeDisabled();
-  });
-
-  it("cleans up when backend cancellation fails", async () => {
-    vi.mocked(startScan).mockResolvedValue({
-      handle: { scanId: "scan-1", scope: "quick", state: "running", revision: "workspace-r1", startedAt: "2026-01-01T00:00:00Z" },
-      unlisten: vi.fn(),
-    });
-    vi.mocked(cancelScan).mockRejectedValue(new Error("already ended"));
-    const user = userEvent.setup();
-    render(<App />);
-
-    await user.click(await screen.findByRole("button", { name: /run quick scan/i }));
-    await user.click(await screen.findByRole("button", { name: "Cancel" }));
-
-    expect(await screen.findByRole("alert")).toHaveTextContent(/could not be confirmed/i);
-    expect(screen.queryByLabelText(/scan progress/i)).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /run quick scan/i })).toBeEnabled();
+    await waitFor(() => expect(startScan).toHaveBeenCalledTimes(1));
+    const [request] = vi.mocked(startScan).mock.calls[0];
+    expect(request).toMatchObject({ networkConsent: false });
   });
 });

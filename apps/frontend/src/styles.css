@@ -25,3 +25,27 @@ header { display: flex; justify-content: space-between; align-items: center; mar
 .review { border-top: 1px solid #1a2a27; padding-bottom: 16px; }.review .row { border: 0; }.review > p { color: #71877f; font-size: 11px; margin: 0 0 10px 50px; }.review > div:last-child { margin-left: 50px; display: flex; gap: 8px; }.review button { padding: 7px 11px; }.review button.quiet { background: transparent; color: #9aaba5; border: 1px solid #31453f; }.empty { color: #71877f; padding: 35px 0; text-align: center; }.empty-page { min-height: 360px; display: grid; place-items: center; align-content: center; text-align: center; }.empty-page > span { color: #86e8bd; border: 1px solid #355048; padding: 12px; border-radius: 10px; }.empty-page p { color: #71877f; }.empty-page button { border: 1px solid #2c403b; background: #17231f; color: #5e716b; border-radius: 8px; padding: 9px 12px; }
 @media (max-width: 1100px) { .metrics { grid-template-columns: repeat(2, 1fr); }.header-actions { flex-direction: column; }.shell { grid-template-columns: 210px 1fr; } main { padding-inline: 24px; } }
 .scan-warning { background: #321f16; border: 1px solid #7a482e; color: #ffd8bc; padding: 10px 14px; border-radius: 10px; margin-bottom: 16px; }
+.scan-warning-inline { background: #321f16; border: 1px solid #7a482e; color: #ffd8bc; padding: 6px 10px; border-radius: 8px; margin-top: 8px; font-size: 11px; }
+.scan-notice { border: 1px solid #2b4c42; background: #10201c; color: #cfe9df; padding: 10px 14px; border-radius: 10px; margin-bottom: 16px; font-size: 12px; }
+.modal-overlay { position: fixed; inset: 0; background: rgba(4, 9, 8, .68); display: grid; place-items: center; z-index: 20; padding: 24px; }
+.modal { width: min(420px, 100%); max-height: min(640px, calc(100vh - 48px)); overflow-y: auto; border: 1px solid #263a35; background: #0d1a17; border-radius: 12px; padding: 22px; display: grid; gap: 14px; }
+.modal h2 { margin: 0; font: 500 18px/1.2 Georgia, serif; }
+.modal .scan-mode { border: 0; padding: 0; margin: 0; display: flex; gap: 16px; }
+.modal .scan-mode legend { color: #6f8981; text-transform: uppercase; font-size: 9px; letter-spacing: .12em; font-weight: 800; margin-bottom: 6px; }
+.modal .scan-mode label { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.deep-options { display: grid; gap: 10px; }
+.deep-options > button { align-self: start; border: 1px solid #2c403b; background: #17231f; color: #dbe6e1; border-radius: 8px; padding: 8px 12px; font-size: 12px; cursor: pointer; }
+.roots-list { max-height: 120px; overflow-y: auto; border: 1px solid #1d2d2a; border-radius: 8px; padding: 8px 10px; background: #0a1413; }
+.roots-list ul { margin: 0; padding-left: 16px; display: grid; gap: 4px; }
+.roots-list li { font-size: 11px; color: #b6c6c0; word-break: break-all; }
+.empty-roots { margin: 0; color: #647a73; font-size: 11px; }
+.checkbox-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.network-confirm { border: 1px solid #7a482e; background: #241a12; border-radius: 8px; padding: 10px 12px; display: grid; gap: 8px; }
+.network-confirm p { margin: 0; color: #ffd8bc; font-size: 12px; line-height: 1.5; }
+.network-confirm div { display: flex; gap: 8px; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.modal button.quiet, .modal-actions button.quiet { background: transparent; color: #9aaba5; border: 1px solid #31453f; border-radius: 8px; padding: 8px 12px; cursor: pointer; font-size: 12px; }
+.modal-actions button:not(.quiet) { border: 0; border-radius: 8px; background: #8bf5c6; color: #092118; padding: 8px 14px; font-weight: 700; cursor: pointer; font-size: 12px; }
+.modal-actions button:disabled { opacity: .5; cursor: not-allowed; }
+.network-confirm button { border: 0; border-radius: 6px; background: #8bf5c6; color: #092118; padding: 6px 10px; font-size: 11px; cursor: pointer; }
+.network-confirm button.quiet { background: transparent; color: #ffd8bc; border: 1px solid #7a482e; }
