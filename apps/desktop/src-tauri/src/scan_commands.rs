@@ -756,8 +756,8 @@ pub(crate) async fn start_scan(
                     DeepScanError::NetworkConsentRequired => {
                         CommandError::network_consent_required()
                     }
-                    DeepScanError::RootUnavailable { message } => {
-                        CommandError::invalid_request(message)
+                    DeepScanError::RootUnavailable => {
+                        CommandError::invalid_request(error.to_string())
                     }
                 });
             }

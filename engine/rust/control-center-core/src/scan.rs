@@ -467,16 +467,22 @@ fn build_quick_scan_jobs(context: QuickScanContext) -> Vec<ScannerJob> {
                     }
                 };
 
-                errors.extend(
-                    report
-                        .errors
-                        .into_iter()
-                        .map(|error| format!("{}: {}", error.root.display(), error.message)),
-                );
+                // `KnownLocationError::root`/`message` may embed real filesystem
+                // paths (including per-user profile paths and resolved shortcut
+                // targets). Scan events and persisted scan errors must never
+                // carry a raw path, so only a stable, path-free count is
+                // reported here — never the error's own text.
+                let known_location_error_count = report.errors.len();
+                for _ in 0..known_location_error_count {
+                    errors.push("known location root unreadable".to_string());
+                }
 
                 if !errors.is_empty() {
-                    emit_partial_failure(&events, "windows.known_location", errors.join("; "))
-                        .await;
+                    let message = format!(
+                        "{} known-location scan issue(s) occurred; see application logs for detail",
+                        errors.len()
+                    );
+                    emit_partial_failure(&events, "windows.known_location", message).await;
                 }
 
                 emit_discoveries(events, cancellation, report.discoveries).await

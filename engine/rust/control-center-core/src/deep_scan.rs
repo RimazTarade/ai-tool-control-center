@@ -46,8 +46,8 @@ pub enum DeepScanError {
     NoRootsSelected,
     #[error("a selected root is on the network and requires explicit consent for this scan")]
     NetworkConsentRequired,
-    #[error("a selected root could not be classified: {message}")]
-    RootUnavailable { message: String },
+    #[error("a selected root could not be classified")]
+    RootUnavailable,
 }
 
 impl DeepScanError {
@@ -55,7 +55,7 @@ impl DeepScanError {
         match self {
             DeepScanError::NoRootsSelected => "no_roots_selected",
             DeepScanError::NetworkConsentRequired => "network_consent_required",
-            DeepScanError::RootUnavailable { .. } => "root_unavailable",
+            DeepScanError::RootUnavailable => "root_unavailable",
         }
     }
 }
@@ -82,9 +82,16 @@ fn validate_roots(roots: &[PathBuf], network_consent: bool) -> Result<(), DeepSc
             }
             Ok(_) => {}
             Err(error) => {
-                return Err(DeepScanError::RootUnavailable {
-                    message: error.to_string(),
-                });
+                // The underlying io::Error may embed the raw path (e.g.
+                // "path has no drive or UNC prefix to classify: {path}").
+                // Log it locally only; never let it reach a ScanEvent or
+                // CommandError, which are serialized to the frontend and
+                // may be persisted.
+                eprintln!(
+                    "deep scan root could not be classified: root={} error={error}",
+                    root.display()
+                );
+                return Err(DeepScanError::RootUnavailable);
             }
         }
     }
@@ -262,6 +269,9 @@ async fn run_deep_scan(
     let start = Instant::now();
 
     if let Err(error) = validate_roots(&context.roots, context.network_consent) {
+        // `error.to_string()` is path-free by construction (see
+        // `DeepScanError`'s Display impls): raw paths are logged locally at
+        // the point they are observed, never carried into a wire event.
         let _ = events
             .critical(ScanEvent::Failed {
                 code: error.code().into(),
@@ -492,6 +502,28 @@ mod tests {
             validate_roots(&[], false),
             Err(DeepScanError::NoRootsSelected)
         ));
+    }
+
+    #[test]
+    fn root_unavailable_error_and_its_wire_message_never_carry_the_raw_path() {
+        // A path with no drive letter and no UNC prefix cannot be classified
+        // and deterministically triggers `DeepScanError::RootUnavailable`.
+        let secret_root = PathBuf::from("relative/unclassifiable/root-marker-72f1");
+
+        let error = validate_roots(&[secret_root.clone()], false).unwrap_err();
+        assert!(matches!(error, DeepScanError::RootUnavailable));
+
+        // The Display impl (what ends up in ScanEvent::Failed.message and in
+        // CommandError::invalid_request(...)) must never contain the raw path.
+        let wire_message = error.to_string();
+        assert!(
+            !wire_message.contains("root-marker-72f1"),
+            "RootUnavailable's wire message leaked the raw path: {wire_message:?}"
+        );
+        assert!(
+            !wire_message.contains(secret_root.to_string_lossy().as_ref()),
+            "RootUnavailable's wire message leaked the raw path: {wire_message:?}"
+        );
     }
 
     #[derive(Clone)]
