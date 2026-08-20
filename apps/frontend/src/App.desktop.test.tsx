@@ -165,6 +165,70 @@ describe("scan lifecycle controls", () => {
 
     expect(startScan).toHaveBeenCalledWith(expect.objectContaining({ revision: "workspace-r2" }), expect.any(Function));
   });
+
+  it("does not drop a progress event that arrives before start_scan resolves", async () => {
+    const user = userEvent.setup();
+    vi.mocked(startScan).mockImplementation(async (_request, handler) => {
+      // Fire an event synchronously, before the handle promise settles —
+      // matching the real listener-attached-before-invoke ordering.
+      handler({ kind: "progress", scanner_id: "filesystem.deep", completed_units: 4, total_units: null, current_location: "Selected root 1 · depth 2" });
+      await Promise.resolve();
+      return {
+        handle: { scanId: "scan-1", scope: "quick", state: "running", revision: "scan-r1", startedAt: "2026-01-01T00:00:00Z" },
+        unlisten: vi.fn(),
+      };
+    });
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "Run scan" }));
+    await user.click(screen.getByRole("button", { name: "Run" }));
+
+    expect(await screen.findByLabelText(/scan progress/i)).toHaveTextContent("4");
+  });
+
+  it("treats a terminal event that arrives before start_scan resolves as already-terminal, not a stuck running scan", async () => {
+    const user = userEvent.setup();
+    vi.mocked(bootstrap).mockResolvedValue({ mode: "desktop", pending: [], inventory: [], scanRevision: "workspace-r2" });
+    vi.mocked(startScan).mockImplementation(async (_request, handler) => {
+      handler({ kind: "failed", code: "scanner_failed", message: "The scan failed immediately", failure_count: 1, duration_ms: 1 });
+      await Promise.resolve();
+      return {
+        handle: { scanId: "scan-1", scope: "quick", state: "running", revision: "scan-r1", startedAt: "2026-01-01T00:00:00Z" },
+        unlisten: vi.fn(),
+      };
+    });
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "Run scan" }));
+    await user.click(screen.getByRole("button", { name: "Run" }));
+
+    // The buffered terminal event must win over the "running" state set from
+    // the resolved handle: no stuck scan bar, and the terminal notice shows.
+    await waitFor(() => expect(screen.queryByLabelText(/scan progress/i)).not.toBeInTheDocument());
+    expect(await screen.findByText(/scan failed/i)).toBeInTheDocument();
+  });
+});
+
+describe("start conflict recovery", () => {
+  it("re-bootstraps and retries once with the fresh revision when start_scan returns conflict", async () => {
+    const user = userEvent.setup();
+    vi.mocked(startScan)
+      .mockRejectedValueOnce({ code: "conflict" })
+      .mockResolvedValueOnce({
+        handle: { scanId: "scan-1", scope: "quick", state: "running", revision: "scan-r1", startedAt: "2026-01-01T00:00:00Z" },
+        unlisten: vi.fn(),
+      });
+    vi.mocked(bootstrap)
+      .mockResolvedValueOnce({ mode: "desktop", pending: [], inventory: [], scanRevision: "workspace-r1" })
+      .mockResolvedValueOnce({ mode: "desktop", pending: [], inventory: [], scanRevision: "workspace-r2" });
+
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "Run scan" }));
+    await user.click(screen.getByRole("button", { name: "Run" }));
+
+    await waitFor(() => expect(startScan).toHaveBeenCalledTimes(2));
+    expect(startScan).toHaveBeenNthCalledWith(1, expect.objectContaining({ revision: "workspace-r1" }), expect.any(Function));
+    expect(startScan).toHaveBeenNthCalledWith(2, expect.objectContaining({ revision: "workspace-r2" }), expect.any(Function));
+    expect(await screen.findByLabelText(/scan progress/i)).toBeInTheDocument();
+  });
 });
 
 describe("network consent retry", () => {

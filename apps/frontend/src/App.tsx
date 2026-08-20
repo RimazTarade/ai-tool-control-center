@@ -56,6 +56,12 @@ export default function App() {
   const stopListening = useRef<null | (() => void)>(null);
   const demoTimer = useRef<number | null>(null);
   const demoStep = useRef(0);
+  // The scan:event listener attaches before start_scan is invoked, so events
+  // (including an immediate terminal one for a fast-failing scan) can arrive
+  // before activeScan is set from the resolved handle. Buffer them here and
+  // replay once the handle resolves, rather than silently dropping them.
+  const isStarting = useRef(false);
+  const pendingEvents = useRef<ScanEvent[]>([]);
 
   useEffect(() => {
     void bootstrap().then((result) => {
@@ -111,6 +117,10 @@ export default function App() {
   }
 
   function handleScanEvent(event: ScanEvent) {
+    if (isStarting.current) {
+      pendingEvents.current.push(event);
+      return;
+    }
     switch (event.kind) {
       case "progress":
         setActiveScan((current) =>
@@ -166,13 +176,15 @@ export default function App() {
     setState(result);
   }
 
-  async function attemptStart(request: ScanRequest) {
+  async function attemptStart(request: ScanRequest, allowConflictRetry = true) {
     setStarting(true);
     setStartError(undefined);
     try {
       if (state.mode === "demo") {
         startDemoScan(request);
       } else {
+        isStarting.current = true;
+        pendingEvents.current = [];
         const { handle, unlisten } = await startScan(request, handleScanEvent);
         stopListening.current = unlisten;
         setActiveScan({
@@ -186,12 +198,36 @@ export default function App() {
           currentLocation: null,
           warnings: [],
         });
+        isStarting.current = false;
+        // Replay any events (progress, scanner_failed, or even a terminal
+        // one for a fast-failing scan) that arrived while the listener was
+        // attached but activeScan wasn't set yet, so nothing is lost and a
+        // terminal event that raced the handle correctly overrides the
+        // "running" state just set above.
+        const buffered = pendingEvents.current;
+        pendingEvents.current = [];
+        buffered.forEach(handleScanEvent);
         closeDialog();
       }
     } catch (error) {
+      isStarting.current = false;
+      pendingEvents.current = [];
       const code = (error as { code?: string } | null)?.code;
       if (code === "network_consent_required" && request.mode === "deep") {
         setNetworkConfirmPending(true);
+      } else if (code === "conflict" && allowConflictRetry) {
+        // The workspace revision was stale. Re-bootstrap to obtain the
+        // current one and retry once with it, rather than leaving the user
+        // stuck on a "could not start" message with no recovery path.
+        try {
+          const result = await bootstrap();
+          setWorkspaceRevision(result.scanRevision);
+          setState(result);
+          await attemptStart({ ...request, revision: result.scanRevision }, false);
+          return;
+        } catch {
+          setStartError("The scan could not start. Please try again.");
+        }
       } else {
         setStartError("The scan could not start.");
       }
