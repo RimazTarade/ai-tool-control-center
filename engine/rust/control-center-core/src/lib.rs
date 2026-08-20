@@ -1,4 +1,5 @@
 pub mod action;
+mod deep_scan_windows;
 pub mod model;
 pub mod python_supervisor;
 pub mod redaction;
