@@ -35,6 +35,12 @@ use uuid::Uuid;
 pub struct CommandError {
     pub code: &'static str,
     pub message: String,
+    /// Present only for `storage_integrity` on a pause/resume whose in-memory
+    /// state (and revision) already changed before persistence failed. Lets
+    /// the frontend adopt the new revision instead of being permanently
+    /// stuck retrying with a now-stale one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<ScanState>,
 }
 
 impl CommandError {
@@ -42,7 +48,13 @@ impl CommandError {
         Self {
             code,
             message: message.into(),
+            state: None,
         }
+    }
+
+    fn with_state(mut self, state: ScanState) -> Self {
+        self.state = Some(state);
+        self
     }
 
     pub(crate) fn conflict() -> Self {
@@ -605,6 +617,7 @@ async fn run_event_bridge<P: EventBridgePorts>(
     mut receiver: mpsc::Receiver<ScanEvent>,
 ) {
     let mut storage_failures: u64 = 0;
+    let mut terminal_seen = false;
 
     while let Some(event) = receiver.recv().await {
         match &event {
@@ -650,6 +663,7 @@ async fn run_event_bridge<P: EventBridgePorts>(
             ScanEvent::Paused | ScanEvent::Resumed => {}
             _ => {
                 if let Some(state) = terminal_state_of(&event) {
+                    terminal_seen = true;
                     let event = with_added_failures(event.clone(), storage_failures);
                     let failure_count = match &event {
                         ScanEvent::Cancelled { failure_count, .. }
@@ -680,6 +694,22 @@ async fn run_event_bridge<P: EventBridgePorts>(
                 ports.emit(&event);
             }
         }
+    }
+
+    // The channel closed without ever producing a terminal event: the
+    // spawned runner (quick_scan/deep_scan) panicked, was aborted, or was
+    // otherwise dropped without settling. Without this fallback the
+    // scan_runs row would stay `running` forever and the frontend would
+    // never receive a terminal event to release its active-scan state.
+    if !terminal_seen {
+        let event = ScanEvent::Failed {
+            code: "runner_stopped".into(),
+            message: "The scan process stopped unexpectedly".into(),
+            failure_count: storage_failures,
+            duration_ms: 0,
+        };
+        let _ = ports.persist_terminal(scan_id, ScanLifecycleState::Failed, storage_failures);
+        ports.emit(&event);
     }
 
     ports.remove_scan(scan_id);
@@ -848,7 +878,8 @@ pub(crate) fn pause_scan(
 ) -> Result<ScanState, CommandError> {
     let outcome = state.scans.pause(request.scan_id, &request.revision)?;
     if outcome.changed {
-        persist_lifecycle(&state, &outcome.state.scan_id, ScanLifecycleState::Paused)?;
+        persist_lifecycle(&state, &outcome.state.scan_id, ScanLifecycleState::Paused)
+            .map_err(|error| error.with_state(outcome.state.clone()))?;
         emit(&app, &ScanEvent::Paused);
     }
     Ok(outcome.state)
@@ -862,7 +893,8 @@ pub(crate) fn resume_scan(
 ) -> Result<ScanState, CommandError> {
     let outcome = state.scans.resume(request.scan_id, &request.revision)?;
     if outcome.changed {
-        persist_lifecycle(&state, &outcome.state.scan_id, ScanLifecycleState::Running)?;
+        persist_lifecycle(&state, &outcome.state.scan_id, ScanLifecycleState::Running)
+            .map_err(|error| error.with_state(outcome.state.clone()))?;
         emit(&app, &ScanEvent::Resumed);
     }
     Ok(outcome.state)
@@ -1187,5 +1219,27 @@ mod tests {
 
         let log = log.lock().unwrap();
         assert_eq!(&log[..], &["persist_terminal", "emit_terminal"]);
+    }
+
+    #[tokio::test]
+    async fn runner_exiting_without_a_terminal_event_still_persists_and_emits_one() {
+        let log: std::sync::Arc<Mutex<Vec<&'static str>>> = Default::default();
+        let ports = RecordingPorts { log: log.clone() };
+        let (sender, receiver) = mpsc::channel(8);
+        let scan_id = Uuid::new_v4();
+
+        let bridge = tokio::spawn(run_event_bridge(ports, scan_id, receiver));
+
+        // Simulate the spawned runner dying without ever emitting a terminal
+        // event (e.g. a top-level panic): the channel just closes.
+        drop(sender);
+        bridge.await.unwrap();
+
+        let log = log.lock().unwrap();
+        assert_eq!(
+            &log[..],
+            &["persist_terminal", "emit_terminal"],
+            "a runner that exits without a terminal event must still leave the scan in a durable, announced terminal state"
+        );
     }
 }
