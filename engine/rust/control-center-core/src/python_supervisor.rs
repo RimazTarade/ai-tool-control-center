@@ -1007,6 +1007,25 @@ Start-Sleep -Seconds 3
     }
 }
 
+/// Serializes the handful of tests below that spawn a real `powershell.exe`
+/// (which itself spawns a `ping.exe` descendant) and assert on tight, fixed
+/// wall-clock windows around that external process's startup, cancellation,
+/// and teardown. Under CPU contention (e.g. several of these launching
+/// PowerShell at once, or a busy CI runner), PowerShell interpreter startup
+/// can outlast those fixed windows and produce a spurious failure — not a
+/// production bug, a test-fixture race. Reproduced locally by running this
+/// module's test set under artificial concurrent load (multiple `cargo test`
+/// invocations racing for CPU) before adding this lock.
+///
+/// Held for a whole test's body so no two of these process-heavy tests ever
+/// launch/verify their external process concurrently within one test binary.
+/// Scoped to just these tests (not `--test-threads=1` for the whole crate)
+/// per the smallest-fix principle: every other test in this crate remains
+/// fully parallel.
+#[cfg(all(test, windows))]
+static WINDOWS_PROCESS_SUPERVISOR_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 #[cfg(all(test, windows))]
 mod cancellation_tests {
     use super::*;
@@ -1071,6 +1090,7 @@ Start-Sleep -Seconds 30
 
     #[tokio::test]
     async fn completed_child_that_stays_alive_can_still_be_cancelled() {
+        let _serialize = super::WINDOWS_PROCESS_SUPERVISOR_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("scanner-completed-then-cancel.ps1");
         let ready_file = temp.path().join("completed-ready.txt");
@@ -1283,6 +1303,7 @@ mod descendant_cleanup_tests {
 
     #[tokio::test]
     async fn timeout_kills_descendant_processes() {
+        let _serialize = super::WINDOWS_PROCESS_SUPERVISOR_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("scanner-descendant.ps1");
         let pid_file = temp.path().join("descendant.pid");
@@ -1363,6 +1384,7 @@ mod cancellation_descendant_cleanup_tests {
 
     #[tokio::test]
     async fn cancellation_kills_descendant_processes_after_grace_period() {
+        let _serialize = super::WINDOWS_PROCESS_SUPERVISOR_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("scanner-cancel-descendant.ps1");
         let pid_file = temp.path().join("cancel-descendant.pid");
@@ -1448,6 +1470,7 @@ Start-Sleep -Seconds 30
 
     #[tokio::test]
     async fn cancellation_past_grace_period_reports_forced_termination() {
+        let _serialize = super::WINDOWS_PROCESS_SUPERVISOR_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("scanner-cancel-forced-descendant.ps1");
         let pid_file = temp.path().join("cancel-forced-descendant.pid");
@@ -1547,6 +1570,7 @@ mod drop_cleanup_tests {
 
     #[tokio::test]
     async fn dropping_supervisor_kills_descendant_processes() {
+        let _serialize = super::WINDOWS_PROCESS_SUPERVISOR_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("scanner-drop-descendant.ps1");
         let pid_file = temp.path().join("drop-descendant.pid");
