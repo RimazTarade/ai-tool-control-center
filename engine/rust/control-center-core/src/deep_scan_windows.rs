@@ -182,23 +182,20 @@ pub(crate) fn stable_directory_identity(path: &Path) -> io::Result<DirectoryIden
         )
     }
     .map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!("failed to open directory {}: {error}", path.display()),
-        )
+        io::Error::other(format!(
+            "failed to open directory {}: {error}",
+            path.display()
+        ))
     })?;
 
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     let result = unsafe { GetFileInformationByHandle(handle, &mut info) };
     let _ = unsafe { CloseHandle(handle) };
     result.map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "failed to read directory identity for {}: {error}",
-                path.display()
-            ),
-        )
+        io::Error::other(format!(
+            "failed to read directory identity for {}: {error}",
+            path.display()
+        ))
     })?;
 
     Ok(DirectoryIdentity(format!(

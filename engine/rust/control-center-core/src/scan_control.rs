@@ -166,11 +166,17 @@ impl ScanEventSink {
     /// Lossless send for use from a blocking (non-async) context, such as
     /// a `spawn_blocking` filesystem walk. Blocks the current thread until
     /// channel capacity is available rather than dropping the event.
+    ///
+    /// The error is boxed (unlike the async siblings above, which are not
+    /// flagged by `clippy::result_large_err` since it does not fire on
+    /// `async fn`) because `SendError<ScanEvent>` embeds a whole `ScanEvent`
+    /// and is large enough to make every caller's `Result` oversized even
+    /// when the call succeeds.
     pub fn blocking_critical(
         &self,
         event: ScanEvent,
-    ) -> Result<(), mpsc::error::SendError<ScanEvent>> {
-        self.tx.blocking_send(event)
+    ) -> Result<(), Box<mpsc::error::SendError<ScanEvent>>> {
+        self.tx.blocking_send(event).map_err(Box::new)
     }
 
     pub async fn scanner_failed(

@@ -490,7 +490,7 @@ mod tests {
     fn network_root_without_consent_is_rejected() {
         let unc_root = PathBuf::from(r"\\server\share\folder");
         assert!(matches!(
-            validate_roots(&[unc_root.clone()], false),
+            validate_roots(std::slice::from_ref(&unc_root), false),
             Err(DeepScanError::NetworkConsentRequired)
         ));
         assert!(validate_roots(&[unc_root], true).is_ok());
@@ -510,7 +510,7 @@ mod tests {
         // and deterministically triggers `DeepScanError::RootUnavailable`.
         let secret_root = PathBuf::from("relative/unclassifiable/root-marker-72f1");
 
-        let error = validate_roots(&[secret_root.clone()], false).unwrap_err();
+        let error = validate_roots(std::slice::from_ref(&secret_root), false).unwrap_err();
         assert!(matches!(error, DeepScanError::RootUnavailable));
 
         // The Display impl (what ends up in ScanEvent::Failed.message and in
@@ -651,10 +651,9 @@ mod tests {
                 .and_then(|value| value.to_str())
                 .unwrap_or_default();
             match self.find(parent, name) {
-                Some(entry) if entry.metadata_error => Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "simulated metadata error",
-                )),
+                Some(entry) if entry.metadata_error => {
+                    Err(io::Error::other("simulated metadata error"))
+                }
                 Some(entry) => Ok(EntryPolicy {
                     reparse_point: entry.reparse,
                     placeholder: entry.placeholder,
