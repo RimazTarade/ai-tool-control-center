@@ -1,6 +1,8 @@
-use crate::{Discovery, ReviewState, ScanLifecycleState, ScanScope};
+use crate::{
+    CanonicalCapability, Discovery, HealthCheckDefinition, HealthState, HealthTarget,
+    InstallationInstance, ReviewState, ScanLifecycleState, ScanScope,
+};
 use chrono::{DateTime, Utc};
-#[cfg(test)]
 use rusqlite::OptionalExtension;
 use rusqlite::{Connection, params};
 use std::path::Path;
@@ -20,6 +22,8 @@ pub enum StoreError {
     Database(#[from] rusqlite::Error),
     #[error("invalid stored discovery: {0}")]
     InvalidData(#[from] serde_json::Error),
+    #[error("invalid stored data: {0}")]
+    StorageIntegrity(String),
     #[error("discovery not found")]
     NotFound,
     #[error("finish_scan requires a terminal state (Cancelled, Completed, or Failed), got {0:?}")]
@@ -40,7 +44,7 @@ impl Store {
         Self::from_connection(Connection::open_in_memory()?)
     }
 
-    fn from_connection(connection: Connection) -> Result<Self, StoreError> {
+    fn from_connection(mut connection: Connection) -> Result<Self, StoreError> {
         connection.execute_batch(
             "PRAGMA foreign_keys = ON;
              CREATE TABLE IF NOT EXISTS discoveries (
@@ -91,6 +95,7 @@ impl Store {
             "CREATE INDEX IF NOT EXISTS idx_discoveries_scan_id ON discoveries(scan_id);",
         )?;
 
+        migrate_m7_health_dependency_systems(&mut connection)?;
         Ok(Self { connection })
     }
 
@@ -146,13 +151,371 @@ impl Store {
         if decision == ReviewDecision::Import {
             let mut discovery: Discovery = serde_json::from_str(&payload)?;
             discovery.review_state = ReviewState::Imported;
+            let imported_at = Utc::now().to_rfc3339();
+
             transaction.execute(
-                "INSERT INTO inventory (id, discovery_id, payload_json, imported_at) VALUES (?1, ?2, ?3, ?4)",
-                params![Uuid::new_v4().to_string(), id.to_string(), serde_json::to_string(&discovery)?, chrono::Utc::now().to_rfc3339()],
+                "INSERT INTO inventory (id, discovery_id, payload_json, imported_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    id.to_string(),
+                    serde_json::to_string(&discovery)?,
+                    &imported_at,
+                ],
             )?;
+
+            let stable_identity = discovery
+                .canonical_identity
+                .as_deref()
+                .map(str::trim)
+                .filter(|identity| !identity.is_empty())
+                .map(str::to_owned);
+
+            let existing_capability_id = if let Some(identity) = stable_identity.as_deref() {
+                transaction
+                    .query_row(
+                        "SELECT id FROM canonical_capabilities WHERE stable_identity=?1",
+                        [identity],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .map(|value| parse_stored_uuid(&value, "canonical_capabilities.id"))
+                    .transpose()?
+            } else {
+                None
+            };
+
+            let capability_id = match existing_capability_id {
+                Some(capability_id) => capability_id,
+                None => {
+                    let capability_id = Uuid::new_v4();
+                    transaction.execute(
+                        "INSERT INTO canonical_capabilities
+                         (id, canonical_name, stable_identity, created_at, updated_at, revision)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            capability_id.to_string(),
+                            &discovery.suggested_name,
+                            stable_identity.as_deref(),
+                            &imported_at,
+                            &imported_at,
+                            Uuid::new_v4().to_string(),
+                        ],
+                    )?;
+                    capability_id
+                }
+            };
+
+            let installation_id = Uuid::new_v4();
+            transaction.execute(
+                "INSERT INTO installation_instances
+                 (id, capability_id, source_discovery_id, kind, display_name, host,
+                  installation_state, registration_state, enablement_state, runtime_state,
+                  connection_state, authentication_state, aggregate_health, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'localhost', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    installation_id.to_string(),
+                    capability_id.to_string(),
+                    id.to_string(),
+                    enum_wire_value(&discovery.suggested_type)?,
+                    &discovery.suggested_name,
+                    enum_wire_value(&discovery.installation_state)?,
+                    enum_wire_value(&discovery.registration_state)?,
+                    enum_wire_value(&discovery.enablement_state)?,
+                    enum_wire_value(&discovery.runtime_state)?,
+                    enum_wire_value(&discovery.connection_state)?,
+                    enum_wire_value(&discovery.authentication_state)?,
+                    enum_wire_value(&HealthState::Grey)?,
+                    &imported_at,
+                    &imported_at,
+                ],
+            )?;
+
+            for hint in &discovery.health_hints {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO health_check_definitions
+                     (id, installation_id, check_type, required, expected_condition, timeout_ms,
+                      stale_after_seconds, target_json, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        installation_id.to_string(),
+                        enum_wire_value(&hint.check_type)?,
+                        if hint.required { 1_i64 } else { 0_i64 },
+                        enum_wire_value(&hint.expected_condition)?,
+                        u64_to_sql(hint.timeout_ms, "health hint timeout_ms")?,
+                        hint.stale_after_seconds
+                            .map(|value| u64_to_sql(value, "health hint stale_after_seconds"))
+                            .transpose()?,
+                        serde_json::to_string(&hint.target)?,
+                        &imported_at,
+                        &imported_at,
+                    ],
+                )?;
+            }
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn capabilities(&self) -> Result<Vec<CanonicalCapability>, StoreError> {
+        let rows = {
+            let mut statement = self.connection.prepare(
+                "SELECT id, canonical_name, stable_identity, created_at, updated_at, revision
+                 FROM canonical_capabilities
+                 ORDER BY created_at ASC, id ASC",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        rows.into_iter()
+            .map(
+                |(id, canonical_name, stable_identity, created_at, updated_at, revision)| {
+                    Ok(CanonicalCapability {
+                        id: parse_stored_uuid(&id, "canonical_capabilities.id")?,
+                        canonical_name,
+                        stable_identity,
+                        created_at: parse_stored_timestamp(
+                            &created_at,
+                            "canonical_capabilities.created_at",
+                        )?,
+                        updated_at: parse_stored_timestamp(
+                            &updated_at,
+                            "canonical_capabilities.updated_at",
+                        )?,
+                        revision,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    pub fn installations(&self) -> Result<Vec<InstallationInstance>, StoreError> {
+        let rows = {
+            let mut statement = self.connection.prepare(
+                "SELECT id, capability_id, source_discovery_id, kind, display_name, host,
+                        installation_state, registration_state, enablement_state, runtime_state,
+                        connection_state, authentication_state, aggregate_health, created_at, updated_at
+                 FROM installation_instances
+                 ORDER BY created_at ASC, id ASC",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, String>(11)?,
+                        row.get::<_, String>(12)?,
+                        row.get::<_, String>(13)?,
+                        row.get::<_, String>(14)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        rows.into_iter()
+            .map(
+                |(
+                    id,
+                    capability_id,
+                    source_discovery_id,
+                    kind,
+                    display_name,
+                    host,
+                    installation_state,
+                    registration_state,
+                    enablement_state,
+                    runtime_state,
+                    connection_state,
+                    authentication_state,
+                    aggregate_health,
+                    created_at,
+                    updated_at,
+                )| {
+                    Ok(InstallationInstance {
+                        id: parse_stored_uuid(&id, "installation_instances.id")?,
+                        capability_id: parse_stored_uuid(
+                            &capability_id,
+                            "installation_instances.capability_id",
+                        )?,
+                        source_discovery_id: parse_stored_uuid(
+                            &source_discovery_id,
+                            "installation_instances.source_discovery_id",
+                        )?,
+                        kind: enum_from_wire(&kind, "installation_instances.kind")?,
+                        display_name,
+                        host,
+                        installation_state: enum_from_wire(
+                            &installation_state,
+                            "installation_instances.installation_state",
+                        )?,
+                        registration_state: enum_from_wire(
+                            &registration_state,
+                            "installation_instances.registration_state",
+                        )?,
+                        enablement_state: enum_from_wire(
+                            &enablement_state,
+                            "installation_instances.enablement_state",
+                        )?,
+                        runtime_state: enum_from_wire(
+                            &runtime_state,
+                            "installation_instances.runtime_state",
+                        )?,
+                        connection_state: enum_from_wire(
+                            &connection_state,
+                            "installation_instances.connection_state",
+                        )?,
+                        authentication_state: enum_from_wire(
+                            &authentication_state,
+                            "installation_instances.authentication_state",
+                        )?,
+                        aggregate_health: enum_from_wire(
+                            &aggregate_health,
+                            "installation_instances.aggregate_health",
+                        )?,
+                        created_at: parse_stored_timestamp(
+                            &created_at,
+                            "installation_instances.created_at",
+                        )?,
+                        updated_at: parse_stored_timestamp(
+                            &updated_at,
+                            "installation_instances.updated_at",
+                        )?,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    pub fn health_check_definitions(
+        &self,
+        installation_id: Uuid,
+    ) -> Result<Vec<HealthCheckDefinition>, StoreError> {
+        let rows = {
+            let mut statement = self.connection.prepare(
+                "SELECT id, installation_id, check_type, required, expected_condition, timeout_ms,
+                        stale_after_seconds, target_json, created_at, updated_at
+                 FROM health_check_definitions
+                 WHERE installation_id=?1
+                 ORDER BY created_at ASC, id ASC",
+            )?;
+            statement
+                .query_map([installation_id.to_string()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        rows.into_iter()
+            .map(
+                |(
+                    id,
+                    stored_installation_id,
+                    check_type,
+                    required,
+                    expected_condition,
+                    timeout_ms,
+                    stale_after_seconds,
+                    target_json,
+                    created_at,
+                    updated_at,
+                )| {
+                    let timeout_ms = u64::try_from(timeout_ms).map_err(|_| {
+                        StoreError::StorageIntegrity(
+                            "health_check_definitions.timeout_ms is negative".into(),
+                        )
+                    })?;
+                    if timeout_ms == 0 {
+                        return Err(StoreError::StorageIntegrity(
+                            "health_check_definitions.timeout_ms must be positive".into(),
+                        ));
+                    }
+                    let stale_after_seconds = stale_after_seconds
+                        .map(|value| {
+                            u64::try_from(value).map_err(|_| {
+                                StoreError::StorageIntegrity(
+                                    "health_check_definitions.stale_after_seconds is negative"
+                                        .into(),
+                                )
+                            })
+                        })
+                        .transpose()?;
+                    let required = match required {
+                        0 => false,
+                        1 => true,
+                        other => {
+                            return Err(StoreError::StorageIntegrity(format!(
+                                "invalid health_check_definitions.required value {other}"
+                            )));
+                        }
+                    };
+
+                    Ok(HealthCheckDefinition {
+                        id: parse_stored_uuid(&id, "health_check_definitions.id")?,
+                        installation_id: parse_stored_uuid(
+                            &stored_installation_id,
+                            "health_check_definitions.installation_id",
+                        )?,
+                        check_type: enum_from_wire(
+                            &check_type,
+                            "health_check_definitions.check_type",
+                        )?,
+                        required,
+                        expected_condition: enum_from_wire(
+                            &expected_condition,
+                            "health_check_definitions.expected_condition",
+                        )?,
+                        timeout_ms,
+                        stale_after_seconds,
+                        target_metadata: serde_json::from_str::<HealthTarget>(&target_json)
+                            .map_err(|error| {
+                                StoreError::StorageIntegrity(format!(
+                                    "invalid health_check_definitions.target_json: {error}"
+                                ))
+                            })?,
+                        created_at: parse_stored_timestamp(
+                            &created_at,
+                            "health_check_definitions.created_at",
+                        )?,
+                        updated_at: parse_stored_timestamp(
+                            &updated_at,
+                            "health_check_definitions.updated_at",
+                        )?,
+                    })
+                },
+            )
+            .collect()
     }
 
     pub fn inventory(&self) -> Result<Vec<Discovery>, StoreError> {
@@ -280,6 +643,272 @@ impl Store {
     }
 }
 
+const M7_MIGRATION_ID: &str = "m7_health_dependency_systems_v1";
+
+fn enum_wire_value<T: serde::Serialize>(value: &T) -> Result<String, StoreError> {
+    match serde_json::to_value(value)? {
+        serde_json::Value::String(value) => Ok(value),
+        _ => Err(StoreError::StorageIntegrity(
+            "stored enum did not serialize to a string".into(),
+        )),
+    }
+}
+
+fn enum_from_wire<T: serde::de::DeserializeOwned>(
+    value: &str,
+    field: &str,
+) -> Result<T, StoreError> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(|error| {
+        StoreError::StorageIntegrity(format!("invalid {field} value {value:?}: {error}"))
+    })
+}
+
+fn parse_stored_uuid(value: &str, field: &str) -> Result<Uuid, StoreError> {
+    Uuid::parse_str(value).map_err(|error| {
+        StoreError::StorageIntegrity(format!("invalid {field} UUID {value:?}: {error}"))
+    })
+}
+
+fn parse_stored_timestamp(value: &str, field: &str) -> Result<DateTime<Utc>, StoreError> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|error| {
+            StoreError::StorageIntegrity(format!("invalid {field} timestamp {value:?}: {error}"))
+        })
+}
+
+fn u64_to_sql(value: u64, field: &str) -> Result<i64, StoreError> {
+    i64::try_from(value)
+        .map_err(|_| StoreError::StorageIntegrity(format!("{field} exceeds SQLite INTEGER range")))
+}
+
+fn migrate_m7_health_dependency_systems(connection: &mut Connection) -> Result<(), StoreError> {
+    let transaction = connection.transaction()?;
+
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+           id TEXT PRIMARY KEY,
+           applied_at TEXT NOT NULL
+         );",
+    )?;
+
+    let already_applied: i64 = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE id=?1)",
+        [M7_MIGRATION_ID],
+        |row| row.get(0),
+    )?;
+    if already_applied != 0 {
+        transaction.commit()?;
+        return Ok(());
+    }
+
+    transaction.execute_batch(
+        "CREATE TABLE canonical_capabilities (
+           id TEXT PRIMARY KEY,
+           canonical_name TEXT NOT NULL,
+           stable_identity TEXT UNIQUE,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           revision TEXT NOT NULL
+         );
+         CREATE TABLE installation_instances (
+           id TEXT PRIMARY KEY,
+           capability_id TEXT NOT NULL REFERENCES canonical_capabilities(id),
+           source_discovery_id TEXT NOT NULL UNIQUE REFERENCES discoveries(id),
+           kind TEXT NOT NULL,
+           display_name TEXT NOT NULL,
+           host TEXT NOT NULL,
+           installation_state TEXT NOT NULL,
+           registration_state TEXT NOT NULL,
+           enablement_state TEXT NOT NULL,
+           runtime_state TEXT NOT NULL,
+           connection_state TEXT NOT NULL,
+           authentication_state TEXT NOT NULL,
+           aggregate_health TEXT NOT NULL,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL
+         );
+         CREATE TABLE health_check_definitions (
+           id TEXT PRIMARY KEY,
+           installation_id TEXT NOT NULL REFERENCES installation_instances(id),
+           check_type TEXT NOT NULL,
+           required INTEGER NOT NULL CHECK(required IN (0,1)),
+           expected_condition TEXT NOT NULL,
+           timeout_ms INTEGER NOT NULL CHECK(timeout_ms > 0),
+           stale_after_seconds INTEGER,
+           target_json TEXT NOT NULL,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           UNIQUE(installation_id, check_type, expected_condition, target_json)
+         );
+         CREATE TABLE health_runs (
+           id TEXT PRIMARY KEY,
+           scope TEXT NOT NULL CHECK(scope IN ('installation','all')),
+           state TEXT NOT NULL CHECK(state IN ('running','cancelling','cancelled','completed')),
+           started_at TEXT NOT NULL,
+           finished_at TEXT,
+           requested_installation_count INTEGER NOT NULL,
+           completed_installation_count INTEGER NOT NULL,
+           revision TEXT NOT NULL
+         );
+         CREATE TABLE health_results (
+           id TEXT PRIMARY KEY,
+           run_id TEXT NOT NULL REFERENCES health_runs(id),
+           installation_id TEXT NOT NULL REFERENCES installation_instances(id),
+           check_definition_id TEXT NOT NULL REFERENCES health_check_definitions(id),
+           check_type TEXT NOT NULL,
+           required INTEGER NOT NULL CHECK(required IN (0,1)),
+           state TEXT NOT NULL CHECK(state IN ('green','yellow','red','grey','blue')),
+           result_code TEXT NOT NULL,
+           redacted_evidence TEXT NOT NULL,
+           duration_ms INTEGER NOT NULL,
+           observed_at TEXT NOT NULL
+         );
+         CREATE TABLE dependency_relationships (
+           id TEXT PRIMARY KEY,
+           source_capability_id TEXT NOT NULL REFERENCES canonical_capabilities(id) ON DELETE CASCADE,
+           target_capability_id TEXT NOT NULL REFERENCES canonical_capabilities(id) ON DELETE CASCADE,
+           kind TEXT NOT NULL CHECK(kind IN ('requires','depends_on')),
+           owner TEXT NOT NULL CHECK(owner IN ('scanner','user')),
+           provenance TEXT NOT NULL,
+           evidence_summary TEXT NOT NULL,
+           created_at TEXT NOT NULL,
+           revision TEXT NOT NULL,
+           CHECK(source_capability_id <> target_capability_id),
+           UNIQUE(source_capability_id, target_capability_id, kind)
+         );
+         CREATE INDEX idx_installations_capability ON installation_instances(capability_id);
+         CREATE INDEX idx_health_definitions_installation ON health_check_definitions(installation_id);
+         CREATE INDEX idx_health_results_installation_observed ON health_results(installation_id, observed_at DESC);
+         CREATE INDEX idx_health_results_definition_observed ON health_results(check_definition_id, observed_at DESC);
+         CREATE INDEX idx_health_runs_started ON health_runs(started_at DESC);
+         CREATE INDEX idx_dependencies_source ON dependency_relationships(source_capability_id);
+         CREATE INDEX idx_dependencies_target ON dependency_relationships(target_capability_id);",
+    )?;
+
+    let legacy_rows = {
+        let mut statement = transaction.prepare(
+            "SELECT i.discovery_id, i.payload_json, i.imported_at
+             FROM inventory i
+             INNER JOIN discoveries d ON d.id=i.discovery_id
+             ORDER BY i.imported_at ASC, i.id ASC",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    for (source_discovery_id_raw, payload_json, imported_at_raw) in legacy_rows {
+        let source_discovery_id =
+            parse_stored_uuid(&source_discovery_id_raw, "inventory.discovery_id")?;
+        let imported_at = parse_stored_timestamp(&imported_at_raw, "inventory.imported_at")?;
+        let imported_at_text = imported_at.to_rfc3339();
+        let discovery: Discovery = serde_json::from_str(&payload_json)?;
+        let stable_identity = discovery
+            .canonical_identity
+            .as_deref()
+            .map(str::trim)
+            .filter(|identity| !identity.is_empty())
+            .map(str::to_owned);
+
+        let capability_id = if let Some(identity) = stable_identity.as_deref() {
+            transaction
+                .query_row(
+                    "SELECT id FROM canonical_capabilities WHERE stable_identity=?1",
+                    [identity],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .map(|value| parse_stored_uuid(&value, "canonical_capabilities.id"))
+                .transpose()?
+        } else {
+            None
+        };
+
+        let capability_id = match capability_id {
+            Some(id) => id,
+            None => {
+                let id = Uuid::new_v4();
+                transaction.execute(
+                    "INSERT INTO canonical_capabilities
+                     (id, canonical_name, stable_identity, created_at, updated_at, revision)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        id.to_string(),
+                        discovery.suggested_name,
+                        stable_identity,
+                        imported_at_text,
+                        imported_at_text,
+                        Uuid::new_v4().to_string(),
+                    ],
+                )?;
+                id
+            }
+        };
+
+        let installation_id = Uuid::new_v4();
+        transaction.execute(
+            "INSERT INTO installation_instances
+             (id, capability_id, source_discovery_id, kind, display_name, host,
+              installation_state, registration_state, enablement_state, runtime_state,
+              connection_state, authentication_state, aggregate_health, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'localhost', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                installation_id.to_string(),
+                capability_id.to_string(),
+                source_discovery_id.to_string(),
+                enum_wire_value(&discovery.suggested_type)?,
+                discovery.suggested_name,
+                enum_wire_value(&discovery.installation_state)?,
+                enum_wire_value(&discovery.registration_state)?,
+                enum_wire_value(&discovery.enablement_state)?,
+                enum_wire_value(&discovery.runtime_state)?,
+                enum_wire_value(&discovery.connection_state)?,
+                enum_wire_value(&discovery.authentication_state)?,
+                enum_wire_value(&HealthState::Grey)?,
+                imported_at_text,
+                imported_at_text,
+            ],
+        )?;
+
+        for hint in discovery.health_hints {
+            transaction.execute(
+                "INSERT OR IGNORE INTO health_check_definitions
+                 (id, installation_id, check_type, required, expected_condition, timeout_ms,
+                  stale_after_seconds, target_json, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    installation_id.to_string(),
+                    enum_wire_value(&hint.check_type)?,
+                    if hint.required { 1_i64 } else { 0_i64 },
+                    enum_wire_value(&hint.expected_condition)?,
+                    u64_to_sql(hint.timeout_ms, "health hint timeout_ms")?,
+                    hint.stale_after_seconds
+                        .map(|value| u64_to_sql(value, "health hint stale_after_seconds"))
+                        .transpose()?,
+                    serde_json::to_string(&hint.target)?,
+                    imported_at_text,
+                    imported_at_text,
+                ],
+            )?;
+        }
+    }
+
+    transaction.execute(
+        "INSERT INTO schema_migrations (id, applied_at) VALUES (?1, ?2)",
+        params![M7_MIGRATION_ID, Utc::now().to_rfc3339()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn scan_scope_str(scope: ScanScope) -> &'static str {
     match scope {
         ScanScope::Quick => "quick",
@@ -362,6 +991,11 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        DEFAULT_HEALTH_TIMEOUT_MS, Evidence, HealthCheckHint, HealthCheckType,
+        HealthExpectedCondition, HealthState, HealthTarget,
+    };
+    use std::path::PathBuf;
 
     fn test_store() -> Store {
         Store::in_memory().unwrap()
@@ -548,5 +1182,494 @@ mod tests {
         let later = Discovery::unknown("Example", "fixture", "same".into());
         store.enqueue(&later).unwrap();
         assert_eq!(store.pending().unwrap()[0].id, later.id);
+    }
+
+    const M7_MIGRATION_ID: &str = "m7_health_dependency_systems_v1";
+
+    fn legacy_discovery(name: &str, scanner: &str, fingerprint: &str) -> Discovery {
+        let mut discovery = Discovery::unknown(name, scanner, fingerprint.into());
+        discovery.review_state = ReviewState::Imported;
+        discovery
+    }
+
+    fn create_pre_m7_schema(connection: &Connection) {
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE scan_runs (
+                   id TEXT PRIMARY KEY NOT NULL,
+                   scope TEXT NOT NULL CHECK(scope IN ('quick', 'deep')),
+                   state TEXT NOT NULL,
+                   started_at TEXT NOT NULL,
+                   finished_at TEXT,
+                   failure_count INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE discoveries (
+                   id TEXT PRIMARY KEY,
+                   fingerprint TEXT NOT NULL UNIQUE,
+                   payload_json TEXT NOT NULL,
+                   review_state TEXT NOT NULL,
+                   observed_at TEXT NOT NULL,
+                   scan_id TEXT REFERENCES scan_runs(id)
+                 );
+                 CREATE TABLE inventory (
+                   id TEXT PRIMARY KEY,
+                   discovery_id TEXT NOT NULL UNIQUE REFERENCES discoveries(id),
+                   payload_json TEXT NOT NULL,
+                   imported_at TEXT NOT NULL
+                 );
+                 CREATE TABLE scan_errors (
+                   id TEXT PRIMARY KEY NOT NULL,
+                   scan_id TEXT NOT NULL REFERENCES scan_runs(id) ON DELETE CASCADE,
+                   scanner_id TEXT NOT NULL,
+                   code TEXT NOT NULL,
+                   redacted_message TEXT NOT NULL,
+                   observed_at TEXT NOT NULL
+                 );
+                 CREATE INDEX idx_scan_errors_scan_id ON scan_errors(scan_id);
+                 CREATE INDEX idx_discoveries_scan_id ON discoveries(scan_id);",
+            )
+            .unwrap();
+    }
+
+    fn insert_legacy_import(connection: &Connection, discovery: &Discovery) {
+        let payload = serde_json::to_string(discovery).unwrap();
+        connection
+            .execute(
+                "INSERT INTO discoveries
+                 (id, fingerprint, payload_json, review_state, observed_at, scan_id)
+                 VALUES (?1, ?2, ?3, 'imported', ?4, NULL)",
+                rusqlite::params![
+                    discovery.id.to_string(),
+                    discovery.fingerprint,
+                    payload,
+                    discovery.observed_at.to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO inventory (id, discovery_id, payload_json, imported_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    Uuid::new_v4().to_string(),
+                    discovery.id.to_string(),
+                    serde_json::to_string(discovery).unwrap(),
+                    discovery.observed_at.to_rfc3339(),
+                ],
+            )
+            .unwrap();
+    }
+
+    fn legacy_connection_with_imported_discoveries(discoveries: &[Discovery]) -> Connection {
+        let connection = Connection::open_in_memory().unwrap();
+        create_pre_m7_schema(&connection);
+        for discovery in discoveries {
+            insert_legacy_import(&connection, discovery);
+        }
+        connection
+    }
+
+    fn raw_table_count_or_zero(connection: &Connection, table: &str) -> i64 {
+        let exists: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if exists == 0 {
+            return 0;
+        }
+        connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    fn raw_migration_marker_count_or_zero(connection: &Connection) -> i64 {
+        if raw_table_count_or_zero(connection, "schema_migrations") == 0 {
+            return 0;
+        }
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE id=?1",
+                [M7_MIGRATION_ID],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn m7_migration_preserves_reviewed_discovery_linkage_and_starts_grey() {
+        let discovery = legacy_discovery("Legacy CLI", "scanner-a", "fingerprint-a");
+        let discovery_id = discovery.id;
+        let connection = legacy_connection_with_imported_discoveries(&[discovery]);
+        let store = Store::from_connection(connection).unwrap();
+
+        let capabilities = store.capabilities().unwrap();
+        let installations = store.installations().unwrap();
+
+        assert_eq!(capabilities.len(), 1);
+        assert_eq!(installations.len(), 1);
+        assert_eq!(installations[0].aggregate_health, HealthState::Grey);
+        assert_eq!(installations[0].source_discovery_id, discovery_id);
+        assert_eq!(installations[0].host, "localhost");
+        assert_eq!(
+            raw_table_count_or_zero(&store.connection, "health_results"),
+            0
+        );
+        assert_eq!(
+            raw_table_count_or_zero(&store.connection, "dependency_relationships"),
+            0
+        );
+        assert_eq!(raw_migration_marker_count_or_zero(&store.connection), 1);
+    }
+
+    #[test]
+    fn m7_migration_groups_only_matching_trusted_canonical_identity() {
+        let mut first = legacy_discovery("Ollama", "scanner-a", "fingerprint-a");
+        first.canonical_identity = Some("windows-path:c:\\tools\\ollama.exe".into());
+        let mut second = legacy_discovery("Ollama CLI", "scanner-b", "fingerprint-b");
+        second.canonical_identity = Some("windows-path:c:\\tools\\ollama.exe".into());
+        let connection = legacy_connection_with_imported_discoveries(&[first, second]);
+        let store = Store::from_connection(connection).unwrap();
+
+        let capabilities = store.capabilities().unwrap();
+        let installations = store.installations().unwrap();
+
+        assert_eq!(capabilities.len(), 1);
+        assert_eq!(installations.len(), 2);
+        assert_eq!(
+            capabilities[0].stable_identity.as_deref(),
+            Some("windows-path:c:\\tools\\ollama.exe")
+        );
+        assert!(
+            installations
+                .iter()
+                .all(|item| item.capability_id == capabilities[0].id)
+        );
+    }
+
+    #[test]
+    fn m7_migration_does_not_group_ambiguous_legacy_rows() {
+        let first = legacy_discovery("Example Tool", "scanner-a", "similar-a");
+        let second = legacy_discovery("Example Tool", "scanner-b", "similar-b");
+        let connection = legacy_connection_with_imported_discoveries(&[first, second]);
+        let store = Store::from_connection(connection).unwrap();
+
+        let capabilities = store.capabilities().unwrap();
+        let installations = store.installations().unwrap();
+
+        assert_eq!(capabilities.len(), 2);
+        assert_eq!(installations.len(), 2);
+        assert!(
+            capabilities
+                .iter()
+                .all(|item| item.stable_identity.is_none())
+        );
+        assert_ne!(
+            installations[0].capability_id,
+            installations[1].capability_id
+        );
+    }
+
+    #[test]
+    fn m7_migration_seeds_definitions_only_from_typed_hints() {
+        let mut typed = legacy_discovery("Typed Tool", "scanner-a", "typed-a");
+        typed.health_hints.push(HealthCheckHint {
+            check_type: HealthCheckType::FileExists,
+            required: true,
+            expected_condition: HealthExpectedCondition::Exists,
+            timeout_ms: DEFAULT_HEALTH_TIMEOUT_MS,
+            stale_after_seconds: None,
+            target: HealthTarget::Path {
+                path: PathBuf::from(r"C:\Tools\typed.exe"),
+            },
+        });
+        let typed_id = typed.id;
+
+        let mut evidence_only =
+            legacy_discovery("Legacy Evidence Tool", "scanner-b", "legacy-evidence");
+        evidence_only.evidence.push(Evidence {
+            kind: "path".into(),
+            summary: r"C:\Tools\legacy.exe".into(),
+        });
+        let evidence_only_id = evidence_only.id;
+
+        let connection = legacy_connection_with_imported_discoveries(&[typed, evidence_only]);
+        let store = Store::from_connection(connection).unwrap();
+        let installations = store.installations().unwrap();
+
+        let typed_installation = installations
+            .iter()
+            .find(|item| item.source_discovery_id == typed_id)
+            .unwrap();
+        let legacy_installation = installations
+            .iter()
+            .find(|item| item.source_discovery_id == evidence_only_id)
+            .unwrap();
+
+        let definitions = store
+            .health_check_definitions(typed_installation.id)
+            .unwrap();
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].check_type, HealthCheckType::FileExists);
+        assert!(definitions[0].required);
+        assert_eq!(
+            definitions[0].expected_condition,
+            HealthExpectedCondition::Exists
+        );
+        assert_eq!(
+            definitions[0].target_metadata,
+            HealthTarget::Path {
+                path: PathBuf::from(r"C:\Tools\typed.exe"),
+            }
+        );
+        assert!(
+            store
+                .health_check_definitions(legacy_installation.id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn m7_migration_is_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("m7-idempotent.sqlite");
+        let mut discovery = legacy_discovery("Stable Tool", "scanner-a", "stable-a");
+        discovery.canonical_identity = Some("windows-path:c:\\tools\\stable.exe".into());
+        discovery.health_hints.push(HealthCheckHint {
+            check_type: HealthCheckType::FileExists,
+            required: true,
+            expected_condition: HealthExpectedCondition::Exists,
+            timeout_ms: DEFAULT_HEALTH_TIMEOUT_MS,
+            stale_after_seconds: None,
+            target: HealthTarget::Path {
+                path: PathBuf::from(r"C:\Tools\stable.exe"),
+            },
+        });
+
+        {
+            let connection = Connection::open(&database).unwrap();
+            create_pre_m7_schema(&connection);
+            insert_legacy_import(&connection, &discovery);
+        }
+
+        {
+            let store = Store::open(&database).unwrap();
+            assert_eq!(store.capabilities().unwrap().len(), 1);
+            assert_eq!(store.installations().unwrap().len(), 1);
+            assert_eq!(
+                store
+                    .health_check_definitions(store.installations().unwrap()[0].id)
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+
+        let store = Store::open(&database).unwrap();
+        assert_eq!(store.capabilities().unwrap().len(), 1);
+        assert_eq!(store.installations().unwrap().len(), 1);
+        assert_eq!(
+            store
+                .health_check_definitions(store.installations().unwrap()[0].id)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(raw_migration_marker_count_or_zero(&store.connection), 1);
+    }
+
+    #[test]
+    fn m7_migration_failure_rolls_back_everything() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("m7-rollback.sqlite");
+        {
+            let connection = Connection::open(&database).unwrap();
+            create_pre_m7_schema(&connection);
+            let valid = legacy_discovery("Valid Tool", "scanner-a", "valid-a");
+            insert_legacy_import(&connection, &valid);
+
+            let malformed_id = Uuid::new_v4();
+            connection
+                .execute(
+                    "INSERT INTO discoveries
+                     (id, fingerprint, payload_json, review_state, observed_at, scan_id)
+                     VALUES (?1, ?2, ?3, 'imported', ?4, NULL)",
+                    rusqlite::params![
+                        malformed_id.to_string(),
+                        "malformed-b",
+                        "{not valid discovery json",
+                        Utc::now().to_rfc3339(),
+                    ],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO inventory (id, discovery_id, payload_json, imported_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        Uuid::new_v4().to_string(),
+                        malformed_id.to_string(),
+                        "{not valid discovery json",
+                        Utc::now().to_rfc3339(),
+                    ],
+                )
+                .unwrap();
+        }
+
+        let result = Store::open(&database);
+        assert!(result.is_err());
+        drop(result);
+
+        let raw = Connection::open(&database).unwrap();
+        assert_eq!(raw_migration_marker_count_or_zero(&raw), 0);
+        assert_eq!(raw_table_count_or_zero(&raw, "canonical_capabilities"), 0);
+        assert_eq!(raw_table_count_or_zero(&raw, "installation_instances"), 0);
+        assert_eq!(raw_table_count_or_zero(&raw, "health_check_definitions"), 0);
+        assert_eq!(raw_table_count_or_zero(&raw, "health_runs"), 0);
+        assert_eq!(raw_table_count_or_zero(&raw, "health_results"), 0);
+        assert_eq!(raw_table_count_or_zero(&raw, "dependency_relationships"), 0);
+    }
+
+    #[test]
+    fn m7_review_import_creates_capability_installation_and_typed_definitions() {
+        let mut store = Store::in_memory().unwrap();
+        let mut discovery = Discovery::unknown("Reviewed CLI", "scanner-a", "review-a".into());
+        discovery.canonical_identity = Some("windows-path:c:\\tools\\reviewed.exe".into());
+        discovery.health_hints.push(HealthCheckHint {
+            check_type: HealthCheckType::FileExists,
+            required: true,
+            expected_condition: HealthExpectedCondition::Exists,
+            timeout_ms: DEFAULT_HEALTH_TIMEOUT_MS,
+            stale_after_seconds: None,
+            target: HealthTarget::Path {
+                path: PathBuf::from(r"C:\Tools\reviewed.exe"),
+            },
+        });
+        let discovery_id = discovery.id;
+
+        store.enqueue(&discovery).unwrap();
+        store.review(discovery.id, ReviewDecision::Import).unwrap();
+
+        let capabilities = store.capabilities().unwrap();
+        let installations = store.installations().unwrap();
+        assert_eq!(capabilities.len(), 1);
+        assert_eq!(installations.len(), 1);
+        assert_eq!(installations[0].source_discovery_id, discovery_id);
+        assert_eq!(installations[0].aggregate_health, HealthState::Grey);
+        assert_eq!(installations[0].capability_id, capabilities[0].id);
+
+        let definitions = store.health_check_definitions(installations[0].id).unwrap();
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].check_type, HealthCheckType::FileExists);
+        assert!(definitions[0].required);
+        assert_eq!(
+            definitions[0].target_metadata,
+            HealthTarget::Path {
+                path: PathBuf::from(r"C:\Tools\reviewed.exe"),
+            }
+        );
+    }
+
+    #[test]
+    fn m7_review_import_reuses_only_exact_stable_identity() {
+        let mut store = Store::in_memory().unwrap();
+
+        let mut first = Discovery::unknown("Shared Tool", "scanner-a", "review-shared-a".into());
+        first.canonical_identity = Some("windows-path:c:\\tools\\shared.exe".into());
+        store.enqueue(&first).unwrap();
+        store.review(first.id, ReviewDecision::Import).unwrap();
+
+        let mut second =
+            Discovery::unknown("Shared Tool CLI", "scanner-b", "review-shared-b".into());
+        second.canonical_identity = Some("windows-path:c:\\tools\\shared.exe".into());
+        store.enqueue(&second).unwrap();
+        store.review(second.id, ReviewDecision::Import).unwrap();
+
+        let capabilities = store.capabilities().unwrap();
+        let installations = store.installations().unwrap();
+        assert_eq!(capabilities.len(), 1);
+        assert_eq!(installations.len(), 2);
+        assert!(
+            installations
+                .iter()
+                .all(|item| item.capability_id == capabilities[0].id)
+        );
+
+        let third = Discovery::unknown("Shared Tool", "scanner-c", "review-ambiguous-c".into());
+        store.enqueue(&third).unwrap();
+        store.review(third.id, ReviewDecision::Import).unwrap();
+
+        let capabilities = store.capabilities().unwrap();
+        let installations = store.installations().unwrap();
+        assert_eq!(capabilities.len(), 2);
+        assert_eq!(installations.len(), 3);
+        assert_eq!(
+            capabilities
+                .iter()
+                .filter(|item| item.stable_identity.as_deref()
+                    == Some("windows-path:c:\\tools\\shared.exe"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            capabilities
+                .iter()
+                .filter(|item| item.stable_identity.is_none())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn m7_review_import_without_health_hints_stays_grey_without_definitions() {
+        let mut store = Store::in_memory().unwrap();
+        let mut discovery =
+            Discovery::unknown("Evidence Only", "scanner-a", "review-evidence".into());
+        discovery.evidence.push(Evidence {
+            kind: "path".into(),
+            summary: r"C:\Tools\evidence-only.exe".into(),
+        });
+        let discovery_id = discovery.id;
+
+        store.enqueue(&discovery).unwrap();
+        store.review(discovery.id, ReviewDecision::Import).unwrap();
+
+        let installations = store.installations().unwrap();
+        let installation = installations
+            .iter()
+            .find(|item| item.source_discovery_id == discovery_id)
+            .unwrap();
+        assert_eq!(installation.aggregate_health, HealthState::Grey);
+        assert!(
+            store
+                .health_check_definitions(installation.id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn m7_review_ignore_and_unknown_do_not_create_inventory_entities() {
+        let mut store = Store::in_memory().unwrap();
+
+        let ignored = Discovery::unknown("Ignored Tool", "scanner-a", "review-ignore".into());
+        store.enqueue(&ignored).unwrap();
+        store.review(ignored.id, ReviewDecision::Ignore).unwrap();
+
+        let unknown = Discovery::unknown("Unknown Tool", "scanner-b", "review-unknown".into());
+        store.enqueue(&unknown).unwrap();
+        store
+            .review(unknown.id, ReviewDecision::KeepUnknown)
+            .unwrap();
+
+        assert!(store.capabilities().unwrap().is_empty());
+        assert!(store.installations().unwrap().is_empty());
+        assert!(store.inventory().unwrap().is_empty());
     }
 }
