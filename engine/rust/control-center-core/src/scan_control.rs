@@ -1,7 +1,8 @@
 use crate::Discovery;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tokio::sync::{Notify, mpsc};
@@ -183,13 +184,21 @@ pub enum ScanEvent {
     },
 }
 
-/// Bounded sink for scan events. `Progress` events are best-effort and may
-/// be dropped when the channel is full; every other event class is
-/// lossless (awaited `send`).
+/// Bounded sink for scan events. `Progress` events are best-effort: when the
+/// channel is full, the newest one for a given `scanner_id` replaces (not
+/// discards) whatever was already coalesced for that scanner in a small
+/// side slot, bounded by the number of distinct scanner ids (at most 8 for
+/// Quick, 1 for Deep) rather than by scan duration. Every other event class
+/// remains lossless (awaited `send`), and always flushes any coalesced
+/// progress first -- so the frontend eventually receives a current progress
+/// state even if the exact tick that would have carried it was dropped, and
+/// no progress is ever stranded behind a terminal event.
 #[derive(Clone)]
 pub struct ScanEventSink {
     tx: mpsc::Sender<ScanEvent>,
     failures: Arc<AtomicU64>,
+    /// Latest dropped `Progress` event per `scanner_id`, pending flush.
+    coalesced_progress: Arc<Mutex<HashMap<String, ScanEvent>>>,
 }
 
 impl ScanEventSink {
@@ -197,23 +206,57 @@ impl ScanEventSink {
         Self {
             tx,
             failures: Arc::new(AtomicU64::new(0)),
+            coalesced_progress: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Best-effort send for high-frequency progress events. Never blocks;
-    /// silently drops the event if the channel is full.
+    /// Best-effort send for high-frequency progress events. Never blocks.
+    /// When the channel is full, the event is not discarded: it replaces
+    /// any previously-coalesced-but-undelivered progress for the same
+    /// `scanner_id`, to be flushed by the next `critical`/`blocking_critical`
+    /// call (see their docs).
     pub fn progress(&self, event: ScanEvent) {
         debug_assert!(matches!(event, ScanEvent::Progress { .. }));
-        let _ = self.tx.try_send(event);
+        if let Err(error) = self.tx.try_send(event)
+            && let mpsc::error::TrySendError::Full(ScanEvent::Progress { scanner_id, .. }) = &error
+        {
+            let scanner_id = scanner_id.clone();
+            let dropped = error.into_inner();
+            self.coalesced_progress
+                .lock()
+                .unwrap()
+                .insert(scanner_id, dropped);
+        }
+        // A `Closed` error means the receiver is gone (scan bridge already
+        // torn down); there is nothing left to coalesce for.
+    }
+
+    /// Sends every coalesced-but-undelivered progress event before `event`
+    /// itself, so a current progress state is never stranded behind a
+    /// lossless event -- most importantly, never stranded behind terminal
+    /// settlement.
+    async fn flush_coalesced_progress_then(
+        &self,
+        event: ScanEvent,
+    ) -> Result<(), mpsc::error::SendError<ScanEvent>> {
+        let pending: Vec<ScanEvent> = {
+            let mut coalesced = self.coalesced_progress.lock().unwrap();
+            coalesced.drain().map(|(_, event)| event).collect()
+        };
+        for progress in pending {
+            self.tx.send(progress).await?;
+        }
+        self.tx.send(event).await
     }
 
     /// Lossless send for discoveries, lifecycle changes and terminal
-    /// events. Awaits channel capacity rather than dropping.
+    /// events. Awaits channel capacity rather than dropping. Flushes any
+    /// coalesced progress first (see `flush_coalesced_progress_then`).
     pub async fn critical(
         &self,
         event: ScanEvent,
     ) -> Result<(), mpsc::error::SendError<ScanEvent>> {
-        self.tx.send(event).await
+        self.flush_coalesced_progress_then(event).await
     }
 
     /// Lossless send for use from a blocking (non-async) context, such as
@@ -229,6 +272,13 @@ impl ScanEventSink {
         &self,
         event: ScanEvent,
     ) -> Result<(), Box<mpsc::error::SendError<ScanEvent>>> {
+        let pending: Vec<ScanEvent> = {
+            let mut coalesced = self.coalesced_progress.lock().unwrap();
+            coalesced.drain().map(|(_, event)| event).collect()
+        };
+        for progress in pending {
+            self.tx.blocking_send(progress).map_err(Box::new)?;
+        }
         self.tx.blocking_send(event).map_err(Box::new)
     }
 
@@ -386,7 +436,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn progress_is_dropped_when_full_but_critical_events_are_lossless() {
+    async fn progress_is_coalesced_not_discarded_when_full_and_critical_events_are_lossless() {
         let (tx, mut rx) = mpsc::channel(1);
         let sink = ScanEventSink::new(tx);
 
@@ -398,7 +448,8 @@ mod tests {
         });
 
         // Channel is now full (capacity 1); a second progress call must
-        // return immediately without blocking or panicking.
+        // return immediately without blocking or panicking -- and must not
+        // permanently discard this state, only coalesce it.
         sink.progress(ScanEvent::Progress {
             scanner_id: "test".into(),
             completed_units: 2,
@@ -424,8 +475,229 @@ mod tests {
                 .expect("critical send must succeed");
         });
 
+        // The coalesced progress (completed_units=2) is flushed first...
+        let coalesced = rx.recv().await.unwrap();
+        assert!(matches!(
+            coalesced,
+            ScanEvent::Progress {
+                completed_units: 2,
+                ..
+            }
+        ));
+
+        // ...then the critical event itself, still lossless.
         let received = rx.recv().await.unwrap();
         assert!(matches!(received, ScanEvent::Paused));
         sender.await.unwrap();
+    }
+
+    /// RED reproduction for the exact counterexample: channel full, the
+    /// final Progress is dropped by try_send, no further Progress event
+    /// ever occurs, and a terminal event follows. Without coalescing, the
+    /// frontend never receives the latest/current progress state at all --
+    /// only whatever was already buffered before the drop.
+    #[tokio::test]
+    async fn final_progress_is_not_permanently_lost_when_the_channel_was_full() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let sink = ScanEventSink::new(tx);
+
+        sink.progress(ScanEvent::Progress {
+            scanner_id: "test".into(),
+            completed_units: 1,
+            total_units: None,
+            current_location: None,
+        });
+
+        // Channel is full; this is the final Progress this scan will ever
+        // emit before terminating. try_send drops it.
+        sink.progress(ScanEvent::Progress {
+            scanner_id: "test".into(),
+            completed_units: 42,
+            total_units: None,
+            current_location: None,
+        });
+
+        // No further Progress event occurs. The scan settles.
+        let sink_clone = sink.clone();
+        let sender = tokio::spawn(async move {
+            sink_clone
+                .critical(ScanEvent::Completed {
+                    visited: 42,
+                    discovered: 0,
+                    failure_count: 0,
+                    duration_ms: 1,
+                })
+                .await
+                .expect("critical send must succeed");
+        });
+
+        // Drain everything the sink actually sent.
+        let mut received = Vec::new();
+        while let Some(event) = rx.recv().await {
+            let is_terminal = matches!(event, ScanEvent::Completed { .. });
+            received.push(event);
+            if is_terminal {
+                break;
+            }
+        }
+        sender.await.unwrap();
+
+        let saw_current_progress = received.iter().any(|event| {
+            matches!(
+                event,
+                ScanEvent::Progress {
+                    completed_units: 42,
+                    ..
+                }
+            )
+        });
+        assert!(
+            saw_current_progress,
+            "the frontend must eventually receive the current (completed_units=42) progress \
+             state before or with the terminal event, not just the stale buffered one; got: \
+             {received:?}"
+        );
+
+        let terminal_is_last = matches!(received.last(), Some(ScanEvent::Completed { .. }));
+        assert!(
+            terminal_is_last,
+            "the current progress must be flushed before terminal settlement, not after; got: \
+             {received:?}"
+        );
+    }
+
+    /// Bounded memory: repeatedly dropping progress for the same
+    /// `scanner_id` must replace, not accumulate -- only the single latest
+    /// value ever gets flushed, never a backlog of every dropped tick.
+    #[tokio::test]
+    async fn coalescing_replaces_stale_progress_for_a_scanner_rather_than_accumulating_it() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let sink = ScanEventSink::new(tx);
+
+        // Fill the channel once and never drain until the end, so every
+        // one of these is dropped by try_send and must go through the
+        // coalescing slot.
+        sink.progress(ScanEvent::Progress {
+            scanner_id: "test".into(),
+            completed_units: 0,
+            total_units: None,
+            current_location: None,
+        });
+        for completed_units in 1..1_000u64 {
+            sink.progress(ScanEvent::Progress {
+                scanner_id: "test".into(),
+                completed_units,
+                total_units: None,
+                current_location: None,
+            });
+        }
+
+        let sink_clone = sink.clone();
+        let sender = tokio::spawn(async move {
+            sink_clone
+                .critical(ScanEvent::Completed {
+                    visited: 999,
+                    discovered: 0,
+                    failure_count: 0,
+                    duration_ms: 1,
+                })
+                .await
+                .expect("critical send must succeed");
+        });
+
+        let mut received = Vec::new();
+        while let Some(event) = rx.recv().await {
+            let is_terminal = matches!(event, ScanEvent::Completed { .. });
+            received.push(event);
+            if is_terminal {
+                break;
+            }
+        }
+        sender.await.unwrap();
+
+        let progress_events: Vec<_> = received
+            .iter()
+            .filter(|event| matches!(event, ScanEvent::Progress { .. }))
+            .collect();
+        // Exactly two: the one that filled the channel's own buffer
+        // (completed_units=0, delivered before any drop occurred), plus the
+        // single coalesced slot for the 999 subsequent drops -- not 999
+        // separate accumulated events.
+        assert_eq!(
+            progress_events.len(),
+            2,
+            "999 dropped progress ticks for one scanner must coalesce down to exactly one \
+             flushed event (plus the one that was already buffered before any drop), not \
+             accumulate; got: {progress_events:?}"
+        );
+        assert!(
+            matches!(
+                progress_events[1],
+                ScanEvent::Progress {
+                    completed_units: 999,
+                    ..
+                }
+            ),
+            "the coalesced flushed event must be the latest value, not an earlier one; got: \
+             {progress_events:?}"
+        );
+    }
+
+    /// The coalescing slot is keyed per scanner_id, bounded by the number
+    /// of distinct scanners (at most 8 for Quick), not by how many progress
+    /// events were dropped -- each scanner's own latest state survives
+    /// independently.
+    #[tokio::test]
+    async fn coalescing_is_independent_per_scanner_id() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let sink = ScanEventSink::new(tx);
+
+        sink.progress(ScanEvent::Progress {
+            scanner_id: "filler".into(),
+            completed_units: 0,
+            total_units: None,
+            current_location: None,
+        });
+        sink.progress(ScanEvent::Progress {
+            scanner_id: "a".into(),
+            completed_units: 1,
+            total_units: None,
+            current_location: None,
+        });
+        sink.progress(ScanEvent::Progress {
+            scanner_id: "b".into(),
+            completed_units: 2,
+            total_units: None,
+            current_location: None,
+        });
+
+        let sink_clone = sink.clone();
+        let sender = tokio::spawn(async move {
+            sink_clone
+                .critical(ScanEvent::Paused)
+                .await
+                .expect("critical send must succeed");
+        });
+
+        let mut received = Vec::new();
+        loop {
+            let event = rx.recv().await.unwrap();
+            let is_terminal = matches!(event, ScanEvent::Paused);
+            received.push(event);
+            if is_terminal {
+                break;
+            }
+        }
+        sender.await.unwrap();
+
+        let scanner_ids: Vec<_> = received
+            .iter()
+            .filter_map(|event| match event {
+                ScanEvent::Progress { scanner_id, .. } => Some(scanner_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(scanner_ids.contains(&"a"), "got: {received:?}");
+        assert!(scanner_ids.contains(&"b"), "got: {received:?}");
     }
 }

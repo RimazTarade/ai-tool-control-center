@@ -348,6 +348,69 @@ describe("network consent retry", () => {
     expect(secondRequest).toEqual({ ...firstRequest, networkConsent: true });
   });
 
+  it("retries with networkConsent true for a followed reparse-root rejection too, not just an obviously-UNC path", async () => {
+    // The frontend never knows *why* the backend required consent (a
+    // direct network root vs. a followed reparse root resolving to
+    // network storage) -- it only reacts to the network_consent_required
+    // code. This uses an ordinary local-looking selected path to prove the
+    // confirmation/retry flow isn't accidentally keyed off the path's own
+    // string shape.
+    vi.mocked(pickScanRoots).mockResolvedValue(["C:\\Users\\me\\LinkedFolder"]);
+    vi.mocked(startScan)
+      .mockRejectedValueOnce({ code: "network_consent_required" })
+      .mockResolvedValueOnce({
+        handle: { scanId: "scan-1", scope: "deep", state: "running", revision: "scan-r1", startedAt: "2026-01-01T00:00:00Z" },
+        unlisten: vi.fn(),
+      });
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Run scan" }));
+    await user.click(screen.getByRole("radio", { name: "Deep" }));
+    await user.click(screen.getByRole("checkbox", { name: "Follow symbolic links and junctions" }));
+    await user.click(screen.getByRole("button", { name: "Select folders" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Run" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Run" }));
+
+    // start_scan rejected synchronously: no scan id/handle was ever
+    // produced, so no active-scan controls appear -- only the consent
+    // dialog, which the user can retry against.
+    expect(await screen.findByRole("alertdialog", { name: "Network location confirmation" })).toBeInTheDocument();
+    expect(screen.queryByLabelText(/scan progress/i)).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Allow" }));
+
+    await waitFor(() => expect(startScan).toHaveBeenCalledTimes(2));
+    const [secondRequest] = vi.mocked(startScan).mock.calls[1];
+    expect(secondRequest).toMatchObject({ networkConsent: true, followReparsePoints: true });
+    expect(await screen.findByLabelText(/scan progress/i)).toBeInTheDocument();
+  });
+
+  it("cancelling the network-consent confirmation leaves scan state unchanged (no retry, no active scan)", async () => {
+    vi.mocked(pickScanRoots).mockResolvedValue(["\\\\server\\share"]);
+    vi.mocked(startScan).mockRejectedValue({ code: "network_consent_required" });
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Run scan" }));
+    await user.click(screen.getByRole("radio", { name: "Deep" }));
+    await user.click(screen.getByRole("button", { name: "Select folders" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Run" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Run" }));
+
+    await screen.findByRole("alertdialog", { name: "Network location confirmation" });
+    expect(startScan).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+
+    // No retry was ever issued, and there is no active scan to show.
+    expect(startScan).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("alertdialog", { name: "Network location confirmation" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/scan progress/i)).not.toBeInTheDocument();
+  });
+
   it("resets networkConsent to false when the dialog is closed and reopened", async () => {
     vi.mocked(pickScanRoots).mockResolvedValue(["\\\\server\\share"]);
     vi.mocked(startScan).mockRejectedValue({ code: "network_consent_required" });

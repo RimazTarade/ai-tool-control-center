@@ -60,17 +60,34 @@ impl DeepScanError {
     }
 }
 
-/// Validates the roots a Deep Scan is about to run over. Never persists
-/// `network_consent`; it is checked fresh for this call only.
+/// Validates the roots a Deep Scan is about to run over: network location
+/// (direct UNC/mapped-drive roots) and, when reparse-point following is
+/// requested, whether a selected root is itself a reparse point that could
+/// resolve to network storage. Never persists `network_consent`; it is
+/// checked fresh for this call only.
 ///
-/// Exposed publicly so callers (the Tauri command layer) can run the same
-/// check synchronously, before a scan is admitted, rather than only inside
-/// the spawned `deep_scan` task.
-pub fn validate_deep_roots(roots: &[PathBuf], network_consent: bool) -> Result<(), DeepScanError> {
-    validate_roots(roots, network_consent)
+/// Exposed publicly, and deliberately synchronous and side-effect-free
+/// (never emits a `ScanEvent`), so the Tauri command layer can run the
+/// exact same check *before* a scan is admitted -- generating no scan id,
+/// persisting no `scan_runs` row, and rotating no workspace revision for a
+/// request that should be rejected outright with `network_consent_required`,
+/// giving the frontend's existing confirmation dialog something to retry
+/// against. `run_deep_scan` also re-runs this (and the equivalent per-entry
+/// check) once traversal starts, as defense in depth against a root's
+/// classification changing between admission and task start.
+pub fn validate_deep_roots(
+    roots: &[PathBuf],
+    follow_reparse_points: bool,
+    network_consent: bool,
+) -> Result<(), DeepScanError> {
+    validate_roots(roots, follow_reparse_points, network_consent)
 }
 
-fn validate_roots(roots: &[PathBuf], network_consent: bool) -> Result<(), DeepScanError> {
+fn validate_roots(
+    roots: &[PathBuf],
+    follow_reparse_points: bool,
+    network_consent: bool,
+) -> Result<(), DeepScanError> {
     if roots.is_empty() {
         return Err(DeepScanError::NoRootsSelected);
     }
@@ -93,6 +110,19 @@ fn validate_roots(roots: &[PathBuf], network_consent: bool) -> Result<(), DeepSc
                 );
                 return Err(DeepScanError::RootUnavailable);
             }
+        }
+
+        if follow_reparse_points
+            && !network_consent
+            && entry_policy(root).is_ok_and(|policy| policy.reparse_point)
+        {
+            // classify_root only inspects the root's own selected path
+            // syntax and cannot see that a local reparse point/junction
+            // resolves to network storage. Following one requires consent
+            // unconditionally, the same as a directly-selected network
+            // root, rather than trusting the root's syntactic
+            // classification.
+            return Err(DeepScanError::NetworkConsentRequired);
         }
     }
 
@@ -268,7 +298,11 @@ async fn run_deep_scan(
 ) {
     let start = Instant::now();
 
-    if let Err(error) = validate_roots(&context.roots, context.network_consent) {
+    if let Err(error) = validate_roots(
+        &context.roots,
+        context.follow_reparse_points,
+        context.network_consent,
+    ) {
         // `error.to_string()` is path-free by construction (see
         // `DeepScanError`'s Display impls): raw paths are logged locally at
         // the point they are observed, never carried into a wire event.
@@ -546,16 +580,60 @@ mod tests {
     fn network_root_without_consent_is_rejected() {
         let unc_root = PathBuf::from(r"\\server\share\folder");
         assert!(matches!(
-            validate_roots(std::slice::from_ref(&unc_root), false),
+            validate_roots(std::slice::from_ref(&unc_root), false, false),
             Err(DeepScanError::NetworkConsentRequired)
         ));
-        assert!(validate_roots(&[unc_root], true).is_ok());
+        assert!(validate_roots(&[unc_root], false, true).is_ok());
+    }
+
+    #[test]
+    fn validate_deep_roots_rejects_a_followed_reparse_root_without_consent_synchronously() {
+        // Regression for the command-layer timing gap: validate_deep_roots
+        // is the exact function start_scan calls synchronously, BEFORE a
+        // scan id is generated, a scan_runs row is persisted, or Started is
+        // emitted. A followed reparse root's target cannot be proven local
+        // from its own path, so it must be rejected HERE, not only later
+        // inside the spawned deep_scan task -- otherwise the frontend
+        // already has a successful ScanHandle by the time the rejection
+        // would arrive, and its network-consent retry dialog never opens.
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let junction = temp.path().join("junction-root");
+
+        // A real NTFS junction (no admin privilege required, unlike a
+        // symlink) so entry_policy genuinely reports reparse_point: true --
+        // not a placebo test against an ordinary directory.
+        let status = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                junction.to_str().unwrap(),
+                target.to_str().unwrap(),
+            ])
+            .status()
+            .expect("mklink must run on Windows CI");
+        assert!(status.success(), "failed to create test junction");
+
+        // Not following reparse points: unaffected by consent either way.
+        assert!(validate_deep_roots(std::slice::from_ref(&junction), false, false).is_ok());
+
+        // Following reparse points without consent: rejected synchronously,
+        // exactly what start_scan's preflight needs.
+        assert!(matches!(
+            validate_deep_roots(std::slice::from_ref(&junction), true, false),
+            Err(DeepScanError::NetworkConsentRequired)
+        ));
+
+        // Following reparse points WITH consent: accepted.
+        assert!(validate_deep_roots(std::slice::from_ref(&junction), true, true).is_ok());
     }
 
     #[test]
     fn empty_root_list_is_rejected() {
         assert!(matches!(
-            validate_roots(&[], false),
+            validate_roots(&[], false, false),
             Err(DeepScanError::NoRootsSelected)
         ));
     }
@@ -566,7 +644,7 @@ mod tests {
         // and deterministically triggers `DeepScanError::RootUnavailable`.
         let secret_root = PathBuf::from("relative/unclassifiable/root-marker-72f1");
 
-        let error = validate_roots(std::slice::from_ref(&secret_root), false).unwrap_err();
+        let error = validate_roots(std::slice::from_ref(&secret_root), false, false).unwrap_err();
         assert!(matches!(error, DeepScanError::RootUnavailable));
 
         // The Display impl (what ends up in ScanEvent::Failed.message and in

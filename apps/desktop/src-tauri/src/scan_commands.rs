@@ -816,7 +816,11 @@ pub(crate) async fn start_scan(
             //    persistence or spawning: an unconfirmed network root must
             //    be rejected as a command error, not admitted and failed
             //    later inside the spawned `deep_scan` task.
-            if let Err(error) = validate_deep_roots(&roots, request.network_consent) {
+            if let Err(error) = validate_deep_roots(
+                &roots,
+                request.follow_reparse_points,
+                request.network_consent,
+            ) {
                 return Err(match error {
                     DeepScanError::NoRootsSelected => CommandError::no_roots_selected(),
                     DeepScanError::NetworkConsentRequired => {
