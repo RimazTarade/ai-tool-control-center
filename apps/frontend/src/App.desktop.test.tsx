@@ -79,6 +79,36 @@ describe("run scan dialog", () => {
     await user.click(screen.getByRole("button", { name: "Close" }));
     expect(screen.queryByText("C:\\Data")).not.toBeInTheDocument();
   });
+
+  it("removes a selected root via its remove control without affecting the others", async () => {
+    vi.mocked(pickScanRoots).mockResolvedValue(["C:\\Data", "C:\\Tools"]);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Run scan" }));
+    await user.click(screen.getByRole("radio", { name: "Deep" }));
+    await user.click(screen.getByRole("button", { name: "Select folders" }));
+
+    expect(await screen.findByText("C:\\Data")).toBeInTheDocument();
+    expect(screen.getByText("C:\\Tools")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Remove C:\\Data" }));
+
+    expect(screen.queryByText("C:\\Data")).not.toBeInTheDocument();
+    expect(screen.getByText("C:\\Tools")).toBeInTheDocument();
+  });
+
+  it("shows a description for each mode and a cloud-placeholder note for Deep", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Run scan" }));
+    expect(screen.getByText(/built-in scanners/i)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("radio", { name: "Deep" }));
+    expect(screen.getByText(/reads only the folders you select/i)).toBeInTheDocument();
+    expect(screen.getByText(/cloud-only files.*skipped, not downloaded/i)).toBeInTheDocument();
+  });
 });
 
 describe("scan lifecycle controls", () => {
@@ -161,6 +191,38 @@ describe("scan lifecycle controls", () => {
 
     expect(await screen.findByRole("alert")).toHaveTextContent(/could not read a location/i);
     expect(screen.getByLabelText(/scan progress/i)).toBeInTheDocument();
+  });
+
+  it("streams a discovery into the Review Queue while the scan is still active, even while another scanner is slow/failing", async () => {
+    const user = userEvent.setup();
+    let emit: (event: unknown) => void = () => undefined;
+    await beginQuickScanFlow(user, (handler) => {
+      emit = handler as (event: unknown) => void;
+    });
+
+    // One scanner reports a discovery; another is still failing/slow. The
+    // discovery must be visible in the Review Queue right away -- not only
+    // after the scan reaches a terminal state.
+    emit({
+      kind: "discovery",
+      discovery: {
+        id: "d1",
+        suggested_name: "Streamed Tool",
+        suggested_type: "runtime",
+        source_scanner: "fast.scanner",
+        confidence: "high",
+        evidence: [],
+        observed_at: "x",
+        health_state: "unknown",
+      },
+    });
+    emit({ kind: "scanner_failed", scanner_id: "slow.scanner", code: "timeout", message: "Still waiting on a slow scanner" });
+
+    // The scan bar still shows Running -- the scan has not terminated.
+    expect(await screen.findByLabelText(/scan progress/i)).toHaveTextContent("Running");
+
+    await user.click(screen.getByRole("button", { name: "Review Queue" }));
+    expect(await screen.findByText("Streamed Tool")).toBeInTheDocument();
   });
 
   it("removes active controls on terminal but leaves a notice, and refreshes workspace revision", async () => {

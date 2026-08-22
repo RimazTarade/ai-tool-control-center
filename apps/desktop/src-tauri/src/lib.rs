@@ -22,6 +22,14 @@ struct BootstrapState {
 
 #[tauri::command]
 fn bootstrap_state(state: State<'_, AppState>) -> Result<BootstrapState, CommandError> {
+    // Read the workspace revision (its own short-lived lock, released
+    // before this call returns) before ever touching the Store lock.
+    // ScanRegistry::admit locks workspace_revision (and scans) and, while
+    // still holding them, invokes its `persist` closure, which locks
+    // Store -- so Store must never be held while acquiring a scan-registry
+    // lock here, or two concurrent commands can deadlock on the opposite
+    // lock orders.
+    let scan_revision = state.scans.workspace_revision();
     let store = state
         .store
         .lock()
@@ -34,7 +42,7 @@ fn bootstrap_state(state: State<'_, AppState>) -> Result<BootstrapState, Command
         inventory: store
             .inventory()
             .map_err(|error| CommandError::storage_integrity(error.to_string()))?,
-        scan_revision: state.scans.workspace_revision(),
+        scan_revision,
     })
 }
 

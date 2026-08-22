@@ -243,13 +243,23 @@ impl Store {
         Ok(())
     }
 
+    /// Upserts a scan-owned discovery. Returns `true` when the row is now
+    /// pending (either freshly inserted, or an existing `pending`/`ignored`
+    /// row was refreshed) -- the caller should treat this discovery as
+    /// newly visible. Returns `false` when a row already existed for this
+    /// fingerprint with a *different*, already-resolved review state
+    /// (`imported` or `unknown`): the `ON CONFLICT ... WHERE` guard skips
+    /// the update in that case, so nothing was actually persisted as
+    /// pending, and the caller must not tell anything downstream (a
+    /// `scan.discovery` event, the Review Queue) that this id is pending --
+    /// it would silently un-resolve a decision the user already made.
     pub fn enqueue_for_scan(
         &mut self,
         scan_id: Uuid,
         discovery: &Discovery,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         let payload = serde_json::to_string(discovery)?;
-        self.connection.execute(
+        let changed = self.connection.execute(
             "INSERT INTO discoveries (id, fingerprint, payload_json, review_state, observed_at, scan_id)
              VALUES (?1, ?2, ?3, 'pending', ?4, ?5)
              ON CONFLICT(fingerprint) DO UPDATE SET id=excluded.id,
@@ -266,7 +276,7 @@ impl Store {
                 scan_id.to_string()
             ],
         )?;
-        Ok(())
+        Ok(changed > 0)
     }
 }
 
@@ -460,12 +470,44 @@ mod tests {
 
         store.begin_scan(scan_id, ScanScope::Quick, now).unwrap();
         let discovery = sample_discovery();
-        store.enqueue_for_scan(scan_id, &discovery).unwrap();
+        assert!(store.enqueue_for_scan(scan_id, &discovery).unwrap());
 
         assert_eq!(
             store.discovery_scan_id_for_test(discovery.id).unwrap(),
             Some(scan_id)
         );
+    }
+
+    #[test]
+    fn enqueue_for_scan_does_not_revive_an_already_resolved_discovery() {
+        // A later scan rediscovering the same tool (same fingerprint) after
+        // the user already imported or kept-unknown it must not silently
+        // flip it back to pending -- that would un-resolve a decision the
+        // user already made, and the caller must be able to tell this
+        // happened so it never announces the id as newly pending.
+        let mut store = test_store();
+        let first_scan = Uuid::new_v4();
+        let second_scan = Uuid::new_v4();
+        let now = Utc::now();
+
+        store.begin_scan(first_scan, ScanScope::Quick, now).unwrap();
+        let discovery = sample_discovery();
+        assert!(store.enqueue_for_scan(first_scan, &discovery).unwrap());
+        store.review(discovery.id, ReviewDecision::Import).unwrap();
+
+        store
+            .begin_scan(second_scan, ScanScope::Quick, now)
+            .unwrap();
+        assert!(!store.enqueue_for_scan(second_scan, &discovery).unwrap());
+
+        // The row must still show the original scan and its resolved
+        // review state, not the second scan or 'pending'.
+        assert_eq!(
+            store.discovery_scan_id_for_test(discovery.id).unwrap(),
+            Some(first_scan)
+        );
+        let pending_ids: Vec<_> = store.pending().unwrap().into_iter().map(|d| d.id).collect();
+        assert!(!pending_ids.contains(&discovery.id));
     }
 
     #[test]

@@ -37,8 +37,11 @@ header { display: flex; justify-content: space-between; align-items: center; mar
 .deep-options > button { align-self: start; border: 1px solid #2c403b; background: #17231f; color: #dbe6e1; border-radius: 8px; padding: 8px 12px; font-size: 12px; cursor: pointer; }
 .roots-list { max-height: 120px; overflow-y: auto; border: 1px solid #1d2d2a; border-radius: 8px; padding: 8px 10px; background: #0a1413; }
 .roots-list ul { margin: 0; padding-left: 16px; display: grid; gap: 4px; }
-.roots-list li { font-size: 11px; color: #b6c6c0; word-break: break-all; }
+.roots-list li { font-size: 11px; color: #b6c6c0; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.roots-list li span { word-break: break-all; }
+.roots-list li button { flex-shrink: 0; }
 .empty-roots { margin: 0; color: #647a73; font-size: 11px; }
+.mode-description, .placeholder-note { margin: 0; color: #8ba39c; font-size: 11px; }
 .checkbox-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
 .network-confirm { border: 1px solid #7a482e; background: #241a12; border-radius: 8px; padding: 10px 12px; display: grid; gap: 8px; }
 .network-confirm p { margin: 0; color: #ffd8bc; font-size: 12px; line-height: 1.5; }

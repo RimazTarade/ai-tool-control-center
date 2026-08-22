@@ -69,19 +69,72 @@ impl PauseGate {
     /// Blocks while the gate is paused. Returns `true` if the caller may
     /// proceed, `false` if `cancellation` fired first.
     pub async fn checkpoint(&self, cancellation: &CancellationToken) -> bool {
+        self.checkpoint_inner(cancellation, || std::future::ready(()))
+            .await
+    }
+
+    /// Core `checkpoint` logic, parameterized over a hook invoked exactly
+    /// once per loop iteration, immediately after the `Notified` future is
+    /// registered and immediately before `is_paused()` is read. Production
+    /// code always calls this via `checkpoint()` with a no-op hook that
+    /// resolves without yielding; the test module below uses an async hook
+    /// to deterministically drive a concurrent `resume()` into that exact
+    /// window, reproducing the tightest possible interleaving between the
+    /// two calls without relying on real scheduling luck or sleeps.
+    ///
+    /// `notified()` MUST be called before `is_paused()` is read (not after,
+    /// as an earlier version of this method did). `Notify::notify_waiters`
+    /// only wakes tasks that registered by calling `.notified()` before
+    /// `notify_waiters()` runs -- unlike `notify_one`, it stores no permit
+    /// for a call that arrives late. Checking `is_paused()` first and
+    /// registering `.notified()` second leaves a window: if `resume()` (and
+    /// its `notify_waiters()`) lands in that window, the registration that
+    /// follows misses it entirely, and `checkpoint` blocks on
+    /// `notified().await` waiting for a call that already happened and may
+    /// never happen again. Registering first closes the window: any
+    /// `resume()` from the moment of registration onward is guaranteed to
+    /// wake this waiter, and if `resume()` already happened before
+    /// registration, `is_paused()` (read immediately after) already
+    /// observes `false` and returns without waiting at all.
+    async fn checkpoint_inner<F>(
+        &self,
+        cancellation: &CancellationToken,
+        mut at_registration: impl FnMut() -> F,
+    ) -> bool
+    where
+        F: std::future::Future<Output = ()>,
+    {
         loop {
             if cancellation.is_cancelled() {
                 return false;
             }
+
+            let notified = self.inner.resumed.notified();
+            at_registration().await;
+
             if !self.is_paused() {
                 return true;
             }
 
             tokio::select! {
                 _ = cancellation.cancelled() => return false,
-                _ = self.inner.resumed.notified() => {}
+                _ = notified => {}
             }
         }
+    }
+
+    /// Test-only entry point exposing the registration-window hook. See
+    /// `checkpoint_inner`'s docs.
+    #[cfg(test)]
+    pub(crate) async fn checkpoint_with_hook<F>(
+        &self,
+        cancellation: &CancellationToken,
+        hook: impl FnMut() -> F,
+    ) -> bool
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        self.checkpoint_inner(cancellation, hook).await
     }
 }
 
@@ -222,6 +275,59 @@ mod tests {
 
         assert!(gate.resume());
         assert!(waiter.await.unwrap());
+    }
+
+    /// Deterministically reproduces the tightest possible interleaving for
+    /// the PauseGate lost-wakeup race: a `resume()` (and its
+    /// `notify_waiters()`) completing exactly between `checkpoint`'s
+    /// `Notified` registration and its `is_paused()` read. Synchronized via
+    /// oneshot channels, not sleeps -- the resumer task cannot proceed until
+    /// the checkpoint task has registered, and the checkpoint task cannot
+    /// proceed past the hook until the resumer has finished calling
+    /// `resume()`, so this ordering is guaranteed on every run.
+    #[tokio::test]
+    async fn checkpoint_does_not_miss_a_resume_landing_between_registration_and_the_pause_check() {
+        let gate = PauseGate::default();
+        let cancellation = CancellationToken::new();
+        assert!(gate.pause());
+
+        let (registered_tx, registered_rx) = tokio::sync::oneshot::channel::<()>();
+        let (resumed_tx, resumed_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let resumer_gate = gate.clone();
+        let resumer = tokio::spawn(async move {
+            registered_rx.await.unwrap();
+            assert!(resumer_gate.resume());
+            let _ = resumed_tx.send(());
+        });
+
+        let mut registered_tx = Some(registered_tx);
+        let mut resumed_rx = Some(resumed_rx);
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            gate.checkpoint_with_hook(&cancellation, move || {
+                let registered_tx = registered_tx.take();
+                let resumed_rx = resumed_rx.take();
+                async move {
+                    if let (Some(registered_tx), Some(resumed_rx)) = (registered_tx, resumed_rx) {
+                        let _ = registered_tx.send(());
+                        resumed_rx.await.unwrap();
+                    }
+                }
+            }),
+        )
+        .await;
+
+        resumer.await.unwrap();
+
+        assert_eq!(
+            outcome,
+            Ok(true),
+            "checkpoint must observe a resume that completed between Notified registration \
+             and the is_paused() check, not hang waiting for a notify_waiters() call that \
+             already fired"
+        );
     }
 
     #[tokio::test]

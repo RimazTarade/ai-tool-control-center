@@ -106,6 +106,10 @@ export default function App() {
     setScanDraft((current) => ({ ...current, roots }));
   }
 
+  function removeRoot(root: string) {
+    setScanDraft((current) => ({ ...current, roots: current.roots.filter((selected) => selected !== root) }));
+  }
+
   function buildRequest(networkConsent: boolean): ScanRequest {
     return {
       mode: scanDraft.mode,
@@ -122,6 +126,18 @@ export default function App() {
       return;
     }
     switch (event.kind) {
+      case "discovery":
+        // Streamed while the scan is still active, not only after terminal
+        // bootstrap: the Review Queue must show it immediately. Backend
+        // only emits this for a discovery it actually persisted as
+        // pending (see Store::enqueue_for_scan), so it is always safe to
+        // add here -- deduped by id defensively in case of a repeat.
+        setState((current) =>
+          current.pending.some((item) => item.id === event.discovery.id)
+            ? current
+            : { ...current, pending: [event.discovery, ...current.pending] },
+        );
+        break;
       case "progress":
         setActiveScan((current) =>
           current
@@ -394,14 +410,26 @@ export default function App() {
                   Deep
                 </label>
               </fieldset>
-              {scanDraft.mode === "deep" && (
+              {scanDraft.mode === "quick" ? (
+                <p className="mode-description">Checks common install locations with the built-in scanners. Fast, no folder selection needed.</p>
+              ) : (
                 <div className="deep-options">
+                  <p className="mode-description">Reads only the folders you select below, as deep as they go.</p>
                   <button type="button" onClick={() => void selectFolders()}>Select folders</button>
                   <div className="roots-list">
                     {scanDraft.roots.length === 0 ? (
                       <p className="empty-roots">No folders selected.</p>
                     ) : (
-                      <ul>{scanDraft.roots.map((root) => <li key={root}>{root}</li>)}</ul>
+                      <ul>
+                        {scanDraft.roots.map((root) => (
+                          <li key={root}>
+                            <span>{root}</span>
+                            <button type="button" className="quiet" aria-label={`Remove ${root}`} onClick={() => removeRoot(root)}>
+                              Remove
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
                     )}
                   </div>
                   <label className="checkbox-row">
@@ -412,6 +440,7 @@ export default function App() {
                     />
                     Follow symbolic links and junctions
                   </label>
+                  <p className="placeholder-note">Cloud-only files that are not downloaded to this device are skipped, not downloaded.</p>
                 </div>
               )}
               {networkConfirmPending && (

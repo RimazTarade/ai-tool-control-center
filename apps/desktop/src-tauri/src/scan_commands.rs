@@ -312,6 +312,17 @@ impl ScanRegistry {
             return Err(CommandError::conflict());
         }
 
+        // Cancellation takes precedence and is terminal: once a scan is
+        // Cancelled, it must never transition back to Paused or Running,
+        // even if the caller presents the current (post-cancel) revision.
+        // Repeat-cancel remains the one idempotent no-op, handled by the
+        // `active.state == target` branch immediately below (it is not
+        // affected by this guard, since target == Cancelled there).
+        if active.state == ScanLifecycleState::Cancelled && target != ScanLifecycleState::Cancelled
+        {
+            return Err(CommandError::scan_not_found());
+        }
+
         if active.state == target {
             return Ok(TransitionOutcome {
                 state: ScanState {
@@ -451,11 +462,16 @@ fn emit(app: &tauri::AppHandle, event: &ScanEvent) {
     let _ = app.emit("scan:event", event);
 }
 
+/// Returns `Ok(true)` when the discovery is now genuinely pending and
+/// should be announced, `Ok(false)` when a row already existed with a
+/// different, already-resolved review state (see
+/// `Store::enqueue_for_scan`'s docs) -- nothing new was persisted, so the
+/// caller must not emit a discovery event for it.
 fn persist_discovery(
     app: &tauri::AppHandle,
     scan_id: Uuid,
     discovery: &Discovery,
-) -> Result<(), CommandError> {
+) -> Result<bool, CommandError> {
     let state = app
         .try_state::<AppState>()
         .ok_or_else(|| CommandError::storage_integrity("Local storage is unavailable"))?;
@@ -552,7 +568,12 @@ fn duration_ms_of(event: &ScanEvent) -> u64 {
 /// `TauriPorts` is the production implementation; tests use a
 /// call-order-recording fake.
 trait EventBridgePorts: Send + 'static {
-    fn persist_discovery(&self, scan_id: Uuid, discovery: &Discovery) -> Result<(), CommandError>;
+    /// `Ok(true)` when the discovery is genuinely pending and should be
+    /// announced; `Ok(false)` when nothing new was persisted (the
+    /// discovery's id was already resolved with a different review
+    /// decision) and no event should be emitted for it.
+    fn persist_discovery(&self, scan_id: Uuid, discovery: &Discovery)
+    -> Result<bool, CommandError>;
     fn persist_scan_error(
         &self,
         scan_id: Uuid,
@@ -573,7 +594,11 @@ trait EventBridgePorts: Send + 'static {
 struct TauriPorts(tauri::AppHandle);
 
 impl EventBridgePorts for TauriPorts {
-    fn persist_discovery(&self, scan_id: Uuid, discovery: &Discovery) -> Result<(), CommandError> {
+    fn persist_discovery(
+        &self,
+        scan_id: Uuid,
+        discovery: &Discovery,
+    ) -> Result<bool, CommandError> {
         persist_discovery(&self.0, scan_id, discovery)
     }
 
@@ -621,8 +646,18 @@ async fn run_event_bridge<P: EventBridgePorts>(
 
     while let Some(event) = receiver.recv().await {
         match &event {
-            ScanEvent::Discovery { discovery } => {
-                if ports.persist_discovery(scan_id, discovery).is_err() {
+            ScanEvent::Discovery { discovery } => match ports.persist_discovery(scan_id, discovery)
+            {
+                Ok(true) => ports.emit(&event),
+                Ok(false) => {
+                    // Nothing new was persisted: this id was already
+                    // resolved (imported / kept-unknown) by an earlier
+                    // review decision. Announcing it now would show the
+                    // Review Queue an item the user already resolved, so
+                    // it is silently skipped -- not an error, not counted
+                    // toward failures.
+                }
+                Err(_) => {
                     // The discovery is not announced: there is no durable
                     // record to back it. Record the integrity failure
                     // instead and count it toward the run's failures.
@@ -639,10 +674,8 @@ async fn run_event_bridge<P: EventBridgePorts>(
                         code: "storage_integrity".into(),
                         message: STORAGE_INTEGRITY_MESSAGE.into(),
                     });
-                    continue;
                 }
-                ports.emit(&event);
-            }
+            },
             ScanEvent::ScannerFailed {
                 scanner_id,
                 code,
@@ -688,7 +721,10 @@ async fn run_event_bridge<P: EventBridgePorts>(
                         ports.emit(&event);
                     }
 
-                    ports.remove_scan(scan_id);
+                    // `remove_scan` runs exactly once, after this loop, on
+                    // every exit path (both a normal terminal event here and
+                    // the runner-stopped fallback below) -- do not also call
+                    // it here.
                     break;
                 }
                 ports.emit(&event);
@@ -917,7 +953,63 @@ pub(crate) fn cancel_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use control_center_core::{ScanLifecycleState, ScanScope};
+    use control_center_core::{ScanLifecycleState, ScanScope, Store};
+
+    /// Regression for a lock-order inversion: `bootstrap_state` used to
+    /// lock Store then read the workspace revision (which locks
+    /// `ScanRegistry::workspace_revision`); `ScanRegistry::admit` locks
+    /// workspace_revision (and scans), then -- still holding them -- its
+    /// `persist` closure locks Store. Two concurrent Tauri commands running
+    /// those opposite orders can deadlock. Exercises both orders under real
+    /// concurrent contention on real OS threads and fails (via timeout)
+    /// rather than hanging forever if the inversion reappears.
+    #[test]
+    fn store_and_scan_registry_locks_never_deadlock_under_concurrent_access() {
+        let state = std::sync::Arc::new(AppState::new(Store::in_memory().unwrap()));
+        let iterations = 200;
+
+        let bootstrap_state = state.clone();
+        let bootstrap_thread = std::thread::spawn(move || {
+            for _ in 0..iterations {
+                // Mirrors bootstrap_state's fixed order: workspace revision
+                // first, Store second.
+                let _revision = bootstrap_state.scans.workspace_revision();
+                let _store = bootstrap_state.store.lock().unwrap();
+            }
+        });
+
+        let admit_state = state.clone();
+        let admit_thread = std::thread::spawn(move || {
+            for _ in 0..iterations {
+                let workspace = admit_state.scans.workspace_revision();
+                let admitted = admit_state
+                    .scans
+                    .admit(&workspace, ScanScope::Quick, |scan_id, started_at| {
+                        admit_state.with_store(|store| {
+                            store.begin_scan(scan_id, ScanScope::Quick, started_at)
+                        })
+                    })
+                    .unwrap();
+                admit_state
+                    .scans
+                    .remove(Uuid::parse_str(&admitted.handle.scan_id).unwrap());
+            }
+        });
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            bootstrap_thread.join().unwrap();
+            admit_thread.join().unwrap();
+            let _ = done_tx.send(());
+        });
+
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect(
+                "bootstrap_state's lock order and ScanRegistry::admit's lock order deadlocked \
+                 under concurrent access",
+            );
+    }
 
     #[test]
     fn start_with_stale_workspace_revision_conflicts() {
@@ -1027,6 +1119,58 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_scan_cannot_transition_back_to_paused_or_running() {
+        let registry = ScanRegistry::new();
+        let workspace = registry.workspace_revision();
+        let admitted = registry
+            .start_with_revision(&workspace, ScanScope::Quick)
+            .unwrap();
+
+        let cancelled = registry
+            .cancel(admitted.handle.scan_id.clone(), &admitted.handle.revision)
+            .unwrap();
+        assert_eq!(cancelled.state.state, ScanLifecycleState::Cancelled);
+
+        // Presenting the current (post-cancel) revision must not revive a
+        // cancelled scan into Paused.
+        let pause_attempt = registry
+            .pause(admitted.handle.scan_id.clone(), &cancelled.state.revision)
+            .unwrap_err();
+        assert_eq!(pause_attempt.code, "scan_not_found");
+        assert_eq!(
+            registry.state_of(&admitted.handle.scan_id).unwrap().state,
+            ScanLifecycleState::Cancelled,
+            "a rejected pause attempt must not mutate the cancelled scan's state"
+        );
+        assert_eq!(
+            registry
+                .state_of(&admitted.handle.scan_id)
+                .unwrap()
+                .revision,
+            cancelled.state.revision,
+            "a rejected pause attempt must not rotate the revision"
+        );
+
+        // Same for resume.
+        let resume_attempt = registry
+            .resume(admitted.handle.scan_id.clone(), &cancelled.state.revision)
+            .unwrap_err();
+        assert_eq!(resume_attempt.code, "scan_not_found");
+        assert_eq!(
+            registry.state_of(&admitted.handle.scan_id).unwrap().state,
+            ScanLifecycleState::Cancelled
+        );
+
+        // Cancellation itself must remain the one idempotent transition
+        // out of Cancelled: repeat-cancel is still a safe no-op.
+        let repeat_cancel = registry
+            .cancel(admitted.handle.scan_id.clone(), &cancelled.state.revision)
+            .unwrap();
+        assert!(!repeat_cancel.changed);
+        assert_eq!(repeat_cancel.state.state, ScanLifecycleState::Cancelled);
+    }
+
+    #[test]
     fn a_second_start_while_one_is_active_is_rejected() {
         let registry = ScanRegistry::new();
         let workspace = registry.workspace_revision();
@@ -1092,6 +1236,16 @@ mod tests {
     /// store or window, so the exact call sequence can be asserted.
     struct RecordingPorts {
         log: std::sync::Arc<Mutex<Vec<&'static str>>>,
+        remove_scan_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl RecordingPorts {
+        fn new(log: std::sync::Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                log,
+                remove_scan_calls: Default::default(),
+            }
+        }
     }
 
     impl EventBridgePorts for RecordingPorts {
@@ -1099,9 +1253,104 @@ mod tests {
             &self,
             _scan_id: Uuid,
             _discovery: &Discovery,
-        ) -> Result<(), CommandError> {
+        ) -> Result<bool, CommandError> {
             self.log.lock().unwrap().push("persist_discovery");
+            Ok(true)
+        }
+
+        fn persist_scan_error(
+            &self,
+            _scan_id: Uuid,
+            _scanner_id: &str,
+            _code: &str,
+            _message: &str,
+        ) -> Result<(), CommandError> {
+            self.log.lock().unwrap().push("persist_scan_error");
             Ok(())
+        }
+
+        fn persist_terminal(
+            &self,
+            _scan_id: Uuid,
+            _state: ScanLifecycleState,
+            _failure_count: u64,
+        ) -> Result<(), CommandError> {
+            self.log.lock().unwrap().push("persist_terminal");
+            Ok(())
+        }
+
+        fn emit(&self, event: &ScanEvent) {
+            let label = match event {
+                ScanEvent::Discovery { .. } => "emit_discovery",
+                ScanEvent::ScannerFailed { .. } => "emit_scanner_failed",
+                ScanEvent::Cancelled { .. }
+                | ScanEvent::Completed { .. }
+                | ScanEvent::Failed { .. } => "emit_terminal",
+                _ => "emit_other",
+            };
+            self.log.lock().unwrap().push(label);
+        }
+
+        fn remove_scan(&self, _scan_id: Uuid) {
+            self.remove_scan_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn sample_discovery() -> Discovery {
+        Discovery::unknown("sample", "filesystem.deep", "fingerprint-1".into())
+    }
+
+    fn sample_completed() -> ScanEvent {
+        ScanEvent::Completed {
+            visited: 1,
+            discovered: 1,
+            failure_count: 0,
+            duration_ms: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn persistence_before_notification_discovery() {
+        let log: std::sync::Arc<Mutex<Vec<&'static str>>> = Default::default();
+        let ports = RecordingPorts::new(log.clone());
+        let (sender, receiver) = mpsc::channel(8);
+        let scan_id = Uuid::new_v4();
+
+        let bridge = tokio::spawn(run_event_bridge(ports, scan_id, receiver));
+
+        sender
+            .send(ScanEvent::Discovery {
+                discovery: sample_discovery(),
+            })
+            .await
+            .unwrap();
+        // A terminal event ends the bridge loop so the test can join it.
+        sender.send(sample_completed()).await.unwrap();
+        drop(sender);
+        bridge.await.unwrap();
+
+        let log = log.lock().unwrap();
+        assert_eq!(&log[0..2], &["persist_discovery", "emit_discovery"]);
+        assert_eq!(&log[2..4], &["persist_terminal", "emit_terminal"]);
+    }
+
+    /// A discovery whose id was already resolved (imported / kept-unknown)
+    /// by an earlier review decision, rediscovered by this scan: the
+    /// bridge must not emit it (would show the Review Queue an item the
+    /// user already resolved) and must not count it as a failure either.
+    struct AlreadyResolvedDiscoveryPorts {
+        log: std::sync::Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl EventBridgePorts for AlreadyResolvedDiscoveryPorts {
+        fn persist_discovery(
+            &self,
+            _scan_id: Uuid,
+            _discovery: &Discovery,
+        ) -> Result<bool, CommandError> {
+            self.log.lock().unwrap().push("persist_discovery");
+            Ok(false)
         }
 
         fn persist_scan_error(
@@ -1140,23 +1389,10 @@ mod tests {
         fn remove_scan(&self, _scan_id: Uuid) {}
     }
 
-    fn sample_discovery() -> Discovery {
-        Discovery::unknown("sample", "filesystem.deep", "fingerprint-1".into())
-    }
-
-    fn sample_completed() -> ScanEvent {
-        ScanEvent::Completed {
-            visited: 1,
-            discovered: 1,
-            failure_count: 0,
-            duration_ms: 1,
-        }
-    }
-
     #[tokio::test]
-    async fn persistence_before_notification_discovery() {
+    async fn already_resolved_discovery_is_persisted_but_never_emitted_or_counted_as_a_failure() {
         let log: std::sync::Arc<Mutex<Vec<&'static str>>> = Default::default();
-        let ports = RecordingPorts { log: log.clone() };
+        let ports = AlreadyResolvedDiscoveryPorts { log: log.clone() };
         let (sender, receiver) = mpsc::channel(8);
         let scan_id = Uuid::new_v4();
 
@@ -1168,20 +1404,31 @@ mod tests {
             })
             .await
             .unwrap();
-        // A terminal event ends the bridge loop so the test can join it.
-        sender.send(sample_completed()).await.unwrap();
+        sender
+            .send(ScanEvent::Completed {
+                visited: 1,
+                discovered: 0,
+                failure_count: 0,
+                duration_ms: 1,
+            })
+            .await
+            .unwrap();
         drop(sender);
         bridge.await.unwrap();
 
         let log = log.lock().unwrap();
-        assert_eq!(&log[0..2], &["persist_discovery", "emit_discovery"]);
-        assert_eq!(&log[2..4], &["persist_terminal", "emit_terminal"]);
+        assert_eq!(
+            &log[..],
+            &["persist_discovery", "persist_terminal", "emit_terminal"],
+            "an already-resolved discovery must be checked (persist_discovery is called) but \
+             never emitted, and the terminal event's failure_count must not be inflated by it"
+        );
     }
 
     #[tokio::test]
     async fn persistence_before_notification_scanner_failed() {
         let log: std::sync::Arc<Mutex<Vec<&'static str>>> = Default::default();
-        let ports = RecordingPorts { log: log.clone() };
+        let ports = RecordingPorts::new(log.clone());
         let (sender, receiver) = mpsc::channel(8);
         let scan_id = Uuid::new_v4();
 
@@ -1207,7 +1454,8 @@ mod tests {
     #[tokio::test]
     async fn persistence_before_notification_terminal() {
         let log: std::sync::Arc<Mutex<Vec<&'static str>>> = Default::default();
-        let ports = RecordingPorts { log: log.clone() };
+        let ports = RecordingPorts::new(log.clone());
+        let remove_scan_calls = ports.remove_scan_calls.clone();
         let (sender, receiver) = mpsc::channel(8);
         let scan_id = Uuid::new_v4();
 
@@ -1219,12 +1467,18 @@ mod tests {
 
         let log = log.lock().unwrap();
         assert_eq!(&log[..], &["persist_terminal", "emit_terminal"]);
+        assert_eq!(
+            remove_scan_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "remove_scan must be called exactly once on the normal terminal path"
+        );
     }
 
     #[tokio::test]
     async fn runner_exiting_without_a_terminal_event_still_persists_and_emits_one() {
         let log: std::sync::Arc<Mutex<Vec<&'static str>>> = Default::default();
-        let ports = RecordingPorts { log: log.clone() };
+        let ports = RecordingPorts::new(log.clone());
+        let remove_scan_calls = ports.remove_scan_calls.clone();
         let (sender, receiver) = mpsc::channel(8);
         let scan_id = Uuid::new_v4();
 
@@ -1240,6 +1494,11 @@ mod tests {
             &log[..],
             &["persist_terminal", "emit_terminal"],
             "a runner that exits without a terminal event must still leave the scan in a durable, announced terminal state"
+        );
+        assert_eq!(
+            remove_scan_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "remove_scan must be called exactly once on the runner-stopped path"
         );
     }
 }

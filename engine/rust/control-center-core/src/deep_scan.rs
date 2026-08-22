@@ -294,17 +294,6 @@ async fn run_deep_scan(
         return;
     }
 
-    let mut queue: VecDeque<DirectoryWork> = context
-        .roots
-        .iter()
-        .enumerate()
-        .map(|(root_index, root)| DirectoryWork {
-            path: root.clone(),
-            root_index,
-            depth: 0,
-        })
-        .collect();
-
     let mut join_set: JoinSet<DirTaskResult> = JoinSet::new();
     let mut identities_seen: HashSet<DirectoryIdentity> = HashSet::new();
     let mut reported_error_codes: HashSet<&'static str> = HashSet::new();
@@ -313,6 +302,73 @@ async fn run_deep_scan(
     let mut discovered: u64 = 0;
     let mut stop_launching = false;
     let mut coordinator_failed = false;
+
+    // Explicitly selected roots get the same safety policy as every entry
+    // discovered during traversal -- validate_roots above only classifies
+    // the root's own selected path (UNC prefix / drive type) and cannot see
+    // that the root itself is a placeholder, or a reparse point/junction
+    // whose target differs from what its own path implies.
+    let mut seed_roots = Vec::with_capacity(context.roots.len());
+    for (root_index, root) in context.roots.iter().enumerate() {
+        match io.entry_policy(root) {
+            Ok(policy) => {
+                if policy.placeholder {
+                    // Same as any placeholder entry: never traversed, never
+                    // hydrated.
+                    continue;
+                }
+                if policy.reparse_point {
+                    if !context.follow_reparse_points {
+                        // Default refusal applies to roots exactly as it
+                        // does to any discovered entry.
+                        continue;
+                    }
+                    if !context.network_consent {
+                        // A local reparse point's target cannot be
+                        // classified as local-vs-network from the selected
+                        // path's own syntax (classify_root only inspects
+                        // that path, not what it resolves to). Require
+                        // consent for any followed root reparse point,
+                        // exactly as for a directly-selected network root,
+                        // rather than trusting the root's syntactic
+                        // classification -- closes the bypass where a local
+                        // junction/symlink resolves to network storage.
+                        let _ = events
+                            .critical(ScanEvent::Failed {
+                                code: DeepScanError::NetworkConsentRequired.code().into(),
+                                message: DeepScanError::NetworkConsentRequired.to_string(),
+                                failure_count: events.failure_count(),
+                                duration_ms: start.elapsed().as_millis() as u64,
+                            })
+                            .await;
+                        return;
+                    }
+                }
+            }
+            Err(_) => {
+                if metadata_error_codes.insert("entry_metadata_unavailable") {
+                    let _ = events
+                        .scanner_failed(
+                            SCANNER_ID,
+                            "entry_metadata_unavailable",
+                            "A selected root's metadata could not be read",
+                        )
+                        .await;
+                }
+                continue;
+            }
+        }
+        seed_roots.push((root_index, root.clone()));
+    }
+
+    let mut queue: VecDeque<DirectoryWork> = seed_roots
+        .into_iter()
+        .map(|(root_index, root)| DirectoryWork {
+            path: root,
+            root_index,
+            depth: 0,
+        })
+        .collect();
 
     loop {
         if !stop_launching {
@@ -894,6 +950,133 @@ mod tests {
         drop(drain);
 
         assert!(!fake.was_read(&root.join("linked")));
+    }
+
+    #[tokio::test]
+    async fn reparse_root_is_not_traversed_when_following_is_disabled() {
+        // The selected root itself (not a child entry) is a reparse point.
+        // Regression for: run_deep_scan previously queued roots directly,
+        // never calling entry_policy on them, so a reparse-point root
+        // bypassed the default reparse refusal entirely.
+        let root = PathBuf::from(r"C:\FakeRoot");
+        let parent = PathBuf::from(r"C:\");
+        let mut root_entry = dir("FakeRoot");
+        root_entry.reparse = true;
+        let mut tree = HashMap::new();
+        tree.insert(parent, vec![root_entry]);
+        tree.insert(root.clone(), vec![file("mcp-config.json")]);
+
+        let fake = Arc::new(FakeDeepScanIo::new(tree));
+        let context = DeepScanContext {
+            roots: vec![root.clone()],
+            follow_reparse_points: false,
+            network_consent: false,
+        };
+        let (tx, rx) = mpsc::channel(64);
+        let events = ScanEventSink::new(tx);
+        let drain = drain_events(rx);
+
+        run_deep_scan(
+            context,
+            events,
+            CancellationToken::new(),
+            PauseGate::default(),
+            fake.clone(),
+        )
+        .await;
+        drop(drain);
+
+        assert!(
+            !fake.was_read(&root),
+            "a reparse-point root must not be traversed when follow_reparse_points is false"
+        );
+    }
+
+    #[tokio::test]
+    async fn placeholder_root_is_not_traversed() {
+        // The selected root itself is a cloud-only/offline placeholder.
+        let root = PathBuf::from(r"C:\FakeRoot");
+        let parent = PathBuf::from(r"C:\");
+        let mut root_entry = dir("FakeRoot");
+        root_entry.placeholder = true;
+        let mut tree = HashMap::new();
+        tree.insert(parent, vec![root_entry]);
+        tree.insert(root.clone(), vec![file("mcp-config.json")]);
+
+        let fake = Arc::new(FakeDeepScanIo::new(tree));
+        let context = DeepScanContext {
+            roots: vec![root.clone()],
+            follow_reparse_points: false,
+            network_consent: false,
+        };
+        let (tx, rx) = mpsc::channel(64);
+        let events = ScanEventSink::new(tx);
+        let drain = drain_events(rx);
+
+        run_deep_scan(
+            context,
+            events,
+            CancellationToken::new(),
+            PauseGate::default(),
+            fake.clone(),
+        )
+        .await;
+        drop(drain);
+
+        assert!(
+            !fake.was_read(&root),
+            "a placeholder root must never be traversed or hydrated"
+        );
+    }
+
+    #[tokio::test]
+    async fn reparse_root_followed_without_network_consent_is_rejected() {
+        // The selected root itself is a reparse point, and the caller
+        // enabled follow_reparse_points but did not grant network consent.
+        // classify_root would see this root's own local path (C:\...) and
+        // classify it Local, but its reparse target is unknown -- it could
+        // resolve to network storage. Regression for the consent bypass:
+        // the scan must require consent for this case rather than trusting
+        // the root's syntactic local classification.
+        let root = PathBuf::from(r"C:\FakeRoot");
+        let parent = PathBuf::from(r"C:\");
+        let mut root_entry = dir("FakeRoot");
+        root_entry.reparse = true;
+        let mut tree = HashMap::new();
+        tree.insert(parent, vec![root_entry]);
+        tree.insert(root.clone(), vec![file("mcp-config.json")]);
+
+        let fake = Arc::new(FakeDeepScanIo::new(tree));
+        let context = DeepScanContext {
+            roots: vec![root.clone()],
+            follow_reparse_points: true,
+            network_consent: false,
+        };
+        let (tx, rx) = mpsc::channel(64);
+        let events = ScanEventSink::new(tx);
+        let drain = drain_events(rx);
+
+        run_deep_scan(
+            context,
+            events,
+            CancellationToken::new(),
+            PauseGate::default(),
+            fake.clone(),
+        )
+        .await;
+        let received = drain.await.unwrap();
+
+        assert!(
+            !fake.was_read(&root),
+            "a followed reparse root must not be traversed before network consent is confirmed"
+        );
+        assert!(
+            received.iter().any(|event| matches!(
+                event,
+                ScanEvent::Failed { code, .. } if code == "network_consent_required"
+            )),
+            "expected a network_consent_required Failed event, got: {received:?}"
+        );
     }
 
     #[tokio::test]
