@@ -72,3 +72,34 @@ fn service_discovery_reports_service_source_failure() {
 
     assert!(error.contains("service enumeration fixture failed"));
 }
+
+#[test]
+fn typed_service_discovery_preserves_exact_service_target() {
+    use control_center_core::{HealthCheckType, HealthExpectedCondition, HealthTarget};
+
+    let source = FixtureServices { fail: false };
+    let discoveries = discover_services_with(&source).unwrap();
+
+    let discovery = discoveries
+        .iter()
+        .find(|item| item.suggested_name == "Ollama Service")
+        .expect("service should be discovered");
+
+    assert_eq!(
+        discovery.canonical_identity.as_deref(),
+        Some("windows-service:ollamaservice")
+    );
+    assert_eq!(discovery.health_hints.len(), 1);
+
+    let hint = &discovery.health_hints[0];
+    assert_eq!(hint.check_type, HealthCheckType::WindowsServiceState);
+    assert!(hint.required);
+    assert_eq!(hint.expected_condition, HealthExpectedCondition::Running);
+    assert_eq!(hint.stale_after_seconds, None);
+    assert_eq!(
+        hint.target,
+        HealthTarget::WindowsService {
+            service_name: "OllamaService".into()
+        }
+    );
+}

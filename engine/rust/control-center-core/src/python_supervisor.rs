@@ -723,6 +723,31 @@ mod tests {
     fn rejects_malformed_python_json() {
         assert_eq!(parse_python_response("{not-json"), Err("scanner_protocol"));
     }
+
+    #[test]
+    fn typed_python_config_does_not_infer_metadata_from_evidence_strings() {
+        let line = r#"{
+            "protocol_version":1,
+            "request_id":"req-m7",
+            "kind":"discovery",
+            "discovery":{
+                "fingerprint":"legacy-python",
+                "suggested_name":"config",
+                "suggested_type":"mcp",
+                "confidence":"medium",
+                "evidence":[
+                    {"kind":"path","summary":"C:\\Users\\test\\.mcp\\config.json"},
+                    {"kind":"reason","summary":"service 127.0.0.1:11434 appears configured"}
+                ]
+            }
+        }"#;
+
+        let discovery = translate_discovery_response(line).unwrap();
+
+        assert_eq!(discovery.canonical_identity, None);
+        assert!(discovery.health_hints.is_empty());
+        assert!(discovery.dependency_proposals.is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -1015,14 +1040,14 @@ Start-Sleep -Seconds 3
 /// windows around that external process's startup, cancellation, or
 /// teardown. Under CPU contention (several of these launching PowerShell at
 /// once, or a busy CI runner), PowerShell interpreter startup latency is
-/// highly variable and can starve even a generous fixed window — this is a
+/// highly variable and can starve even a generous fixed window â€” this is a
 /// test-fixture race, not a production bug.
 ///
 /// An earlier version of this lock covered only 5 of the 11 tests that
 /// launch `powershell.exe`. That under-scoped lock was disproved by CI
 /// (unlocked tests still contending with locked ones) and confirmed locally:
-/// with only 5 tests locked, `timeout_kills_descendant_processes` — itself
-/// locked — still failed under induced contention from the 6 *unlocked*
+/// with only 5 tests locked, `timeout_kills_descendant_processes` â€” itself
+/// locked â€” still failed under induced contention from the 6 *unlocked*
 /// `powershell.exe`-spawning tests running concurrently in the same binary.
 /// The lock now covers all 11.
 ///

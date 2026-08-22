@@ -39,3 +39,30 @@ fn path_executable_discovery_ignores_missing_path_directories() {
 
     assert!(discoveries.is_empty());
 }
+
+#[test]
+fn typed_path_executable_discovery_carries_exact_file_health_metadata() {
+    use control_center_core::{HealthCheckType, HealthExpectedCondition, HealthTarget};
+    use control_center_core::windows::windows_path_key;
+
+    let root = tempdir().unwrap();
+    let executable = root.path().join("ollama.exe");
+    fs::write(&executable, b"fixture").unwrap();
+
+    let discoveries = discover_path_executables(&root.path().display().to_string(), ".EXE");
+    let discovery = discoveries
+        .iter()
+        .find(|item| item.suggested_name == "ollama")
+        .expect("PATH executable should be discovered");
+
+    let expected_identity = format!("windows-path:{}", windows_path_key(&executable));
+    assert_eq!(discovery.canonical_identity.as_deref(), Some(expected_identity.as_str()));
+    assert_eq!(discovery.health_hints.len(), 1);
+
+    let hint = &discovery.health_hints[0];
+    assert_eq!(hint.check_type, HealthCheckType::FileExists);
+    assert!(hint.required);
+    assert_eq!(hint.expected_condition, HealthExpectedCondition::Exists);
+    assert_eq!(hint.stale_after_seconds, None);
+    assert_eq!(hint.target, HealthTarget::Path { path: executable });
+}

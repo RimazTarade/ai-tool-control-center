@@ -192,3 +192,40 @@ fn known_location_discovery_refuses_directory_junction_targets() {
         "scanner must never traverse a Windows directory junction"
     );
 }
+
+#[test]
+fn typed_known_location_discovery_carries_exact_file_health_metadata() {
+    use control_center_core::{HealthCheckType, HealthExpectedCondition, HealthTarget};
+    use control_center_core::windows::windows_path_key;
+
+    let root = tempdir().expect("temporary root should be created");
+    let programs = root.path().join("Programs");
+    fs::create_dir_all(&programs).unwrap();
+    let executable = programs.join("ExampleTool.exe");
+    fs::write(&executable, b"fixture").unwrap();
+
+    let report = discover_known_locations(
+        &[KnownLocationRoot {
+            kind: KnownLocationKind::Programs,
+            path: programs,
+        }],
+        2,
+    );
+
+    let discovery = report
+        .discoveries
+        .iter()
+        .find(|item| item.suggested_name == "ExampleTool")
+        .expect("known-location executable should be discovered");
+
+    let expected_identity = format!("windows-path:{}", windows_path_key(&executable));
+    assert_eq!(discovery.canonical_identity.as_deref(), Some(expected_identity.as_str()));
+    assert_eq!(discovery.health_hints.len(), 1);
+
+    let hint = &discovery.health_hints[0];
+    assert_eq!(hint.check_type, HealthCheckType::FileExists);
+    assert!(hint.required);
+    assert_eq!(hint.expected_condition, HealthExpectedCondition::Exists);
+    assert_eq!(hint.stale_after_seconds, None);
+    assert_eq!(hint.target, HealthTarget::Path { path: executable });
+}

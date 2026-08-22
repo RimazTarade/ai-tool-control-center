@@ -97,3 +97,31 @@ fn uninstall_registry_discovery_emits_reviewable_desktop_applications_and_skips_
         assert_eq!(discovery.fingerprint.len(), 64);
     }
 }
+
+#[test]
+fn typed_uninstall_registry_uses_install_directory_only_as_health_target() {
+    use control_center_core::{HealthCheckType, HealthExpectedCondition, HealthTarget};
+
+    let registry = FixtureRegistry::default();
+    let discoveries = discover_uninstall_registry_with(&registry).discoveries;
+
+    let discovery = discoveries
+        .iter()
+        .find(|item| item.suggested_name == "Ollama")
+        .expect("uninstall record should be discovered");
+
+    assert_eq!(discovery.canonical_identity, None);
+    assert_eq!(discovery.health_hints.len(), 1);
+
+    let hint = &discovery.health_hints[0];
+    assert_eq!(hint.check_type, HealthCheckType::PathExists);
+    assert!(hint.required);
+    assert_eq!(hint.expected_condition, HealthExpectedCondition::Exists);
+    assert_eq!(hint.stale_after_seconds, None);
+    assert_eq!(
+        hint.target,
+        HealthTarget::Path {
+            path: PathBuf::from(r"C:\Fixture\Programs\Ollama")
+        }
+    );
+}
