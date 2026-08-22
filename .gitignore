@@ -26,3 +26,4 @@ artifacts/
 apps/desktop/src-tauri/icons/*
 !apps/desktop/src-tauri/icons/app-icon.svg
 !apps/desktop/src-tauri/icons/icon.ico
+.worktrees/

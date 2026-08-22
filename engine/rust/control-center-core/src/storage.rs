@@ -1,4 +1,7 @@
-use crate::{Discovery, ReviewState};
+use crate::{Discovery, ReviewState, ScanLifecycleState, ScanScope};
+use chrono::{DateTime, Utc};
+#[cfg(test)]
+use rusqlite::OptionalExtension;
 use rusqlite::{Connection, params};
 use std::path::Path;
 use thiserror::Error;
@@ -19,6 +22,8 @@ pub enum StoreError {
     InvalidData(#[from] serde_json::Error),
     #[error("discovery not found")]
     NotFound,
+    #[error("finish_scan requires a terminal state (Cancelled, Completed, or Failed), got {0:?}")]
+    NonTerminalFinishState(ScanLifecycleState),
 }
 
 pub struct Store {
@@ -50,8 +55,42 @@ impl Store {
                discovery_id TEXT NOT NULL UNIQUE REFERENCES discoveries(id),
                payload_json TEXT NOT NULL,
                imported_at TEXT NOT NULL
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS scan_runs (
+               id TEXT PRIMARY KEY NOT NULL,
+               scope TEXT NOT NULL CHECK(scope IN ('quick', 'deep')),
+               state TEXT NOT NULL,
+               started_at TEXT NOT NULL,
+               finished_at TEXT,
+               failure_count INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS scan_errors (
+               id TEXT PRIMARY KEY NOT NULL,
+               scan_id TEXT NOT NULL REFERENCES scan_runs(id) ON DELETE CASCADE,
+               scanner_id TEXT NOT NULL,
+               code TEXT NOT NULL,
+               redacted_message TEXT NOT NULL,
+               observed_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_scan_errors_scan_id
+               ON scan_errors(scan_id);",
         )?;
+
+        let has_scan_id_column = connection
+            .prepare("PRAGMA table_info(discoveries)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|name| name == "scan_id");
+        if !has_scan_id_column {
+            connection.execute_batch(
+                "ALTER TABLE discoveries ADD COLUMN scan_id TEXT REFERENCES scan_runs(id);",
+            )?;
+        }
+        connection.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_discoveries_scan_id ON discoveries(scan_id);",
+        )?;
+
         Ok(Self { connection })
     }
 
@@ -123,11 +162,353 @@ impl Store {
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
     }
+
+    pub fn begin_scan(
+        &mut self,
+        scan_id: Uuid,
+        scope: ScanScope,
+        started_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO scan_runs (id, scope, state, started_at, finished_at, failure_count)
+             VALUES (?1, ?2, 'running', ?3, NULL, 0)",
+            params![
+                scan_id.to_string(),
+                scan_scope_str(scope),
+                started_at.to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_scan_state(
+        &mut self,
+        scan_id: Uuid,
+        state: ScanLifecycleState,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE scan_runs SET state=?2 WHERE id=?1",
+            params![scan_id.to_string(), scan_lifecycle_state_str(state)],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_scan(
+        &mut self,
+        scan_id: Uuid,
+        state: ScanLifecycleState,
+        finished_at: DateTime<Utc>,
+        failure_count: u64,
+    ) -> Result<(), StoreError> {
+        if !matches!(
+            state,
+            ScanLifecycleState::Cancelled
+                | ScanLifecycleState::Completed
+                | ScanLifecycleState::Failed
+        ) {
+            return Err(StoreError::NonTerminalFinishState(state));
+        }
+        self.connection.execute(
+            "UPDATE scan_runs SET state=?2, finished_at=?3, failure_count=?4 WHERE id=?1",
+            params![
+                scan_id.to_string(),
+                scan_lifecycle_state_str(state),
+                finished_at.to_rfc3339(),
+                failure_count as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_scan_error(
+        &mut self,
+        scan_id: Uuid,
+        scanner_id: &str,
+        code: &str,
+        redacted_message: &str,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO scan_errors (id, scan_id, scanner_id, code, redacted_message, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                Uuid::new_v4().to_string(),
+                scan_id.to_string(),
+                scanner_id,
+                code,
+                redacted_message,
+                observed_at.to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Upserts a scan-owned discovery. Returns `true` when the row is now
+    /// pending (either freshly inserted, or an existing `pending`/`ignored`
+    /// row was refreshed) -- the caller should treat this discovery as
+    /// newly visible. Returns `false` when a row already existed for this
+    /// fingerprint with a *different*, already-resolved review state
+    /// (`imported` or `unknown`): the `ON CONFLICT ... WHERE` guard skips
+    /// the update in that case, so nothing was actually persisted as
+    /// pending, and the caller must not tell anything downstream (a
+    /// `scan.discovery` event, the Review Queue) that this id is pending --
+    /// it would silently un-resolve a decision the user already made.
+    pub fn enqueue_for_scan(
+        &mut self,
+        scan_id: Uuid,
+        discovery: &Discovery,
+    ) -> Result<bool, StoreError> {
+        let payload = serde_json::to_string(discovery)?;
+        let changed = self.connection.execute(
+            "INSERT INTO discoveries (id, fingerprint, payload_json, review_state, observed_at, scan_id)
+             VALUES (?1, ?2, ?3, 'pending', ?4, ?5)
+             ON CONFLICT(fingerprint) DO UPDATE SET id=excluded.id,
+               payload_json=excluded.payload_json,
+               review_state='pending',
+               observed_at=excluded.observed_at,
+               scan_id=excluded.scan_id
+             WHERE discoveries.review_state IN ('pending', 'ignored')",
+            params![
+                discovery.id.to_string(),
+                discovery.fingerprint,
+                payload,
+                discovery.observed_at.to_rfc3339(),
+                scan_id.to_string()
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+}
+
+fn scan_scope_str(scope: ScanScope) -> &'static str {
+    match scope {
+        ScanScope::Quick => "quick",
+        ScanScope::Deep => "deep",
+    }
+}
+
+fn scan_lifecycle_state_str(state: ScanLifecycleState) -> &'static str {
+    match state {
+        ScanLifecycleState::Running => "running",
+        ScanLifecycleState::Paused => "paused",
+        ScanLifecycleState::Cancelled => "cancelled",
+        ScanLifecycleState::Completed => "completed",
+        ScanLifecycleState::Failed => "failed",
+    }
+}
+
+#[cfg(test)]
+pub struct ScanRunRow {
+    pub scope: String,
+    pub state: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub failure_count: i64,
+}
+
+#[cfg(test)]
+pub struct ScanErrorRow {
+    pub scanner_id: String,
+    pub code: String,
+    pub redacted_message: String,
+}
+
+#[cfg(test)]
+impl Store {
+    pub fn scan_run_for_test(&self, scan_id: Uuid) -> Result<Option<ScanRunRow>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT scope, state, started_at, finished_at, failure_count
+                 FROM scan_runs WHERE id=?1",
+                [scan_id.to_string()],
+                |row| {
+                    Ok(ScanRunRow {
+                        scope: row.get(0)?,
+                        state: row.get(1)?,
+                        started_at: row.get(2)?,
+                        finished_at: row.get(3)?,
+                        failure_count: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn scan_errors_for_test(&self, scan_id: Uuid) -> Result<Vec<ScanErrorRow>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT scanner_id, code, redacted_message FROM scan_errors WHERE scan_id=?1",
+        )?;
+        let rows = statement.query_map([scan_id.to_string()], |row| {
+            Ok(ScanErrorRow {
+                scanner_id: row.get(0)?,
+                code: row.get(1)?,
+                redacted_message: row.get(2)?,
+            })
+        })?;
+        rows.map(|row| Ok(row?)).collect()
+    }
+
+    pub fn discovery_scan_id_for_test(&self, id: Uuid) -> Result<Option<Uuid>, StoreError> {
+        let scan_id: Option<String> = self.connection.query_row(
+            "SELECT scan_id FROM discoveries WHERE id=?1",
+            [id.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(scan_id.map(|value| Uuid::parse_str(&value).expect("valid uuid")))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_store() -> Store {
+        Store::in_memory().unwrap()
+    }
+
+    fn sample_discovery() -> Discovery {
+        Discovery::unknown("Example", "fixture", "abc".into())
+    }
+
+    #[test]
+    fn scan_run_moves_from_running_to_completed() {
+        let mut store = test_store();
+        let scan_id = Uuid::new_v4();
+        let started = Utc::now();
+
+        store
+            .begin_scan(scan_id, ScanScope::Quick, started)
+            .unwrap();
+        store
+            .finish_scan(
+                scan_id,
+                ScanLifecycleState::Completed,
+                started + chrono::Duration::seconds(2),
+                1,
+            )
+            .unwrap();
+
+        let row = store.scan_run_for_test(scan_id).unwrap().unwrap();
+        assert_eq!(row.scope, "quick");
+        assert_eq!(row.state, "completed");
+        assert_eq!(row.failure_count, 1);
+        assert!(row.finished_at.is_some());
+    }
+
+    #[test]
+    fn finish_scan_rejects_non_terminal_states() {
+        let mut store = test_store();
+        let scan_id = Uuid::new_v4();
+        let started = Utc::now();
+
+        store
+            .begin_scan(scan_id, ScanScope::Quick, started)
+            .unwrap();
+
+        let running_result = store.finish_scan(
+            scan_id,
+            ScanLifecycleState::Running,
+            started + chrono::Duration::seconds(1),
+            0,
+        );
+        assert!(matches!(
+            running_result,
+            Err(StoreError::NonTerminalFinishState(
+                ScanLifecycleState::Running
+            ))
+        ));
+
+        let paused_result = store.finish_scan(
+            scan_id,
+            ScanLifecycleState::Paused,
+            started + chrono::Duration::seconds(1),
+            0,
+        );
+        assert!(matches!(
+            paused_result,
+            Err(StoreError::NonTerminalFinishState(
+                ScanLifecycleState::Paused
+            ))
+        ));
+
+        // Row must remain untouched: still running, no finished_at.
+        let row = store.scan_run_for_test(scan_id).unwrap().unwrap();
+        assert_eq!(row.state, "running");
+        assert!(row.finished_at.is_none());
+        assert_eq!(row.failure_count, 0);
+    }
+
+    #[test]
+    fn scanner_error_is_owned_by_scan() {
+        let mut store = test_store();
+        let scan_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        store.begin_scan(scan_id, ScanScope::Quick, now).unwrap();
+        store
+            .record_scan_error(
+                scan_id,
+                "python",
+                "scanner_timeout",
+                "scanner timed out",
+                now,
+            )
+            .unwrap();
+
+        let rows = store.scan_errors_for_test(scan_id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].scanner_id, "python");
+        assert_eq!(rows[0].code, "scanner_timeout");
+    }
+
+    #[test]
+    fn discovery_created_by_scan_keeps_scan_id() {
+        let mut store = test_store();
+        let scan_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        store.begin_scan(scan_id, ScanScope::Quick, now).unwrap();
+        let discovery = sample_discovery();
+        assert!(store.enqueue_for_scan(scan_id, &discovery).unwrap());
+
+        assert_eq!(
+            store.discovery_scan_id_for_test(discovery.id).unwrap(),
+            Some(scan_id)
+        );
+    }
+
+    #[test]
+    fn enqueue_for_scan_does_not_revive_an_already_resolved_discovery() {
+        // A later scan rediscovering the same tool (same fingerprint) after
+        // the user already imported or kept-unknown it must not silently
+        // flip it back to pending -- that would un-resolve a decision the
+        // user already made, and the caller must be able to tell this
+        // happened so it never announces the id as newly pending.
+        let mut store = test_store();
+        let first_scan = Uuid::new_v4();
+        let second_scan = Uuid::new_v4();
+        let now = Utc::now();
+
+        store.begin_scan(first_scan, ScanScope::Quick, now).unwrap();
+        let discovery = sample_discovery();
+        assert!(store.enqueue_for_scan(first_scan, &discovery).unwrap());
+        store.review(discovery.id, ReviewDecision::Import).unwrap();
+
+        store
+            .begin_scan(second_scan, ScanScope::Quick, now)
+            .unwrap();
+        assert!(!store.enqueue_for_scan(second_scan, &discovery).unwrap());
+
+        // The row must still show the original scan and its resolved
+        // review state, not the second scan or 'pending'.
+        assert_eq!(
+            store.discovery_scan_id_for_test(discovery.id).unwrap(),
+            Some(first_scan)
+        );
+        let pending_ids: Vec<_> = store.pending().unwrap().into_iter().map(|d| d.id).collect();
+        assert!(!pending_ids.contains(&discovery.id));
+    }
 
     #[test]
     fn discoveries_require_review_before_inventory() {

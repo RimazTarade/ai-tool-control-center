@@ -126,6 +126,11 @@ struct WindowsJob {
 }
 
 #[cfg(windows)]
+// SAFETY: Windows kernel handles are process-scoped. This wrapper uniquely owns the handle
+// and moving ownership between threads does not duplicate or concurrently close it.
+unsafe impl Send for WindowsJob {}
+
+#[cfg(windows)]
 impl WindowsJob {
     fn new() -> Result<Self, &'static str> {
         use std::mem::{size_of, zeroed};
@@ -185,38 +190,64 @@ impl Drop for WindowsJob {
     }
 }
 
+/// Distinguishes a cooperative Python process-tree exit (the child settled
+/// within the 2-second grace period after stdin was closed) from a forced
+/// exit (the Windows Job Object had to be closed because the process tree
+/// did not exit in time).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PythonTermination {
+    Cooperative,
+    Forced,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PythonSupervisorError {
     code: &'static str,
+    termination: Option<PythonTermination>,
 }
 
 impl PythonSupervisorError {
     pub fn protocol() -> Self {
         Self {
             code: "scanner_protocol",
+            termination: None,
         }
     }
 
     pub fn timeout() -> Self {
         Self {
             code: "scanner_timeout",
+            termination: None,
         }
     }
 
     pub fn cancelled() -> Self {
         Self {
             code: "scanner_cancelled",
+            termination: None,
+        }
+    }
+
+    pub fn cancelled_with(termination: PythonTermination) -> Self {
+        Self {
+            code: "scanner_cancelled",
+            termination: Some(termination),
         }
     }
 
     pub fn failed(_detail: &str) -> Self {
         Self {
             code: "scanner_failed",
+            termination: None,
         }
     }
 
     pub fn code(&self) -> &'static str {
         self.code
+    }
+
+    pub fn termination(&self) -> Option<PythonTermination> {
+        self.termination
     }
 }
 
@@ -297,6 +328,30 @@ struct SupervisorControl {
     cancellation: tokio_util::sync::CancellationToken,
 }
 
+/// Called once root cancellation fires and the child's stdin has already
+/// been closed (child stdin is shut down immediately after the scan
+/// request is written, before either select loop below can observe
+/// cancellation). Waits up to 2 seconds for the process tree to exit on
+/// its own; if it does not, closes the Windows Job Object to force
+/// termination and waits for the child to settle.
+#[cfg(windows)]
+async fn await_cancellation_grace_period(
+    child: &mut tokio::process::Child,
+    job: WindowsJob,
+) -> PythonTermination {
+    if tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+        .await
+        .is_err()
+    {
+        drop(job);
+        let _ = child.wait().await;
+        PythonTermination::Forced
+    } else {
+        drop(job);
+        PythonTermination::Cooperative
+    }
+}
+
 #[cfg(windows)]
 async fn run_supervised_process<F>(
     program: &Path,
@@ -373,16 +428,9 @@ where
     let count = tokio::select! {
         result = &mut consume => result?,
         _ = control.cancellation.cancelled() => {
-            if tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
-                .await
-                .is_err()
-            {
-                drop(job);
-                let _ = child.wait().await;
-            }
-
+            let termination = await_cancellation_grace_period(&mut child, job).await;
             let _ = stderr_task.await;
-            return Err(PythonSupervisorError::cancelled());
+            return Err(PythonSupervisorError::cancelled_with(termination));
         }
         _ = tokio::time::sleep_until(deadline) => {
             drop(job);
@@ -397,16 +445,9 @@ where
             result.map_err(|_| PythonSupervisorError::failed("child wait failed"))?
         }
         _ = control.cancellation.cancelled() => {
-            if tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
-                .await
-                .is_err()
-            {
-                drop(job);
-                let _ = child.wait().await;
-            }
-
+            let termination = await_cancellation_grace_period(&mut child, job).await;
             let _ = stderr_task.await;
-            return Err(PythonSupervisorError::cancelled());
+            return Err(PythonSupervisorError::cancelled_with(termination));
         }
         _ = tokio::time::sleep_until(deadline) => {
             drop(job);
@@ -819,6 +860,7 @@ mod supervised_process_tests {
 
     #[tokio::test]
     async fn supervised_process_writes_one_request_and_reads_completed() {
+        let _serialize = super::WINDOWS_PROCESS_SUPERVISOR_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("scanner-helper.ps1");
 
@@ -874,6 +916,7 @@ mod timeout_tests {
 
     #[tokio::test]
     async fn supervised_process_returns_scanner_timeout() {
+        let _serialize = super::WINDOWS_PROCESS_SUPERVISOR_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("scanner-timeout.ps1");
 
@@ -920,6 +963,7 @@ Start-Sleep -Seconds 30
 
     #[tokio::test]
     async fn completed_child_that_stays_alive_still_times_out() {
+        let _serialize = super::WINDOWS_PROCESS_SUPERVISOR_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("scanner-completed-then-sleeps.ps1");
 
@@ -966,6 +1010,63 @@ Start-Sleep -Seconds 3
     }
 }
 
+/// Serializes every test in this module that spawns a real `powershell.exe`
+/// (several of which spawn a `ping.exe` descendant) and assert on wall-clock
+/// windows around that external process's startup, cancellation, or
+/// teardown. Under CPU contention (several of these launching PowerShell at
+/// once, or a busy CI runner), PowerShell interpreter startup latency is
+/// highly variable and can starve even a generous fixed window — this is a
+/// test-fixture race, not a production bug.
+///
+/// An earlier version of this lock covered only 5 of the 11 tests that
+/// launch `powershell.exe`. That under-scoped lock was disproved by CI
+/// (unlocked tests still contending with locked ones) and confirmed locally:
+/// with only 5 tests locked, `timeout_kills_descendant_processes` — itself
+/// locked — still failed under induced contention from the 6 *unlocked*
+/// `powershell.exe`-spawning tests running concurrently in the same binary.
+/// The lock now covers all 11.
+///
+/// Held for a whole test's body so no two of these process-heavy tests ever
+/// launch/verify their external process concurrently within one test binary.
+/// Scoped to just these tests (not `--test-threads=1` for the whole crate)
+/// per the smallest-fix principle: every other test in this crate remains
+/// fully parallel.
+#[cfg(all(test, windows))]
+static WINDOWS_PROCESS_SUPERVISOR_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+/// Polls for `path` to contain a parseable PID within `budget`, checked
+/// against actual elapsed wall-clock time rather than an iteration count.
+///
+/// An iteration-count budget (e.g. "give up after 100 attempts") is *not*
+/// a reliable wall-clock bound under scheduler contention: an individual
+/// `sleep(25ms)` can itself take far longer than 25ms to actually resume
+/// when the runtime is starved for CPU, so "100 iterations" can span far
+/// more than the nominally-intended 2.5 seconds. Measured locally under
+/// induced contention: a 25ms-interval loop needed as much as 91
+/// iterations / 3.15s wall-clock to observe readiness that normally
+/// arrives in well under 100ms.
+///
+/// Returns `None` (never panics) if the budget elapses first, so callers
+/// choose how to fail -- panic with a clear message, or (for a readiness
+/// barrier raced against another future via `tokio::select!`) let the
+/// other branch determine the outcome.
+#[cfg(all(test, windows))]
+async fn wait_for_pid_file(path: &std::path::Path, budget: std::time::Duration) -> Option<u32> {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(path)
+            && let Ok(pid) = contents.trim().parse::<u32>()
+        {
+            return Some(pid);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 #[cfg(all(test, windows))]
 mod cancellation_tests {
     use super::*;
@@ -976,6 +1077,7 @@ mod cancellation_tests {
 
     #[tokio::test]
     async fn supervised_process_returns_scanner_cancelled() {
+        let _serialize = super::WINDOWS_PROCESS_SUPERVISOR_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("scanner-cancel.ps1");
 
@@ -1030,6 +1132,7 @@ Start-Sleep -Seconds 30
 
     #[tokio::test]
     async fn completed_child_that_stays_alive_can_still_be_cancelled() {
+        let _serialize = super::WINDOWS_PROCESS_SUPERVISOR_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("scanner-completed-then-cancel.ps1");
         let ready_file = temp.path().join("completed-ready.txt");
@@ -1132,6 +1235,7 @@ mod malformed_protocol_tests {
 
     #[tokio::test]
     async fn malformed_child_json_returns_scanner_protocol() {
+        let _serialize = super::WINDOWS_PROCESS_SUPERVISOR_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("scanner-malformed.ps1");
 
@@ -1187,6 +1291,7 @@ mod oversized_protocol_tests {
 
     #[tokio::test]
     async fn oversized_child_line_returns_scanner_protocol() {
+        let _serialize = super::WINDOWS_PROCESS_SUPERVISOR_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("scanner-oversized.ps1");
 
@@ -1242,6 +1347,7 @@ mod descendant_cleanup_tests {
 
     #[tokio::test]
     async fn timeout_kills_descendant_processes() {
+        let _serialize = super::WINDOWS_PROCESS_SUPERVISOR_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("scanner-descendant.ps1");
         let pid_file = temp.path().join("descendant.pid");
@@ -1291,11 +1397,17 @@ Start-Sleep -Seconds 30
 
         assert_eq!(error.code(), "scanner_timeout");
 
-        let pid: u32 = std::fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        // The supervisor's own 1500ms timeout can legitimately fire before
+        // the descendant PowerShell script -- itself just started -- has
+        // reached its `Set-Content` line under contention (PowerShell
+        // interpreter startup latency is highly variable; see
+        // `wait_for_pid_file`'s docs). Wait explicitly and fail clearly
+        // rather than assuming the file is already there.
+        let pid = super::wait_for_pid_file(&pid_file, Duration::from_secs(5))
+            .await
+            .expect(
+                "descendant process never wrote a readable PID file after the supervisor's own timeout fired",
+            );
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1322,6 +1434,7 @@ mod cancellation_descendant_cleanup_tests {
 
     #[tokio::test]
     async fn cancellation_kills_descendant_processes_after_grace_period() {
+        let _serialize = super::WINDOWS_PROCESS_SUPERVISOR_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("scanner-cancel-descendant.ps1");
         let pid_file = temp.path().join("cancel-descendant.pid");
@@ -1357,18 +1470,7 @@ Start-Sleep -Seconds 30
         let cancellation = CancellationToken::new();
         let trigger = cancellation.clone();
 
-        let pid_wait = pid_file.clone();
-        tokio::spawn(async move {
-            for _ in 0..100 {
-                if pid_wait.is_file() {
-                    trigger.cancel();
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        });
-
-        let error = run_supervised_process(
+        let mut supervisor = Box::pin(run_supervised_process(
             &powershell,
             &args,
             temp.path(),
@@ -1379,10 +1481,28 @@ Start-Sleep -Seconds 30
                 cancellation,
             },
             |_| {},
-        )
-        .await
-        .unwrap_err();
+        ));
 
+        // Explicit readiness barrier (mirrors drop_cleanup_tests below):
+        // race the descendant's PID file becoming readable against the
+        // supervisor settling on its own. If the supervisor settles first,
+        // something else is wrong -- nothing has cancelled or timed it out
+        // yet. If the readiness budget elapses, this panics with a clear
+        // diagnostic instead of silently giving up and letting the
+        // supervisor's own 10-second timeout fire, which previously
+        // produced a confusing scanner_timeout-vs-scanner_cancelled
+        // assertion mismatch (CI #28) rather than a clear failure.
+        tokio::select! {
+            result = &mut supervisor => {
+                panic!("supervisor settled before the descendant became ready: {result:?}");
+            }
+            ready = super::wait_for_pid_file(&pid_file, Duration::from_secs(8)) => {
+                ready.expect("descendant process never wrote a readable PID file within the readiness budget");
+                trigger.cancel();
+            }
+        }
+
+        let error = supervisor.await.unwrap_err();
         assert_eq!(error.code(), "scanner_cancelled");
 
         let pid: u32 = std::fs::read_to_string(&pid_file)
@@ -1404,6 +1524,98 @@ Start-Sleep -Seconds 30
             "descendant process {pid} survived supervisor cancellation"
         );
     }
+
+    #[tokio::test]
+    async fn cancellation_past_grace_period_reports_forced_termination() {
+        let _serialize = super::WINDOWS_PROCESS_SUPERVISOR_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("scanner-cancel-forced-descendant.ps1");
+        let pid_file = temp.path().join("cancel-forced-descendant.pid");
+
+        // This child ignores stdin shutdown: it never reads stdin again after
+        // the initial ReadLine, and keeps its descendant alive well past the
+        // 2-second grace period so the supervisor must fall back to closing
+        // the Windows Job Object.
+        std::fs::write(
+            &script,
+            format!(
+                r#"$null = [Console]::In.ReadLine()
+$child = Start-Process ping.exe -ArgumentList '127.0.0.1','-n','30' -PassThru
+Set-Content -Path '{}' -Value $child.Id
+Start-Sleep -Seconds 30
+"#,
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+
+        let powershell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+
+        let args = vec![
+            OsString::from("-NoProfile"),
+            OsString::from("-File"),
+            script.into_os_string(),
+        ];
+
+        let request = r#"{"protocol_version":1,"request_id":"req-cancel-forced-descendant","operation":"scan","roots":[]}
+"#;
+
+        let cancellation = CancellationToken::new();
+        let trigger = cancellation.clone();
+
+        let mut supervisor = Box::pin(run_supervised_process(
+            &powershell,
+            &args,
+            temp.path(),
+            &[],
+            request,
+            SupervisorControl {
+                timeout: Duration::from_secs(10),
+                cancellation,
+            },
+            |_| {},
+        ));
+
+        // See cancellation_kills_descendant_processes_after_grace_period
+        // above for why this is a select! readiness barrier rather than a
+        // detached, silently-give-up-able polling task.
+        tokio::select! {
+            result = &mut supervisor => {
+                panic!("supervisor settled before the descendant became ready: {result:?}");
+            }
+            ready = super::wait_for_pid_file(&pid_file, Duration::from_secs(8)) => {
+                ready.expect("descendant process never wrote a readable PID file within the readiness budget");
+                trigger.cancel();
+            }
+        }
+
+        let error = supervisor.await.unwrap_err();
+        assert_eq!(error.code(), "scanner_cancelled");
+        assert_eq!(error.termination(), Some(PythonTermination::Forced));
+
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let output = std::process::Command::new("tasklist.exe")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .unwrap();
+
+        let output = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !output.contains(&pid.to_string()),
+            "descendant process {pid} survived forced supervisor cancellation"
+        );
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -1416,6 +1628,7 @@ mod drop_cleanup_tests {
 
     #[tokio::test]
     async fn dropping_supervisor_kills_descendant_processes() {
+        let _serialize = super::WINDOWS_PROCESS_SUPERVISOR_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("scanner-drop-descendant.ps1");
         let pid_file = temp.path().join("drop-descendant.pid");
