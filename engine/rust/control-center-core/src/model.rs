@@ -98,7 +98,11 @@ pub enum HealthExpectedCondition {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum HealthTarget {
     Path { path: PathBuf },
     Config { path: PathBuf, format: ConfigFormat },
@@ -225,6 +229,39 @@ pub struct HealthResult {
     pub observed_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthCheckSnapshot {
+    pub definition: HealthCheckDefinition,
+    pub latest_result: Option<HealthResult>,
+    pub stale: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallationHealthSnapshot {
+    pub installation: InstallationInstance,
+    pub capability: CanonicalCapability,
+    pub checks: Vec<HealthCheckSnapshot>,
+    pub effective_health: HealthState,
+    pub last_checked_at: Option<DateTime<Utc>>,
+    pub warning_count: u64,
+    pub failure_count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthSummary {
+    pub capability_count: u64,
+    pub installation_count: u64,
+    pub pending_discovery_count: u64,
+    pub green_count: u64,
+    pub yellow_count: u64,
+    pub red_count: u64,
+    pub grey_count: u64,
+    pub blue_count: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DependencyOwner {
@@ -310,7 +347,6 @@ impl Discovery {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,7 +381,10 @@ mod tests {
 
     #[test]
     fn m7_wire_values_are_stable_snake_case() {
-        assert_eq!(serde_json::to_string(&HealthState::Grey).unwrap(), r#""grey""#);
+        assert_eq!(
+            serde_json::to_string(&HealthState::Grey).unwrap(),
+            r#""grey""#
+        );
         assert_eq!(
             serde_json::to_string(&HealthCheckType::LoopbackPortReachable).unwrap(),
             r#""loopback_port_reachable""#

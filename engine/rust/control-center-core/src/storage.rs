@@ -1,11 +1,13 @@
 use crate::{
-    CanonicalCapability, Discovery, HealthCheckDefinition, HealthState, HealthTarget,
-    InstallationInstance, ReviewState, ScanLifecycleState, ScanScope,
+    CanonicalCapability, Discovery, HealthCheckDefinition, HealthCheckSnapshot, HealthResult,
+    HealthRun, HealthRunScope, HealthRunState, HealthState, HealthSummary, HealthTarget,
+    InstallationHealthSnapshot, InstallationInstance, ReviewState, ScanLifecycleState, ScanScope,
+    aggregate_health, is_result_stale,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::OptionalExtension;
 use rusqlite::{Connection, params};
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -518,6 +520,553 @@ impl Store {
             .collect()
     }
 
+    pub fn begin_health_run(&mut self, run: &HealthRun) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO health_runs
+             (id, scope, state, started_at, finished_at, requested_installation_count,
+              completed_installation_count, revision)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                run.id.to_string(),
+                enum_wire_value(&run.scope)?,
+                enum_wire_value(&run.state)?,
+                run.started_at.to_rfc3339(),
+                run.finished_at.map(|value| value.to_rfc3339()),
+                u64_to_sql(
+                    run.requested_installation_count,
+                    "health_runs.requested_installation_count",
+                )?,
+                u64_to_sql(
+                    run.completed_installation_count,
+                    "health_runs.completed_installation_count",
+                )?,
+                &run.revision,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_health_run(&mut self, run: &HealthRun) -> Result<(), StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE health_runs
+             SET scope=?2, state=?3, started_at=?4, finished_at=?5,
+                 requested_installation_count=?6, completed_installation_count=?7, revision=?8
+             WHERE id=?1",
+            params![
+                run.id.to_string(),
+                enum_wire_value(&run.scope)?,
+                enum_wire_value(&run.state)?,
+                run.started_at.to_rfc3339(),
+                run.finished_at.map(|value| value.to_rfc3339()),
+                u64_to_sql(
+                    run.requested_installation_count,
+                    "health_runs.requested_installation_count",
+                )?,
+                u64_to_sql(
+                    run.completed_installation_count,
+                    "health_runs.completed_installation_count",
+                )?,
+                &run.revision,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    pub fn health_run(&self, run_id: Uuid) -> Result<HealthRun, StoreError> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT id, scope, state, started_at, finished_at,
+                        requested_installation_count, completed_installation_count, revision
+                 FROM health_runs
+                 WHERE id=?1",
+                [run_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)?;
+
+        let requested_installation_count = u64::try_from(row.5).map_err(|_| {
+            StoreError::StorageIntegrity(
+                "health_runs.requested_installation_count is negative".into(),
+            )
+        })?;
+        let completed_installation_count = u64::try_from(row.6).map_err(|_| {
+            StoreError::StorageIntegrity(
+                "health_runs.completed_installation_count is negative".into(),
+            )
+        })?;
+
+        Ok(HealthRun {
+            id: parse_stored_uuid(&row.0, "health_runs.id")?,
+            scope: enum_from_wire::<HealthRunScope>(&row.1, "health_runs.scope")?,
+            state: enum_from_wire::<HealthRunState>(&row.2, "health_runs.state")?,
+            started_at: parse_stored_timestamp(&row.3, "health_runs.started_at")?,
+            finished_at: row
+                .4
+                .as_deref()
+                .map(|value| parse_stored_timestamp(value, "health_runs.finished_at"))
+                .transpose()?,
+            requested_installation_count,
+            completed_installation_count,
+            revision: row.7,
+        })
+    }
+
+    pub fn record_health_result_and_recompute(
+        &mut self,
+        result: &HealthResult,
+        evaluated_at: DateTime<Utc>,
+    ) -> Result<HealthState, StoreError> {
+        let transaction = self.connection.transaction()?;
+
+        transaction.execute(
+            "INSERT INTO health_results
+             (id, run_id, installation_id, check_definition_id, check_type, required, state,
+              result_code, redacted_evidence, duration_ms, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                result.id.to_string(),
+                result.run_id.to_string(),
+                result.installation_id.to_string(),
+                result.check_definition_id.to_string(),
+                enum_wire_value(&result.check_type)?,
+                if result.required { 1_i64 } else { 0_i64 },
+                enum_wire_value(&result.state)?,
+                &result.result_code,
+                &result.redacted_evidence,
+                u64_to_sql(result.duration_ms, "health_results.duration_ms")?,
+                result.observed_at.to_rfc3339(),
+            ],
+        )?;
+
+        let definition_rows = {
+            let mut statement = transaction.prepare(
+                "SELECT id, installation_id, check_type, required, expected_condition, timeout_ms,
+                        stale_after_seconds, target_json, created_at, updated_at
+                 FROM health_check_definitions
+                 WHERE installation_id=?1
+                 ORDER BY created_at ASC, id ASC",
+            )?;
+            statement
+                .query_map([result.installation_id.to_string()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut definitions = Vec::with_capacity(definition_rows.len());
+        for row in definition_rows {
+            let timeout_ms = u64::try_from(row.5).map_err(|_| {
+                StoreError::StorageIntegrity(
+                    "health_check_definitions.timeout_ms is negative".into(),
+                )
+            })?;
+            if timeout_ms == 0 {
+                return Err(StoreError::StorageIntegrity(
+                    "health_check_definitions.timeout_ms must be positive".into(),
+                ));
+            }
+            let stale_after_seconds = row
+                .6
+                .map(|value| {
+                    u64::try_from(value).map_err(|_| {
+                        StoreError::StorageIntegrity(
+                            "health_check_definitions.stale_after_seconds is negative".into(),
+                        )
+                    })
+                })
+                .transpose()?;
+            let required = match row.3 {
+                0 => false,
+                1 => true,
+                other => {
+                    return Err(StoreError::StorageIntegrity(format!(
+                        "invalid health_check_definitions.required value {other}"
+                    )));
+                }
+            };
+            definitions.push(HealthCheckDefinition {
+                id: parse_stored_uuid(&row.0, "health_check_definitions.id")?,
+                installation_id: parse_stored_uuid(
+                    &row.1,
+                    "health_check_definitions.installation_id",
+                )?,
+                check_type: enum_from_wire(&row.2, "health_check_definitions.check_type")?,
+                required,
+                expected_condition: enum_from_wire(
+                    &row.4,
+                    "health_check_definitions.expected_condition",
+                )?,
+                timeout_ms,
+                stale_after_seconds,
+                target_metadata: serde_json::from_str::<HealthTarget>(&row.7).map_err(|error| {
+                    StoreError::StorageIntegrity(format!(
+                        "invalid health_check_definitions.target_json: {error}"
+                    ))
+                })?,
+                created_at: parse_stored_timestamp(&row.8, "health_check_definitions.created_at")?,
+                updated_at: parse_stored_timestamp(&row.9, "health_check_definitions.updated_at")?,
+            });
+        }
+
+        let mut latest_results = HashMap::new();
+        for definition in &definitions {
+            let row = transaction
+                .query_row(
+                    "SELECT id, run_id, installation_id, check_definition_id, check_type, required,
+                            state, result_code, redacted_evidence, duration_ms, observed_at
+                     FROM health_results
+                     WHERE check_definition_id=?1
+                     ORDER BY observed_at DESC, id DESC
+                     LIMIT 1",
+                    [definition.id.to_string()],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, String>(7)?,
+                            row.get::<_, String>(8)?,
+                            row.get::<_, i64>(9)?,
+                            row.get::<_, String>(10)?,
+                        ))
+                    },
+                )
+                .optional()?;
+
+            if let Some(row) = row {
+                let required = match row.5 {
+                    0 => false,
+                    1 => true,
+                    other => {
+                        return Err(StoreError::StorageIntegrity(format!(
+                            "invalid health_results.required value {other}"
+                        )));
+                    }
+                };
+                let duration_ms = u64::try_from(row.9).map_err(|_| {
+                    StoreError::StorageIntegrity("health_results.duration_ms is negative".into())
+                })?;
+                let latest = HealthResult {
+                    id: parse_stored_uuid(&row.0, "health_results.id")?,
+                    run_id: parse_stored_uuid(&row.1, "health_results.run_id")?,
+                    installation_id: parse_stored_uuid(&row.2, "health_results.installation_id")?,
+                    check_definition_id: parse_stored_uuid(
+                        &row.3,
+                        "health_results.check_definition_id",
+                    )?,
+                    check_type: enum_from_wire(&row.4, "health_results.check_type")?,
+                    required,
+                    state: enum_from_wire(&row.6, "health_results.state")?,
+                    result_code: row.7,
+                    redacted_evidence: row.8,
+                    duration_ms,
+                    observed_at: parse_stored_timestamp(&row.10, "health_results.observed_at")?,
+                };
+                latest_results.insert(definition.id, latest);
+            }
+        }
+
+        let aggregate = aggregate_health(&definitions, &latest_results, evaluated_at);
+        let changed = transaction.execute(
+            "UPDATE installation_instances
+             SET aggregate_health=?2, updated_at=?3
+             WHERE id=?1",
+            params![
+                result.installation_id.to_string(),
+                enum_wire_value(&aggregate)?,
+                evaluated_at.to_rfc3339(),
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound);
+        }
+
+        transaction.commit()?;
+        Ok(aggregate)
+    }
+
+    pub fn health_results_for_installation(
+        &self,
+        installation_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<HealthResult>, StoreError> {
+        let limit = limit.min(100);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let sql_limit = i64::try_from(limit).map_err(|_| {
+            StoreError::StorageIntegrity("health history limit exceeds SQLite INTEGER range".into())
+        })?;
+
+        let rows = {
+            let mut statement = self.connection.prepare(
+                "SELECT id, run_id, installation_id, check_definition_id, check_type, required,
+                        state, result_code, redacted_evidence, duration_ms, observed_at
+                 FROM health_results
+                 WHERE installation_id=?1
+                 ORDER BY observed_at DESC, id DESC
+                 LIMIT ?2",
+            )?;
+            statement
+                .query_map(params![installation_id.to_string(), sql_limit], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, String>(10)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        rows.into_iter()
+            .map(|row| {
+                let required = match row.5 {
+                    0 => false,
+                    1 => true,
+                    other => {
+                        return Err(StoreError::StorageIntegrity(format!(
+                            "invalid health_results.required value {other}"
+                        )));
+                    }
+                };
+                let duration_ms = u64::try_from(row.9).map_err(|_| {
+                    StoreError::StorageIntegrity("health_results.duration_ms is negative".into())
+                })?;
+                Ok(HealthResult {
+                    id: parse_stored_uuid(&row.0, "health_results.id")?,
+                    run_id: parse_stored_uuid(&row.1, "health_results.run_id")?,
+                    installation_id: parse_stored_uuid(&row.2, "health_results.installation_id")?,
+                    check_definition_id: parse_stored_uuid(
+                        &row.3,
+                        "health_results.check_definition_id",
+                    )?,
+                    check_type: enum_from_wire(&row.4, "health_results.check_type")?,
+                    required,
+                    state: enum_from_wire(&row.6, "health_results.state")?,
+                    result_code: row.7,
+                    redacted_evidence: row.8,
+                    duration_ms,
+                    observed_at: parse_stored_timestamp(&row.10, "health_results.observed_at")?,
+                })
+            })
+            .collect()
+    }
+
+    pub fn installation_health(
+        &self,
+        installation_id: Uuid,
+        evaluated_at: DateTime<Utc>,
+    ) -> Result<InstallationHealthSnapshot, StoreError> {
+        let installation = self
+            .installations()?
+            .into_iter()
+            .find(|item| item.id == installation_id)
+            .ok_or(StoreError::NotFound)?;
+        let capability = self
+            .capabilities()?
+            .into_iter()
+            .find(|item| item.id == installation.capability_id)
+            .ok_or(StoreError::NotFound)?;
+        let definitions = self.health_check_definitions(installation_id)?;
+        let mut latest_results = HashMap::new();
+
+        for definition in &definitions {
+            let row = self
+                .connection
+                .query_row(
+                    "SELECT id, run_id, installation_id, check_definition_id, check_type, required,
+                            state, result_code, redacted_evidence, duration_ms, observed_at
+                     FROM health_results
+                     WHERE check_definition_id=?1
+                     ORDER BY observed_at DESC, id DESC
+                     LIMIT 1",
+                    [definition.id.to_string()],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, String>(7)?,
+                            row.get::<_, String>(8)?,
+                            row.get::<_, i64>(9)?,
+                            row.get::<_, String>(10)?,
+                        ))
+                    },
+                )
+                .optional()?;
+
+            if let Some(row) = row {
+                let required = match row.5 {
+                    0 => false,
+                    1 => true,
+                    other => {
+                        return Err(StoreError::StorageIntegrity(format!(
+                            "invalid health_results.required value {other}"
+                        )));
+                    }
+                };
+                let duration_ms = u64::try_from(row.9).map_err(|_| {
+                    StoreError::StorageIntegrity("health_results.duration_ms is negative".into())
+                })?;
+                latest_results.insert(
+                    definition.id,
+                    HealthResult {
+                        id: parse_stored_uuid(&row.0, "health_results.id")?,
+                        run_id: parse_stored_uuid(&row.1, "health_results.run_id")?,
+                        installation_id: parse_stored_uuid(
+                            &row.2,
+                            "health_results.installation_id",
+                        )?,
+                        check_definition_id: parse_stored_uuid(
+                            &row.3,
+                            "health_results.check_definition_id",
+                        )?,
+                        check_type: enum_from_wire(&row.4, "health_results.check_type")?,
+                        required,
+                        state: enum_from_wire(&row.6, "health_results.state")?,
+                        result_code: row.7,
+                        redacted_evidence: row.8,
+                        duration_ms,
+                        observed_at: parse_stored_timestamp(&row.10, "health_results.observed_at")?,
+                    },
+                );
+            }
+        }
+
+        let effective_health = aggregate_health(&definitions, &latest_results, evaluated_at);
+        let mut checks = Vec::with_capacity(definitions.len());
+        let mut last_checked_at = None;
+        let mut warning_count = 0_u64;
+        let mut failure_count = 0_u64;
+
+        for definition in definitions {
+            let latest_result = latest_results.get(&definition.id).cloned();
+            let stale = latest_result
+                .as_ref()
+                .map(|result| is_result_stale(&definition, result, evaluated_at))
+                .unwrap_or(false);
+
+            if let Some(result) = &latest_result {
+                last_checked_at = Some(
+                    last_checked_at
+                        .map(|current: DateTime<Utc>| current.max(result.observed_at))
+                        .unwrap_or(result.observed_at),
+                );
+                if definition.required && result.state == HealthState::Red {
+                    failure_count += 1;
+                }
+                if stale || (!definition.required && result.state != HealthState::Green) {
+                    warning_count += 1;
+                }
+            }
+
+            checks.push(HealthCheckSnapshot {
+                definition,
+                latest_result,
+                stale,
+            });
+        }
+
+        Ok(InstallationHealthSnapshot {
+            installation,
+            capability,
+            checks,
+            effective_health,
+            last_checked_at,
+            warning_count,
+            failure_count,
+        })
+    }
+
+    pub fn health_summary(&self, evaluated_at: DateTime<Utc>) -> Result<HealthSummary, StoreError> {
+        let capabilities = self.capabilities()?;
+        let installations = self.installations()?;
+        let pending = self.pending()?;
+
+        let capability_count = u64::try_from(capabilities.len()).map_err(|_| {
+            StoreError::StorageIntegrity("capability count exceeds u64 range".into())
+        })?;
+        let installation_count = u64::try_from(installations.len()).map_err(|_| {
+            StoreError::StorageIntegrity("installation count exceeds u64 range".into())
+        })?;
+        let pending_discovery_count = u64::try_from(pending.len()).map_err(|_| {
+            StoreError::StorageIntegrity("pending discovery count exceeds u64 range".into())
+        })?;
+
+        let mut green_count = 0_u64;
+        let mut yellow_count = 0_u64;
+        let mut red_count = 0_u64;
+        let mut grey_count = 0_u64;
+        let mut blue_count = 0_u64;
+
+        for installation in installations {
+            match self
+                .installation_health(installation.id, evaluated_at)?
+                .effective_health
+            {
+                HealthState::Green => green_count += 1,
+                HealthState::Yellow => yellow_count += 1,
+                HealthState::Red => red_count += 1,
+                HealthState::Grey => grey_count += 1,
+                HealthState::Blue => blue_count += 1,
+            }
+        }
+
+        Ok(HealthSummary {
+            capability_count,
+            installation_count,
+            pending_discovery_count,
+            green_count,
+            yellow_count,
+            red_count,
+            grey_count,
+            blue_count,
+        })
+    }
+
     pub fn inventory(&self) -> Result<Vec<Discovery>, StoreError> {
         let mut statement = self
             .connection
@@ -993,7 +1542,8 @@ mod tests {
     use super::*;
     use crate::{
         DEFAULT_HEALTH_TIMEOUT_MS, Evidence, HealthCheckHint, HealthCheckType,
-        HealthExpectedCondition, HealthState, HealthTarget,
+        HealthExpectedCondition, HealthResult, HealthRun, HealthRunScope, HealthRunState,
+        HealthState, HealthTarget,
     };
     use std::path::PathBuf;
 
@@ -1652,6 +2202,694 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    fn health_storage_import(
+        store: &mut Store,
+        name: &str,
+        fingerprint: &str,
+        stable_identity: Option<&str>,
+        hints: Vec<HealthCheckHint>,
+    ) -> InstallationInstance {
+        let mut discovery = Discovery::unknown(name, "health-storage-fixture", fingerprint.into());
+        discovery.canonical_identity = stable_identity.map(str::to_string);
+        discovery.health_hints = hints;
+        let discovery_id = discovery.id;
+        store.enqueue(&discovery).unwrap();
+        store.review(discovery.id, ReviewDecision::Import).unwrap();
+        store
+            .installations()
+            .unwrap()
+            .into_iter()
+            .find(|item| item.source_discovery_id == discovery_id)
+            .unwrap()
+    }
+
+    fn health_storage_hint(
+        check_type: HealthCheckType,
+        required: bool,
+        stale_after_seconds: Option<u64>,
+        path: &str,
+    ) -> HealthCheckHint {
+        HealthCheckHint {
+            check_type,
+            required,
+            expected_condition: HealthExpectedCondition::Exists,
+            timeout_ms: DEFAULT_HEALTH_TIMEOUT_MS,
+            stale_after_seconds,
+            target: HealthTarget::Path {
+                path: PathBuf::from(path),
+            },
+        }
+    }
+
+    fn health_storage_run(
+        id: Uuid,
+        state: HealthRunState,
+        started_at: DateTime<Utc>,
+        finished_at: Option<DateTime<Utc>>,
+        requested_installation_count: u64,
+        completed_installation_count: u64,
+    ) -> HealthRun {
+        HealthRun {
+            id,
+            scope: HealthRunScope::Installation,
+            state,
+            started_at,
+            finished_at,
+            requested_installation_count,
+            completed_installation_count,
+            revision: Uuid::new_v4().to_string(),
+        }
+    }
+
+    fn health_storage_result(
+        run_id: Uuid,
+        installation_id: Uuid,
+        definition: &HealthCheckDefinition,
+        state: HealthState,
+        result_code: &str,
+        observed_at: DateTime<Utc>,
+    ) -> HealthResult {
+        HealthResult {
+            id: Uuid::new_v4(),
+            run_id,
+            installation_id,
+            check_definition_id: definition.id,
+            check_type: definition.check_type.clone(),
+            required: definition.required,
+            state,
+            result_code: result_code.into(),
+            redacted_evidence: "fixture".into(),
+            duration_ms: 1,
+            observed_at,
+        }
+    }
+
+    #[test]
+    fn health_storage_results_are_append_only() {
+        let mut store = test_store();
+        let installation = health_storage_import(
+            &mut store,
+            "Append Only Tool",
+            "health-append-only",
+            None,
+            vec![health_storage_hint(
+                HealthCheckType::FileExists,
+                true,
+                None,
+                r"C:\Tools\append-only.exe",
+            )],
+        );
+        let definition = store
+            .health_check_definitions(installation.id)
+            .unwrap()
+            .remove(0);
+        let started = Utc::now();
+        let run = health_storage_run(Uuid::new_v4(), HealthRunState::Running, started, None, 1, 0);
+        store.begin_health_run(&run).unwrap();
+        let first = health_storage_result(
+            run.id,
+            installation.id,
+            &definition,
+            HealthState::Red,
+            "file_missing",
+            started + chrono::Duration::seconds(1),
+        );
+        let second = health_storage_result(
+            run.id,
+            installation.id,
+            &definition,
+            HealthState::Green,
+            "ok",
+            started + chrono::Duration::seconds(2),
+        );
+        store
+            .record_health_result_and_recompute(&first, first.observed_at)
+            .unwrap();
+        store
+            .record_health_result_and_recompute(&second, second.observed_at)
+            .unwrap();
+
+        let history = store
+            .health_results_for_installation(installation.id, 10)
+            .unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].id, second.id);
+        assert_eq!(history[1].id, first.id);
+    }
+
+    #[test]
+    fn health_storage_result_and_aggregate_commit_together() {
+        let mut store = test_store();
+        let installation = health_storage_import(
+            &mut store,
+            "Aggregate Tool",
+            "health-aggregate-together",
+            None,
+            vec![
+                health_storage_hint(
+                    HealthCheckType::FileExists,
+                    true,
+                    None,
+                    r"C:\Tools\aggregate-a.exe",
+                ),
+                health_storage_hint(
+                    HealthCheckType::PathExists,
+                    true,
+                    None,
+                    r"C:\Tools\aggregate-b",
+                ),
+            ],
+        );
+        let definitions = store.health_check_definitions(installation.id).unwrap();
+        let started = Utc::now();
+        let run = health_storage_run(Uuid::new_v4(), HealthRunState::Running, started, None, 1, 0);
+        store.begin_health_run(&run).unwrap();
+        let first = health_storage_result(
+            run.id,
+            installation.id,
+            &definitions[0],
+            HealthState::Green,
+            "ok",
+            started + chrono::Duration::seconds(1),
+        );
+        assert_eq!(
+            store
+                .record_health_result_and_recompute(&first, first.observed_at)
+                .unwrap(),
+            HealthState::Grey
+        );
+        assert_eq!(
+            store
+                .installations()
+                .unwrap()
+                .into_iter()
+                .find(|item| item.id == installation.id)
+                .unwrap()
+                .aggregate_health,
+            HealthState::Grey
+        );
+
+        let second = health_storage_result(
+            run.id,
+            installation.id,
+            &definitions[1],
+            HealthState::Green,
+            "ok",
+            started + chrono::Duration::seconds(2),
+        );
+        assert_eq!(
+            store
+                .record_health_result_and_recompute(&second, second.observed_at)
+                .unwrap(),
+            HealthState::Green
+        );
+        assert_eq!(
+            store
+                .installations()
+                .unwrap()
+                .into_iter()
+                .find(|item| item.id == installation.id)
+                .unwrap()
+                .aggregate_health,
+            HealthState::Green
+        );
+    }
+
+    #[test]
+    fn health_storage_required_failure_persists_red() {
+        let mut store = test_store();
+        let installation = health_storage_import(
+            &mut store,
+            "Required Failure Tool",
+            "health-required-red",
+            None,
+            vec![health_storage_hint(
+                HealthCheckType::FileExists,
+                true,
+                None,
+                r"C:\Tools\required-red.exe",
+            )],
+        );
+        let definition = store
+            .health_check_definitions(installation.id)
+            .unwrap()
+            .remove(0);
+        let started = Utc::now();
+        let run = health_storage_run(Uuid::new_v4(), HealthRunState::Running, started, None, 1, 0);
+        store.begin_health_run(&run).unwrap();
+        let result = health_storage_result(
+            run.id,
+            installation.id,
+            &definition,
+            HealthState::Red,
+            "file_missing",
+            started + chrono::Duration::seconds(1),
+        );
+        store
+            .record_health_result_and_recompute(&result, result.observed_at)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .installations()
+                .unwrap()
+                .into_iter()
+                .find(|item| item.id == installation.id)
+                .unwrap()
+                .aggregate_health,
+            HealthState::Red
+        );
+    }
+
+    #[test]
+    fn health_storage_optional_failure_persists_yellow() {
+        let mut store = test_store();
+        let installation = health_storage_import(
+            &mut store,
+            "Optional Failure Tool",
+            "health-optional-yellow",
+            None,
+            vec![
+                health_storage_hint(
+                    HealthCheckType::FileExists,
+                    true,
+                    None,
+                    r"C:\Tools\required-green.exe",
+                ),
+                health_storage_hint(
+                    HealthCheckType::PathExists,
+                    false,
+                    None,
+                    r"C:\Tools\optional-red",
+                ),
+            ],
+        );
+        let definitions = store.health_check_definitions(installation.id).unwrap();
+        let started = Utc::now();
+        let run = health_storage_run(Uuid::new_v4(), HealthRunState::Running, started, None, 1, 0);
+        store.begin_health_run(&run).unwrap();
+        let required = definitions.iter().find(|item| item.required).unwrap();
+        let optional = definitions.iter().find(|item| !item.required).unwrap();
+        let required_result = health_storage_result(
+            run.id,
+            installation.id,
+            required,
+            HealthState::Green,
+            "ok",
+            started + chrono::Duration::seconds(1),
+        );
+        store
+            .record_health_result_and_recompute(&required_result, required_result.observed_at)
+            .unwrap();
+        let optional_result = health_storage_result(
+            run.id,
+            installation.id,
+            optional,
+            HealthState::Red,
+            "path_missing",
+            started + chrono::Duration::seconds(2),
+        );
+        assert_eq!(
+            store
+                .record_health_result_and_recompute(&optional_result, optional_result.observed_at)
+                .unwrap(),
+            HealthState::Yellow
+        );
+        assert_eq!(
+            store
+                .installations()
+                .unwrap()
+                .into_iter()
+                .find(|item| item.id == installation.id)
+                .unwrap()
+                .aggregate_health,
+            HealthState::Yellow
+        );
+    }
+
+    #[test]
+    fn health_storage_cancelled_run_preserves_prior_result() {
+        let mut store = test_store();
+        let installation = health_storage_import(
+            &mut store,
+            "Cancelled Run Tool",
+            "health-cancelled-preserves",
+            None,
+            vec![health_storage_hint(
+                HealthCheckType::FileExists,
+                true,
+                None,
+                r"C:\Tools\cancelled-preserves.exe",
+            )],
+        );
+        let definition = store
+            .health_check_definitions(installation.id)
+            .unwrap()
+            .remove(0);
+        let started = Utc::now();
+        let prior_run =
+            health_storage_run(Uuid::new_v4(), HealthRunState::Running, started, None, 1, 0);
+        store.begin_health_run(&prior_run).unwrap();
+        let prior_result = health_storage_result(
+            prior_run.id,
+            installation.id,
+            &definition,
+            HealthState::Green,
+            "ok",
+            started + chrono::Duration::seconds(1),
+        );
+        store
+            .record_health_result_and_recompute(&prior_result, prior_result.observed_at)
+            .unwrap();
+
+        let later_started = started + chrono::Duration::seconds(10);
+        let later_run = health_storage_run(
+            Uuid::new_v4(),
+            HealthRunState::Running,
+            later_started,
+            None,
+            1,
+            0,
+        );
+        store.begin_health_run(&later_run).unwrap();
+        let cancelled = health_storage_run(
+            later_run.id,
+            HealthRunState::Cancelled,
+            later_started,
+            Some(later_started + chrono::Duration::seconds(1)),
+            1,
+            0,
+        );
+        store.update_health_run(&cancelled).unwrap();
+
+        assert_eq!(
+            store.health_run(later_run.id).unwrap().state,
+            HealthRunState::Cancelled
+        );
+        let history = store
+            .health_results_for_installation(installation.id, 10)
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id, prior_result.id);
+        assert_eq!(history[0].state, HealthState::Green);
+    }
+
+    #[test]
+    fn health_storage_timeout_can_persist_grey() {
+        let mut store = test_store();
+        let installation = health_storage_import(
+            &mut store,
+            "Timeout Tool",
+            "health-timeout-grey",
+            None,
+            vec![health_storage_hint(
+                HealthCheckType::FileExists,
+                true,
+                None,
+                r"C:\Tools\timeout.exe",
+            )],
+        );
+        let definition = store
+            .health_check_definitions(installation.id)
+            .unwrap()
+            .remove(0);
+        let started = Utc::now();
+        let run = health_storage_run(Uuid::new_v4(), HealthRunState::Running, started, None, 1, 0);
+        store.begin_health_run(&run).unwrap();
+        let timeout = health_storage_result(
+            run.id,
+            installation.id,
+            &definition,
+            HealthState::Grey,
+            "health_check_timeout",
+            started + chrono::Duration::seconds(1),
+        );
+        assert_eq!(
+            store
+                .record_health_result_and_recompute(&timeout, timeout.observed_at)
+                .unwrap(),
+            HealthState::Grey
+        );
+        let history = store
+            .health_results_for_installation(installation.id, 10)
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].result_code, "health_check_timeout");
+        assert_eq!(history[0].state, HealthState::Grey);
+    }
+
+    #[test]
+    fn health_storage_projection_recomputes_staleness_without_writing() {
+        let mut store = test_store();
+        let installation = health_storage_import(
+            &mut store,
+            "TTL Tool",
+            "health-ttl-projection",
+            None,
+            vec![health_storage_hint(
+                HealthCheckType::FileExists,
+                true,
+                Some(10),
+                r"C:\Tools\ttl.exe",
+            )],
+        );
+        let definition = store
+            .health_check_definitions(installation.id)
+            .unwrap()
+            .remove(0);
+        let started = Utc::now();
+        let run = health_storage_run(Uuid::new_v4(), HealthRunState::Running, started, None, 1, 0);
+        store.begin_health_run(&run).unwrap();
+        let observed = started + chrono::Duration::seconds(1);
+        let result = health_storage_result(
+            run.id,
+            installation.id,
+            &definition,
+            HealthState::Green,
+            "ok",
+            observed,
+        );
+        store
+            .record_health_result_and_recompute(&result, observed)
+            .unwrap();
+
+        let immediate = store
+            .installation_health(installation.id, observed + chrono::Duration::seconds(5))
+            .unwrap();
+        assert_eq!(immediate.effective_health, HealthState::Green);
+        assert!(!immediate.checks[0].stale);
+
+        let later = store
+            .installation_health(installation.id, observed + chrono::Duration::seconds(20))
+            .unwrap();
+        assert_eq!(later.effective_health, HealthState::Yellow);
+        assert!(later.checks[0].stale);
+        assert_eq!(
+            store
+                .installations()
+                .unwrap()
+                .into_iter()
+                .find(|item| item.id == installation.id)
+                .unwrap()
+                .aggregate_health,
+            HealthState::Green
+        );
+    }
+
+    #[test]
+    fn health_storage_summary_counts_installations_not_capabilities() {
+        let mut store = test_store();
+        let first = health_storage_import(
+            &mut store,
+            "Shared Capability",
+            "health-summary-first",
+            Some("windows-path:c:\\tools\\shared-health.exe"),
+            vec![health_storage_hint(
+                HealthCheckType::FileExists,
+                true,
+                None,
+                r"C:\Tools\shared-health.exe",
+            )],
+        );
+        let second = health_storage_import(
+            &mut store,
+            "Shared Capability CLI",
+            "health-summary-second",
+            Some("windows-path:c:\\tools\\shared-health.exe"),
+            vec![health_storage_hint(
+                HealthCheckType::FileExists,
+                true,
+                None,
+                r"C:\Tools\shared-health.exe",
+            )],
+        );
+        let pending =
+            Discovery::unknown("Pending Tool", "fixture", "health-summary-pending".into());
+        store.enqueue(&pending).unwrap();
+        let started = Utc::now();
+
+        for (installation, state, code, offset) in [
+            (first, HealthState::Green, "ok", 1_i64),
+            (second, HealthState::Red, "file_missing", 2_i64),
+        ] {
+            let definition = store
+                .health_check_definitions(installation.id)
+                .unwrap()
+                .remove(0);
+            let run =
+                health_storage_run(Uuid::new_v4(), HealthRunState::Running, started, None, 1, 0);
+            store.begin_health_run(&run).unwrap();
+            let result = health_storage_result(
+                run.id,
+                installation.id,
+                &definition,
+                state,
+                code,
+                started + chrono::Duration::seconds(offset),
+            );
+            store
+                .record_health_result_and_recompute(&result, result.observed_at)
+                .unwrap();
+        }
+
+        let summary = store
+            .health_summary(started + chrono::Duration::seconds(3))
+            .unwrap();
+        assert_eq!(summary.capability_count, 1);
+        assert_eq!(summary.installation_count, 2);
+        assert_eq!(summary.pending_discovery_count, 1);
+        assert_eq!(summary.green_count, 1);
+        assert_eq!(summary.red_count, 1);
+        assert_eq!(
+            summary.green_count
+                + summary.yellow_count
+                + summary.red_count
+                + summary.grey_count
+                + summary.blue_count,
+            2
+        );
+    }
+
+    #[test]
+    fn health_storage_last_checked_and_counts_are_current_projection() {
+        let mut store = test_store();
+        let installation = health_storage_import(
+            &mut store,
+            "Projection Counts Tool",
+            "health-current-counts",
+            None,
+            vec![
+                health_storage_hint(
+                    HealthCheckType::FileExists,
+                    true,
+                    None,
+                    r"C:\Tools\projection-required.exe",
+                ),
+                health_storage_hint(
+                    HealthCheckType::PathExists,
+                    false,
+                    None,
+                    r"C:\Tools\projection-optional",
+                ),
+            ],
+        );
+        let definitions = store.health_check_definitions(installation.id).unwrap();
+        let required = definitions.iter().find(|item| item.required).unwrap();
+        let optional = definitions.iter().find(|item| !item.required).unwrap();
+        let started = Utc::now();
+        let run = health_storage_run(Uuid::new_v4(), HealthRunState::Running, started, None, 1, 0);
+        store.begin_health_run(&run).unwrap();
+
+        let historical_red = health_storage_result(
+            run.id,
+            installation.id,
+            required,
+            HealthState::Red,
+            "file_missing",
+            started + chrono::Duration::seconds(1),
+        );
+        store
+            .record_health_result_and_recompute(&historical_red, historical_red.observed_at)
+            .unwrap();
+        let current_required = health_storage_result(
+            run.id,
+            installation.id,
+            required,
+            HealthState::Green,
+            "ok",
+            started + chrono::Duration::seconds(2),
+        );
+        store
+            .record_health_result_and_recompute(&current_required, current_required.observed_at)
+            .unwrap();
+        let current_optional = health_storage_result(
+            run.id,
+            installation.id,
+            optional,
+            HealthState::Red,
+            "path_missing",
+            started + chrono::Duration::seconds(3),
+        );
+        store
+            .record_health_result_and_recompute(&current_optional, current_optional.observed_at)
+            .unwrap();
+
+        let snapshot = store
+            .installation_health(installation.id, started + chrono::Duration::seconds(4))
+            .unwrap();
+        assert_eq!(snapshot.last_checked_at, Some(current_optional.observed_at));
+        assert_eq!(snapshot.failure_count, 0);
+        assert_eq!(snapshot.warning_count, 1);
+        assert_eq!(snapshot.effective_health, HealthState::Yellow);
+    }
+
+    #[test]
+    fn health_storage_history_limit_is_bounded() {
+        let mut store = test_store();
+        let installation = health_storage_import(
+            &mut store,
+            "Bounded History Tool",
+            "health-history-bounded",
+            None,
+            vec![health_storage_hint(
+                HealthCheckType::FileExists,
+                true,
+                None,
+                r"C:\Tools\history.exe",
+            )],
+        );
+        let definition = store
+            .health_check_definitions(installation.id)
+            .unwrap()
+            .remove(0);
+        let started = Utc::now();
+        let run = health_storage_run(Uuid::new_v4(), HealthRunState::Running, started, None, 1, 0);
+        store.begin_health_run(&run).unwrap();
+        let mut newest_id = None;
+        for offset in 0..125_i64 {
+            let result = health_storage_result(
+                run.id,
+                installation.id,
+                &definition,
+                HealthState::Green,
+                "ok",
+                started + chrono::Duration::seconds(offset),
+            );
+            if offset == 124 {
+                newest_id = Some(result.id);
+            }
+            store
+                .record_health_result_and_recompute(&result, result.observed_at)
+                .unwrap();
+        }
+
+        let history = store
+            .health_results_for_installation(installation.id, 1_000)
+            .unwrap();
+        assert_eq!(history.len(), 100);
+        assert_eq!(history[0].id, newest_id.unwrap());
     }
 
     #[test]
