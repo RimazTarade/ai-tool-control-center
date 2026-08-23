@@ -23,3 +23,9 @@ pub use health::{
     HealthProbeIo, HealthProbeOutcome, MAX_CONFIG_BYTES, NativeHealthProbeIo, aggregate_health,
     execute_health_check, is_result_stale,
 };
+pub use health_control::{
+    HEALTH_INSTALLATION_CONCURRENCY, HealthCheckExecutor, HealthEvent, HealthEventSink,
+    InstallationHealthWork, NativeHealthCheckExecutor, run_health_work,
+};
+
+pub mod health_control;
