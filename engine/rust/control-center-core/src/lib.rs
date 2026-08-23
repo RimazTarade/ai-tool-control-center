@@ -17,3 +17,9 @@ pub use model::*;
 pub use scan::{PythonRootError, QuickScanContext, quick_scan};
 pub use scan_control::{PauseGate, ScanEvent, ScanEventSink, ScanLifecycleState, ScanScope};
 pub use storage::{ReviewDecision, Store, StoreError};
+
+pub mod health;
+pub use health::{
+    HealthProbeIo, HealthProbeOutcome, MAX_CONFIG_BYTES, NativeHealthProbeIo, aggregate_health,
+    execute_health_check, is_result_stale,
+};
