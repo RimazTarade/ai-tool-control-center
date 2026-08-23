@@ -1,8 +1,9 @@
 use crate::{
-    CanonicalCapability, Discovery, HealthCheckDefinition, HealthCheckSnapshot, HealthResult,
-    HealthRun, HealthRunScope, HealthRunState, HealthState, HealthSummary, HealthTarget,
-    InstallationHealthSnapshot, InstallationInstance, ReviewState, ScanLifecycleState, ScanScope,
-    aggregate_health, is_result_stale,
+    CanonicalCapability, DependencyKind, DependencyOwner, DependencyRelationship, Discovery,
+    HealthCheckDefinition, HealthCheckSnapshot, HealthResult, HealthRun, HealthRunScope,
+    HealthRunState, HealthState, HealthSummary, HealthTarget, InstallationHealthSnapshot,
+    InstallationInstance, ReviewState, ScanLifecycleState, ScanScope, aggregate_health,
+    is_result_stale,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::OptionalExtension;
@@ -28,6 +29,14 @@ pub enum StoreError {
     StorageIntegrity(String),
     #[error("discovery not found")]
     NotFound,
+    #[error("invalid dependency relationship")]
+    DependencyInvalid,
+    #[error("dependency relationship already exists")]
+    DependencyDuplicate,
+    #[error("dependency relationship cannot reference itself")]
+    DependencySelfReference,
+    #[error("dependency relationship is not user-owned")]
+    DependencyNotUserOwned,
     #[error("finish_scan requires a terminal state (Cancelled, Completed, or Failed), got {0:?}")]
     NonTerminalFinishState(ScanLifecycleState),
 }
@@ -255,8 +264,166 @@ impl Store {
                     ],
                 )?;
             }
+            materialize_scanner_dependency_proposals(&transaction, &discovery, capability_id)?;
         }
         transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn dependencies(&self) -> Result<Vec<DependencyRelationship>, StoreError> {
+        let rows = {
+            let mut statement = self.connection.prepare(
+                "SELECT id, source_capability_id, target_capability_id, kind, owner, provenance,
+                        evidence_summary, created_at, revision
+                 FROM dependency_relationships
+                 ORDER BY created_at ASC, id ASC",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(DependencyRelationship {
+                    id: parse_stored_uuid(&row.0, "dependency_relationships.id")?,
+                    source_capability_id: parse_stored_uuid(
+                        &row.1,
+                        "dependency_relationships.source_capability_id",
+                    )?,
+                    target_capability_id: parse_stored_uuid(
+                        &row.2,
+                        "dependency_relationships.target_capability_id",
+                    )?,
+                    kind: enum_from_wire(&row.3, "dependency_relationships.kind")?,
+                    owner: enum_from_wire(&row.4, "dependency_relationships.owner")?,
+                    provenance: row.5,
+                    evidence_summary: row.6,
+                    created_at: parse_stored_timestamp(
+                        &row.7,
+                        "dependency_relationships.created_at",
+                    )?,
+                    revision: row.8,
+                })
+            })
+            .collect()
+    }
+
+    pub fn create_user_dependency(
+        &mut self,
+        source_capability_id: Uuid,
+        kind: DependencyKind,
+        target_capability_id: Uuid,
+    ) -> Result<DependencyRelationship, StoreError> {
+        if source_capability_id == target_capability_id {
+            return Err(StoreError::DependencySelfReference);
+        }
+
+        let source_exists: i64 = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM canonical_capabilities WHERE id=?1)",
+            [source_capability_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let target_exists: i64 = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM canonical_capabilities WHERE id=?1)",
+            [target_capability_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if source_exists == 0 || target_exists == 0 {
+            return Err(StoreError::DependencyInvalid);
+        }
+
+        let kind_text = enum_wire_value(&kind)?;
+        let duplicate_exists: i64 = self.connection.query_row(
+            "SELECT EXISTS(
+             SELECT 1 FROM dependency_relationships
+             WHERE source_capability_id=?1 AND target_capability_id=?2 AND kind=?3
+             )",
+            params![
+                source_capability_id.to_string(),
+                target_capability_id.to_string(),
+                &kind_text,
+            ],
+            |row| row.get(0),
+        )?;
+        if duplicate_exists != 0 {
+            return Err(StoreError::DependencyDuplicate);
+        }
+
+        let relationship = DependencyRelationship {
+            id: Uuid::new_v4(),
+            source_capability_id,
+            target_capability_id,
+            kind,
+            owner: DependencyOwner::User,
+            provenance: "user".into(),
+            evidence_summary: String::new(),
+            created_at: Utc::now(),
+            revision: Uuid::new_v4().to_string(),
+        };
+
+        let insert = self.connection.execute(
+            "INSERT INTO dependency_relationships
+             (id, source_capability_id, target_capability_id, kind, owner, provenance,
+              evidence_summary, created_at, revision)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                relationship.id.to_string(),
+                relationship.source_capability_id.to_string(),
+                relationship.target_capability_id.to_string(),
+                enum_wire_value(&relationship.kind)?,
+                enum_wire_value(&relationship.owner)?,
+                &relationship.provenance,
+                &relationship.evidence_summary,
+                relationship.created_at.to_rfc3339(),
+                &relationship.revision,
+            ],
+        );
+        match insert {
+            Ok(_) => Ok(relationship),
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                Err(StoreError::DependencyDuplicate)
+            }
+            Err(error) => Err(StoreError::Database(error)),
+        }
+    }
+
+    pub fn delete_user_dependency(&mut self, relationship_id: Uuid) -> Result<(), StoreError> {
+        let owner_text = self
+            .connection
+            .query_row(
+                "SELECT owner FROM dependency_relationships WHERE id=?1",
+                [relationship_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)?;
+        let owner: DependencyOwner = enum_from_wire(&owner_text, "dependency_relationships.owner")?;
+        if owner != DependencyOwner::User {
+            return Err(StoreError::DependencyNotUserOwned);
+        }
+
+        self.connection.execute(
+            "DELETE FROM dependency_relationships WHERE id=?1 AND owner=?2",
+            params![
+                relationship_id.to_string(),
+                enum_wire_value(&DependencyOwner::User)?,
+            ],
+        )?;
         Ok(())
     }
 
@@ -1193,6 +1360,83 @@ impl Store {
 }
 
 const M7_MIGRATION_ID: &str = "m7_health_dependency_systems_v1";
+
+fn materialize_scanner_dependency_proposals(
+    transaction: &rusqlite::Transaction<'_>,
+    discovery: &Discovery,
+    source_capability_id: Uuid,
+) -> Result<(), StoreError> {
+    for proposal in &discovery.dependency_proposals {
+        match proposal.kind {
+            DependencyKind::Requires | DependencyKind::DependsOn => {}
+        }
+
+        let target_identity = proposal.target_stable_identity.trim();
+        if target_identity.is_empty() {
+            continue;
+        }
+
+        let target_rows = {
+            let mut statement = transaction.prepare(
+                "SELECT id FROM canonical_capabilities WHERE stable_identity=?1 ORDER BY id ASC",
+            )?;
+            statement
+                .query_map([target_identity], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        let target_capability_id = match target_rows.as_slice() {
+            [] => continue,
+            [only] => parse_stored_uuid(only, "canonical_capabilities.id")?,
+            _ => {
+                return Err(StoreError::StorageIntegrity(
+                    "multiple canonical capabilities resolved the same stable identity".into(),
+                ));
+            }
+        };
+
+        if source_capability_id == target_capability_id {
+            continue;
+        }
+
+        let kind_text = enum_wire_value(&proposal.kind)?;
+        let duplicate_exists: i64 = transaction.query_row(
+            "SELECT EXISTS(
+             SELECT 1 FROM dependency_relationships
+             WHERE source_capability_id=?1 AND target_capability_id=?2 AND kind=?3
+             )",
+            params![
+                source_capability_id.to_string(),
+                target_capability_id.to_string(),
+                &kind_text,
+            ],
+            |row| row.get(0),
+        )?;
+        if duplicate_exists != 0 {
+            continue;
+        }
+
+        transaction.execute(
+            "INSERT INTO dependency_relationships
+             (id, source_capability_id, target_capability_id, kind, owner, provenance,
+              evidence_summary, created_at, revision)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                Uuid::new_v4().to_string(),
+                source_capability_id.to_string(),
+                target_capability_id.to_string(),
+                kind_text,
+                enum_wire_value(&DependencyOwner::Scanner)?,
+                format!("scanner:{}:{}", discovery.source_scanner, discovery.id),
+                crate::redaction::redact(&proposal.evidence_summary),
+                Utc::now().to_rfc3339(),
+                Uuid::new_v4().to_string(),
+            ],
+        )?;
+    }
+
+    Ok(())
+}
 
 fn enum_wire_value<T: serde::Serialize>(value: &T) -> Result<String, StoreError> {
     match serde_json::to_value(value)? {
@@ -2909,5 +3153,428 @@ mod tests {
         assert!(store.capabilities().unwrap().is_empty());
         assert!(store.installations().unwrap().is_empty());
         assert!(store.inventory().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod dependency_storage_tests {
+    use super::*;
+    use crate::{DependencyKind, DependencyOwner, DependencyProposal};
+
+    fn import_capability(
+        store: &mut Store,
+        name: &str,
+        fingerprint: &str,
+        stable_identity: &str,
+    ) -> CanonicalCapability {
+        let mut discovery = Discovery::unknown(name, "dependency-fixture", fingerprint.into());
+        discovery.canonical_identity = Some(stable_identity.to_string());
+        store.enqueue(&discovery).unwrap();
+        store.review(discovery.id, ReviewDecision::Import).unwrap();
+        store
+            .capabilities()
+            .unwrap()
+            .into_iter()
+            .find(|item| item.stable_identity.as_deref() == Some(stable_identity))
+            .unwrap()
+    }
+
+    fn proposing_discovery(
+        name: &str,
+        scanner: &str,
+        fingerprint: &str,
+        source_identity: &str,
+        kind: DependencyKind,
+        target_identity: &str,
+        evidence_summary: &str,
+    ) -> Discovery {
+        let mut discovery = Discovery::unknown(name, scanner, fingerprint.into());
+        discovery.canonical_identity = Some(source_identity.to_string());
+        discovery.dependency_proposals.push(DependencyProposal {
+            kind,
+            target_stable_identity: target_identity.to_string(),
+            evidence_summary: evidence_summary.to_string(),
+        });
+        discovery
+    }
+
+    #[test]
+    fn dependency_storage_user_requires_persists() {
+        let mut store = Store::in_memory().unwrap();
+        let source = import_capability(
+            &mut store,
+            "Source",
+            "dep-user-requires-source",
+            "dep:source-requires",
+        );
+        let target = import_capability(
+            &mut store,
+            "Target",
+            "dep-user-requires-target",
+            "dep:target-requires",
+        );
+
+        let relationship = store
+            .create_user_dependency(source.id, DependencyKind::Requires, target.id)
+            .unwrap();
+
+        assert_eq!(relationship.kind, DependencyKind::Requires);
+        assert_eq!(relationship.owner, DependencyOwner::User);
+        assert_eq!(relationship.provenance, "user");
+        assert!(relationship.evidence_summary.is_empty());
+        assert!(!relationship.revision.is_empty());
+        assert_eq!(store.dependencies().unwrap(), vec![relationship]);
+    }
+
+    #[test]
+    fn dependency_storage_user_depends_on_persists() {
+        let mut store = Store::in_memory().unwrap();
+        let source = import_capability(
+            &mut store,
+            "Source",
+            "dep-user-depends-source",
+            "dep:source-depends",
+        );
+        let target = import_capability(
+            &mut store,
+            "Target",
+            "dep-user-depends-target",
+            "dep:target-depends",
+        );
+
+        let relationship = store
+            .create_user_dependency(source.id, DependencyKind::DependsOn, target.id)
+            .unwrap();
+
+        assert_eq!(relationship.kind, DependencyKind::DependsOn);
+        assert_eq!(relationship.owner, DependencyOwner::User);
+        assert_eq!(relationship.provenance, "user");
+        assert_eq!(store.dependencies().unwrap(), vec![relationship]);
+    }
+
+    #[test]
+    fn dependency_storage_rejects_self_reference() {
+        let mut store = Store::in_memory().unwrap();
+        let capability = import_capability(&mut store, "Self", "dep-self", "dep:self");
+
+        let error = store
+            .create_user_dependency(capability.id, DependencyKind::Requires, capability.id)
+            .unwrap_err();
+
+        assert!(matches!(error, StoreError::DependencySelfReference));
+        assert!(store.dependencies().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dependency_storage_rejects_logical_duplicate() {
+        let mut store = Store::in_memory().unwrap();
+        let source = import_capability(
+            &mut store,
+            "Source",
+            "dep-duplicate-source",
+            "dep:duplicate-source",
+        );
+        let target = import_capability(
+            &mut store,
+            "Target",
+            "dep-duplicate-target",
+            "dep:duplicate-target",
+        );
+        store
+            .create_user_dependency(source.id, DependencyKind::Requires, target.id)
+            .unwrap();
+
+        let error = store
+            .create_user_dependency(source.id, DependencyKind::Requires, target.id)
+            .unwrap_err();
+
+        assert!(matches!(error, StoreError::DependencyDuplicate));
+        assert_eq!(store.dependencies().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn dependency_storage_missing_source_or_target_is_invalid() {
+        let mut store = Store::in_memory().unwrap();
+        let capability = import_capability(
+            &mut store,
+            "Existing",
+            "dep-missing-existing",
+            "dep:existing",
+        );
+
+        let missing_target = store
+            .create_user_dependency(capability.id, DependencyKind::Requires, Uuid::new_v4())
+            .unwrap_err();
+        assert!(matches!(missing_target, StoreError::DependencyInvalid));
+
+        let missing_source = store
+            .create_user_dependency(Uuid::new_v4(), DependencyKind::Requires, capability.id)
+            .unwrap_err();
+        assert!(matches!(missing_source, StoreError::DependencyInvalid));
+        assert!(store.dependencies().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dependency_storage_user_can_delete_user_owned() {
+        let mut store = Store::in_memory().unwrap();
+        let source = import_capability(
+            &mut store,
+            "Source",
+            "dep-delete-source",
+            "dep:delete-source",
+        );
+        let target = import_capability(
+            &mut store,
+            "Target",
+            "dep-delete-target",
+            "dep:delete-target",
+        );
+        let relationship = store
+            .create_user_dependency(source.id, DependencyKind::Requires, target.id)
+            .unwrap();
+
+        store.delete_user_dependency(relationship.id).unwrap();
+
+        assert!(store.dependencies().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dependency_storage_user_cannot_delete_scanner_owned() {
+        let mut store = Store::in_memory().unwrap();
+        import_capability(
+            &mut store,
+            "Target",
+            "dep-scanner-delete-target",
+            "dep:scanner-delete-target",
+        );
+        let discovery = proposing_discovery(
+            "Scanner Source",
+            "scanner-a",
+            "dep-scanner-delete-source",
+            "dep:scanner-delete-source",
+            DependencyKind::Requires,
+            "dep:scanner-delete-target",
+            "scanner evidence",
+        );
+        store.enqueue(&discovery).unwrap();
+        store.review(discovery.id, ReviewDecision::Import).unwrap();
+        let relationship = store.dependencies().unwrap().remove(0);
+        assert_eq!(relationship.owner, DependencyOwner::Scanner);
+
+        let error = store.delete_user_dependency(relationship.id).unwrap_err();
+
+        assert!(matches!(error, StoreError::DependencyNotUserOwned));
+        assert_eq!(store.dependencies().unwrap(), vec![relationship]);
+    }
+
+    #[test]
+    fn dependency_storage_scanner_proposal_materializes_only_on_import() {
+        let mut store = Store::in_memory().unwrap();
+        let target = import_capability(
+            &mut store,
+            "Target",
+            "dep-review-gate-target",
+            "dep:review-gate-target",
+        );
+        let discovery = proposing_discovery(
+            "Scanner Source",
+            "scanner-a",
+            "dep-review-gate-source",
+            "dep:review-gate-source",
+            DependencyKind::Requires,
+            "dep:review-gate-target",
+            "reviewed scanner evidence",
+        );
+        let discovery_id = discovery.id;
+        store.enqueue(&discovery).unwrap();
+
+        assert!(store.dependencies().unwrap().is_empty());
+
+        store.review(discovery.id, ReviewDecision::Import).unwrap();
+        let relationships = store.dependencies().unwrap();
+        assert_eq!(relationships.len(), 1);
+        assert_eq!(relationships[0].target_capability_id, target.id);
+        assert_eq!(relationships[0].kind, DependencyKind::Requires);
+        assert_eq!(relationships[0].owner, DependencyOwner::Scanner);
+        assert_eq!(
+            relationships[0].provenance,
+            format!("scanner:scanner-a:{discovery_id}")
+        );
+    }
+
+    #[test]
+    fn dependency_storage_scanner_proposal_unresolved_target_creates_nothing() {
+        let mut store = Store::in_memory().unwrap();
+        let discovery = proposing_discovery(
+            "Scanner Source",
+            "scanner-a",
+            "dep-unresolved-source",
+            "dep:unresolved-source",
+            DependencyKind::DependsOn,
+            "dep:does-not-exist",
+            "scanner evidence",
+        );
+        store.enqueue(&discovery).unwrap();
+        store.review(discovery.id, ReviewDecision::Import).unwrap();
+
+        assert!(store.dependencies().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dependency_storage_scanner_proposal_rejects_self_reference() {
+        let mut store = Store::in_memory().unwrap();
+        let discovery = proposing_discovery(
+            "Scanner Self",
+            "scanner-a",
+            "dep-scanner-self",
+            "dep:scanner-self",
+            DependencyKind::Requires,
+            "dep:scanner-self",
+            "scanner evidence",
+        );
+        store.enqueue(&discovery).unwrap();
+        store.review(discovery.id, ReviewDecision::Import).unwrap();
+
+        assert!(store.dependencies().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dependency_storage_scanner_proposal_does_not_replace_existing_user_relationship() {
+        let mut store = Store::in_memory().unwrap();
+        let source = import_capability(
+            &mut store,
+            "Source",
+            "dep-preserve-owner-source",
+            "dep:preserve-owner-source",
+        );
+        let target = import_capability(
+            &mut store,
+            "Target",
+            "dep-preserve-owner-target",
+            "dep:preserve-owner-target",
+        );
+        let user_relationship = store
+            .create_user_dependency(source.id, DependencyKind::Requires, target.id)
+            .unwrap();
+        let discovery = proposing_discovery(
+            "Source Again",
+            "scanner-b",
+            "dep-preserve-owner-scanner",
+            "dep:preserve-owner-source",
+            DependencyKind::Requires,
+            "dep:preserve-owner-target",
+            "new scanner evidence",
+        );
+        store.enqueue(&discovery).unwrap();
+        store.review(discovery.id, ReviewDecision::Import).unwrap();
+
+        let relationships = store.dependencies().unwrap();
+        assert_eq!(relationships.len(), 1);
+        assert_eq!(relationships[0], user_relationship);
+        assert_eq!(relationships[0].owner, DependencyOwner::User);
+    }
+
+    #[test]
+    fn dependency_storage_scanner_activity_preserves_unrelated_user_relationships() {
+        let mut store = Store::in_memory().unwrap();
+        let first = import_capability(
+            &mut store,
+            "First",
+            "dep-preserve-first",
+            "dep:preserve-first",
+        );
+        let second = import_capability(
+            &mut store,
+            "Second",
+            "dep-preserve-second",
+            "dep:preserve-second",
+        );
+        let third = import_capability(
+            &mut store,
+            "Third",
+            "dep-preserve-third",
+            "dep:preserve-third",
+        );
+        let first_user = store
+            .create_user_dependency(first.id, DependencyKind::Requires, second.id)
+            .unwrap();
+        let second_user = store
+            .create_user_dependency(second.id, DependencyKind::DependsOn, third.id)
+            .unwrap();
+
+        let discovery = proposing_discovery(
+            "Scanner Source",
+            "scanner-c",
+            "dep-preserve-scanner-source",
+            "dep:preserve-scanner-source",
+            DependencyKind::Requires,
+            "dep:preserve-third",
+            "scanner evidence",
+        );
+        store.enqueue(&discovery).unwrap();
+        store.review(discovery.id, ReviewDecision::Import).unwrap();
+
+        let relationships = store.dependencies().unwrap();
+        assert!(relationships.contains(&first_user));
+        assert!(relationships.contains(&second_user));
+        let preserved_first = relationships
+            .iter()
+            .find(|item| item.id == first_user.id)
+            .unwrap();
+        let preserved_second = relationships
+            .iter()
+            .find(|item| item.id == second_user.id)
+            .unwrap();
+        assert_eq!(preserved_first.owner, first_user.owner);
+        assert_eq!(preserved_first.kind, first_user.kind);
+        assert_eq!(
+            preserved_first.source_capability_id,
+            first_user.source_capability_id
+        );
+        assert_eq!(
+            preserved_first.target_capability_id,
+            first_user.target_capability_id
+        );
+        assert_eq!(preserved_first.revision, first_user.revision);
+        assert_eq!(preserved_second.owner, second_user.owner);
+        assert_eq!(preserved_second.kind, second_user.kind);
+        assert_eq!(
+            preserved_second.source_capability_id,
+            second_user.source_capability_id
+        );
+        assert_eq!(
+            preserved_second.target_capability_id,
+            second_user.target_capability_id
+        );
+        assert_eq!(preserved_second.revision, second_user.revision);
+    }
+
+    #[test]
+    fn dependency_storage_scanner_evidence_is_redacted() {
+        let mut store = Store::in_memory().unwrap();
+        import_capability(
+            &mut store,
+            "Target",
+            "dep-redaction-target",
+            "dep:redaction-target",
+        );
+        let discovery = proposing_discovery(
+            "Scanner Source",
+            "scanner-redaction",
+            "dep-redaction-source",
+            "dep:redaction-source",
+            DependencyKind::DependsOn,
+            "dep:redaction-target",
+            "Authorization: Bearer super-secret-token api_key=abc123 password=hunter2 token=xyz789",
+        );
+        store.enqueue(&discovery).unwrap();
+        store.review(discovery.id, ReviewDecision::Import).unwrap();
+
+        let relationship = store.dependencies().unwrap().remove(0);
+        assert!(relationship.evidence_summary.contains("[REDACTED]"));
+        assert!(!relationship.evidence_summary.contains("super-secret-token"));
+        assert!(!relationship.evidence_summary.contains("abc123"));
+        assert!(!relationship.evidence_summary.contains("hunter2"));
+        assert!(!relationship.evidence_summary.contains("xyz789"));
     }
 }
