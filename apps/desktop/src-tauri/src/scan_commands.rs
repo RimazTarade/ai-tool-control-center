@@ -430,6 +430,7 @@ impl ScanRegistry {
 pub(crate) struct AppState {
     pub(crate) store: Mutex<Store>,
     pub(crate) scans: ScanRegistry,
+    pub(crate) health: crate::health_commands::HealthRegistry,
 }
 
 impl AppState {
@@ -437,6 +438,7 @@ impl AppState {
         Self {
             store: Mutex::new(store),
             scans: ScanRegistry::new(),
+            health: crate::health_commands::HealthRegistry::new(),
         }
     }
 
