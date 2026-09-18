@@ -2,6 +2,7 @@
 #[link(name = "resource")]
 unsafe extern "C" {}
 
+mod dependency_commands;
 mod health_commands;
 mod runtime_root;
 mod scan_commands;
@@ -9,6 +10,7 @@ mod scan_commands;
 use control_center_core::{
     CanonicalCapability, Discovery, InstallationInstance, ReviewDecision, Store,
 };
+use dependency_commands::{create_user_dependency, delete_user_dependency, list_dependencies};
 use health_commands::{
     cancel_health_run, list_health_summary, list_installation_health, run_all_health_checks,
     run_health_checks,
@@ -32,6 +34,7 @@ struct BootstrapState {
     /// The workspace scan-control revision that `start_scan` must present.
     scan_revision: String,
     health_revision: String,
+    dependency_revision: String,
 }
 
 #[tauri::command]
@@ -46,6 +49,7 @@ fn map_store_error_for_ipc(_error: control_center_core::StoreError) -> CommandEr
 fn build_bootstrap_state(state: &AppState) -> Result<BootstrapState, CommandError> {
     let scan_revision = state.scans.workspace_revision();
     let health_revision = state.health.workspace_revision();
+    let dependency_revision = state.dependencies.workspace_revision();
     let store = state
         .store
         .lock()
@@ -58,6 +62,7 @@ fn build_bootstrap_state(state: &AppState) -> Result<BootstrapState, CommandErro
         installations: store.installations().map_err(map_store_error_for_ipc)?,
         scan_revision,
         health_revision,
+        dependency_revision,
     })
 }
 
@@ -115,6 +120,37 @@ mod tests {
         assert!(bootstrap.capabilities.is_empty());
         assert!(bootstrap.installations.is_empty());
     }
+    #[test]
+    fn dependency_command_bootstrap_exposes_dependency_revision() {
+        let state = AppState::new(Store::in_memory().unwrap());
+        let expected_dependency_revision = state.dependencies.workspace_revision();
+
+        let bootstrap = build_bootstrap_state(&state).unwrap();
+
+        assert_eq!(bootstrap.dependency_revision, expected_dependency_revision);
+    }
+
+    #[test]
+    fn dependency_command_lib_registers_all_dependency_commands() {
+        let source = include_str!("lib.rs");
+        let handler = source
+            .rsplit_once(".invoke_handler(tauri::generate_handler![")
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.split("])").next())
+            .expect("generate_handler block");
+
+        for command in [
+            "list_dependencies",
+            "create_user_dependency",
+            "delete_user_dependency",
+        ] {
+            assert!(
+                handler.contains(command),
+                "missing dependency command: {command}"
+            );
+        }
+    }
+
     #[test]
     fn lib_registers_all_health_commands() {
         let source = include_str!("lib.rs");
@@ -190,6 +226,9 @@ pub fn run() {
             run_health_checks,
             run_all_health_checks,
             cancel_health_run,
+            list_dependencies,
+            create_user_dependency,
+            delete_user_dependency,
         ])
         .run(tauri::generate_context!())
         .expect("AI Tool Control Center failed to start");
