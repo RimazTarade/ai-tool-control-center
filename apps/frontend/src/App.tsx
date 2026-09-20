@@ -43,7 +43,7 @@ const defaultScanDraft: ScanDraft = {
 
 export default function App() {
   const [page, setPage] = useState<PageName>("Overview");
-  const [state, setState] = useState<BootstrapState>({ mode: "demo", pending: [], inventory: [], scanRevision: "" });
+  const [state, setState] = useState<BootstrapState>({ mode: "demo", pending: [], capabilities: [], installations: [], scanRevision: "", healthRevision: "", dependencyRevision: "" });
   const [workspaceRevision, setWorkspaceRevision] = useState("");
   const [query, setQuery] = useState("");
   const [scanDraft, setScanDraft] = useState<ScanDraft>(defaultScanDraft);
@@ -82,10 +82,17 @@ export default function App() {
 
   async function decide(item: Discovery, decision: "import" | "ignore" | "unknown") {
     await reviewDiscovery(item.id, decision);
+
+    if (decision === "import") {
+      const refreshed = await bootstrap();
+      setState(refreshed);
+      setWorkspaceRevision(refreshed.scanRevision);
+      return;
+    }
+
     setState((current) => ({
       ...current,
       pending: current.pending.filter((candidate) => candidate.id !== item.id),
-      inventory: decision === "import" ? [...current.inventory, item] : current.inventory,
     }));
   }
 
@@ -493,18 +500,18 @@ export default function App() {
               : `Scan ${terminalNotice.kind}: ${terminalNotice.counts?.discovered ?? 0} discoveries, ${terminalNotice.counts?.visited ?? 0} visited, ${terminalNotice.counts?.failureCount ?? 0} failures.`}
           </div>
         )}
-        {page === "Overview" ? <Overview state={state} onReview={() => setPage("Review Queue")} /> : page === "Review Queue" ? <ReviewQueue items={visible} decide={decide} /> : page === "Inventory" ? <Inventory items={state.inventory} /> : <EmptyPage name={page} />}
+        {page === "Overview" ? <Overview state={state} onReview={() => setPage("Review Queue")} /> : page === "Review Queue" ? <ReviewQueue items={visible} decide={decide} /> : page === "Inventory" ? <Inventory items={state.installations} /> : <EmptyPage name={page} />}
       </main>
     </div>
   );
 }
 
 function Overview({ state, onReview }: { state: BootstrapState; onReview: () => void }) {
-  return <><section className="metrics"><Metric label="Reviewed tools" value={state.inventory.length} tone="mint" /><Metric label="Pending review" value={state.pending.length} tone="amber" /><Metric label="Health failures" value={0} tone="rose" /><Metric label="Unknown state" value={state.pending.length} tone="blue" /></section><section className="panel hero"><div><p className="eyebrow">Next best action</p><h2>Review discoveries before they enter inventory</h2><p>Every scanner observation stays pending until you explicitly import, ignore, or retain it as unknown.</p></div><button onClick={onReview}>Review {state.pending.length} items →</button></section><section className="panel"><div className="panel-title"><div><p className="eyebrow">Recent evidence</p><h2>Pending discoveries</h2></div><span>{state.pending.length} observations</span></div>{state.pending.slice(0, 4).map((item) => <EvidenceRow key={item.id} item={item} />)}</section></>;
+  return <><section className="metrics"><Metric label="Reviewed tools" value={state.installations.length} tone="mint" /><Metric label="Pending review" value={state.pending.length} tone="amber" /><Metric label="Health failures" value={0} tone="rose" /><Metric label="Unknown state" value={state.pending.length} tone="blue" /></section><section className="panel hero"><div><p className="eyebrow">Next best action</p><h2>Review discoveries before they enter inventory</h2><p>Every scanner observation stays pending until you explicitly import, ignore, or retain it as unknown.</p></div><button onClick={onReview}>Review {state.pending.length} items →</button></section><section className="panel"><div className="panel-title"><div><p className="eyebrow">Recent evidence</p><h2>Pending discoveries</h2></div><span>{state.pending.length} observations</span></div>{state.pending.slice(0, 4).map((item) => <EvidenceRow key={item.id} item={item} />)}</section></>;
 }
 
 function Metric({ label, value, tone }: { label: string; value: number; tone: string }) { return <article className={`metric ${tone}`}><span>{label}</span><strong>{value.toString().padStart(2, "0")}</strong><small>installation instances</small></article>; }
 function EvidenceRow({ item }: { item: Discovery }) { return <article className="row"><div className="toolicon">{item.suggested_name.slice(0, 2).toUpperCase()}</div><div><strong>{item.suggested_name}</strong><span>{item.evidence[0]?.summary}</span></div><em>{item.confidence} confidence</em><b>Unknown</b></article>; }
 function ReviewQueue({ items, decide }: { items: Discovery[]; decide: (item: Discovery, decision: "import" | "ignore" | "unknown") => void }) { return <section className="panel"><div className="panel-title"><div><p className="eyebrow">Mandatory gate</p><h2>{items.length} discoveries need a decision</h2></div></div>{items.length === 0 ? <p className="empty">No matching pending discoveries.</p> : items.map((item) => <article className="review" key={item.id}><EvidenceRow item={item} /><p>Detected by {item.source_scanner}. Health remains unknown until a reviewed check runs.</p><div><button onClick={() => void decide(item, "import")}>Import</button><button onClick={() => void decide(item, "unknown")}>Keep unknown</button><button className="quiet" onClick={() => void decide(item, "ignore")}>Ignore once</button></div></article>)}</section>; }
-function Inventory({ items }: { items: Discovery[] }) { return <section className="panel"><div className="panel-title"><div><p className="eyebrow">Reviewed only</p><h2>Inventory</h2></div></div>{items.length ? items.map((item) => <EvidenceRow key={item.id} item={item} />) : <p className="empty">Nothing imported yet. Review a discovery first.</p>}</section>; }
+function Inventory({ items }: { items: import("./model").InstallationInstance[] }) { return <section className="panel"><div className="panel-title"><div><p className="eyebrow">Reviewed only</p><h2>Inventory</h2></div></div>{items.length ? items.map((item) => <article className="row" key={item.id}><div className="toolicon">{item.displayName.slice(0, 2).toUpperCase()}</div><div><strong>{item.displayName}</strong><span>{item.kind}</span></div><em>{item.host}</em><b>{item.aggregateHealth === "grey" ? "Not checked" : item.aggregateHealth}</b></article>) : <p className="empty">Nothing imported yet. Review a discovery first.</p>}</section>; }
 function EmptyPage({ name }: { name: PageName }) { return <section className="panel empty-page"><span>{name.slice(0, 2)}</span><h2>{name}</h2><p>This workspace will populate from reviewed local evidence. No synthetic status is shown.</p><button disabled title="Available after reviewed evidence exists">No reviewed data yet</button></section>; }

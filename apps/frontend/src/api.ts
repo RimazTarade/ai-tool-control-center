@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { BootstrapState, Discovery, ScanEvent, ScanHandle, ScanMutationRequest, ScanRequest, ScanState } from "./model";
+import type { BootstrapState, CanonicalCapability, Discovery, HealthEvent, HealthResult, HealthRunHandle, HealthRunStateResponse, HealthWorkspaceSnapshot, InstallationHealthDetail, InstallationInstance, ScanEvent, ScanHandle, ScanMutationRequest, ScanRequest, ScanState } from "./model";
 
 const synthetic: Discovery[] = [
   {
@@ -25,15 +25,387 @@ const synthetic: Discovery[] = [
   },
 ];
 
+let demoPending = [...synthetic];
+const demoCapabilities: CanonicalCapability[] = [];
+const demoInstallations: InstallationInstance[] = [];
+const demoHealthListeners = new Set<(event: HealthEvent) => void>();
+const demoHealthHistory = new Map<string, HealthResult[]>();
+
+type DemoHealthRun = {
+  installationIds: string[];
+  revision: string;
+  timers: ReturnType<typeof setTimeout>[];
+  terminal: boolean;
+};
+
+const demoHealthRuns = new Map<string, DemoHealthRun>();
+let demoHealthRunCounter = 0;
+
+function emitDemoHealth(event: HealthEvent) {
+  for (const listener of [...demoHealthListeners]) listener(event);
+}
+
+function recordDemoHealthResult(runId: string, installationId: string, sequence: number) {
+  const run = demoHealthRuns.get(runId);
+  if (!run || run.terminal) return;
+
+  const result: HealthResult = {
+    id: `demo-result-${runId}-${installationId}-${sequence}`,
+    runId,
+    installationId,
+    checkDefinitionId: `demo-check-${installationId}-${sequence}`,
+    checkType: "path_exists",
+    required: true,
+    state: "green",
+    resultCode: "demo_synthetic_ok",
+    redactedEvidence: "Synthetic demo result - not observed on this computer",
+    durationMs: 10,
+    observedAt: new Date().toISOString(),
+  };
+
+  const history = demoHealthHistory.get(installationId) ?? [];
+  history.push(result);
+  demoHealthHistory.set(installationId, history);
+
+  const installation = demoInstallations.find(
+    (candidate) => candidate.id === installationId,
+  );
+  if (installation) installation.aggregateHealth = "green";
+
+  emitDemoHealth({ kind: "check_completed", runId, result });
+  emitDemoHealth({
+    kind: "installation_updated",
+    runId,
+    installationId,
+    aggregate: "green",
+  });
+}
+
 export const isDesktop = () => "__TAURI_INTERNALS__" in window;
 
 export async function bootstrap(): Promise<BootstrapState> {
   if (isDesktop()) return invoke<BootstrapState>("bootstrap_state");
-  return { mode: "demo", pending: synthetic, inventory: [], scanRevision: "demo-revision" };
+  return {
+    mode: "demo",
+    pending: [...demoPending],
+    capabilities: [...demoCapabilities],
+    installations: [...demoInstallations],
+    scanRevision: "demo-revision",
+    healthRevision: "demo-health-revision",
+    dependencyRevision: "demo-dependency-revision",
+  };
+}
+export async function listHealthSummary(): Promise<HealthWorkspaceSnapshot> {
+  if (isDesktop()) return invoke<HealthWorkspaceSnapshot>("list_health_summary");
+
+  const installations = demoInstallations.flatMap((installation) => {
+    const capability = demoCapabilities.find(
+      (candidate) => candidate.id === installation.capabilityId,
+    );
+    if (!capability) return [];
+
+    const history = demoHealthHistory.get(installation.id) ?? [];
+    const latestResult = history.length > 0 ? history[history.length - 1] : null;
+
+    return [
+      {
+        installation,
+        capability,
+        checks: [],
+        effectiveHealth: installation.aggregateHealth,
+        lastCheckedAt: latestResult?.observedAt ?? null,
+        warningCount: installation.aggregateHealth === "yellow" ? 1 : 0,
+        failureCount: installation.aggregateHealth === "red" ? 1 : 0,
+      },
+    ];
+  });
+
+  const count = (state: InstallationInstance["aggregateHealth"]) =>
+    installations.filter((item) => item.effectiveHealth === state).length;
+
+  return {
+    summary: {
+      capabilityCount: demoCapabilities.length,
+      installationCount: demoInstallations.length,
+      pendingDiscoveryCount: demoPending.length,
+      greenCount: count("green"),
+      yellowCount: count("yellow"),
+      redCount: count("red"),
+      greyCount: count("grey"),
+      blueCount: count("blue"),
+    },
+    installations,
+    revision: "demo-health-revision",
+  };
+}
+export async function listInstallationHealth(
+  installationId: string,
+): Promise<InstallationHealthDetail> {
+  if (isDesktop()) {
+    return invoke<InstallationHealthDetail>("list_installation_health", {
+      installationId,
+    });
+  }
+
+  const installation = demoInstallations.find((candidate) => candidate.id === installationId);
+  if (!installation) throw new Error("Demo installation not found");
+
+  const capability = demoCapabilities.find(
+    (candidate) => candidate.id === installation.capabilityId,
+  );
+  if (!capability) throw new Error("Demo capability not found");
+
+  const history = [...(demoHealthHistory.get(installationId) ?? [])];
+
+  return {
+    snapshot: {
+      installation,
+      capability,
+      checks: [],
+      effectiveHealth: installation.aggregateHealth,
+      lastCheckedAt: history.at(-1)?.observedAt ?? null,
+      warningCount: 0,
+      failureCount: 0,
+    },
+    history,
+  };
 }
 
+export async function runHealthChecks(
+  installationId: string,
+  revision: string,
+): Promise<HealthRunHandle> {
+  if (isDesktop()) {
+    return invoke<HealthRunHandle>("run_health_checks", {
+      request: {
+        installationId,
+        revision,
+      },
+    });
+  }
+
+  const installation = demoInstallations.find(
+    (candidate) => candidate.id === installationId,
+  );
+  if (!installation) throw new Error("Demo installation not found");
+
+  demoHealthRunCounter += 1;
+  const runId = `demo-health-run-${demoHealthRunCounter}`;
+  const runRevision = `${runId}-r1`;
+  const startedAt = new Date().toISOString();
+
+  const run: DemoHealthRun = {
+    installationIds: [installationId],
+    revision: runRevision,
+    timers: [],
+    terminal: false,
+  };
+  demoHealthRuns.set(runId, run);
+
+  emitDemoHealth({
+    kind: "started",
+    runId,
+    scope: "installation",
+    requestedInstallationCount: 1,
+  });
+
+  run.timers.push(
+    setTimeout(() => recordDemoHealthResult(runId, installationId, 1), 50),
+    setTimeout(() => recordDemoHealthResult(runId, installationId, 2), 100),
+    setTimeout(() => {
+      const current = demoHealthRuns.get(runId);
+      if (!current || current.terminal) return;
+
+      current.terminal = true;
+      emitDemoHealth({
+        kind: "completed",
+        runId,
+        completedInstallationCount: 1,
+      });
+    }, 150),
+  );
+
+  return {
+    runId,
+    scope: "installation",
+    state: "running",
+    revision: runRevision,
+    startedAt,
+    requestedInstallationCount: 1,
+    scheduledInstallationCount: 1,
+    skippedActiveInstallationCount: 0,
+  };
+}
+export async function runAllHealthChecks(
+  revision: string,
+): Promise<HealthRunHandle> {
+  if (isDesktop()) {
+    return invoke<HealthRunHandle>("run_all_health_checks", {
+      request: {
+        revision,
+      },
+    });
+  }
+
+  demoHealthRunCounter += 1;
+  const runId = `demo-health-run-${demoHealthRunCounter}`;
+  const runRevision = `${runId}-r1`;
+  const startedAt = new Date().toISOString();
+  const installationIds = demoInstallations.map((installation) => installation.id);
+
+  const run: DemoHealthRun = {
+    installationIds,
+    revision: runRevision,
+    timers: [],
+    terminal: false,
+  };
+  demoHealthRuns.set(runId, run);
+
+  emitDemoHealth({
+    kind: "started",
+    runId,
+    scope: "all",
+    requestedInstallationCount: installationIds.length,
+  });
+
+  installationIds.forEach((installationId, index) => {
+    run.timers.push(
+      setTimeout(
+        () => recordDemoHealthResult(runId, installationId, 1),
+        50 + index * 50,
+      ),
+    );
+  });
+
+  run.timers.push(
+    setTimeout(() => {
+      const current = demoHealthRuns.get(runId);
+      if (!current || current.terminal) return;
+
+      current.terminal = true;
+      emitDemoHealth({
+        kind: "completed",
+        runId,
+        completedInstallationCount: installationIds.length,
+      });
+    }, 100 + installationIds.length * 50),
+  );
+
+  return {
+    runId,
+    scope: "all",
+    state: "running",
+    revision: runRevision,
+    startedAt,
+    requestedInstallationCount: installationIds.length,
+    scheduledInstallationCount: installationIds.length,
+    skippedActiveInstallationCount: 0,
+  };
+}
+export async function cancelHealthRun(
+  runId: string,
+  revision: string,
+): Promise<HealthRunStateResponse> {
+  if (isDesktop()) {
+    return invoke<HealthRunStateResponse>("cancel_health_run", {
+      request: {
+        runId,
+        revision,
+      },
+    });
+  }
+
+  const run = demoHealthRuns.get(runId);
+  if (!run) throw new Error("Demo health run not found");
+
+  if (run.revision !== revision) {
+    throw {
+      code: "conflict",
+      message: "Health run revision is stale",
+      state: null,
+    };
+  }
+
+  const nextRevision = `${runId}-r2`;
+  run.revision = nextRevision;
+  run.terminal = true;
+  for (const timer of run.timers) clearTimeout(timer);
+
+  emitDemoHealth({
+    kind: "cancelled",
+    runId,
+    completedInstallationCount: 0,
+  });
+
+  return {
+    runId,
+    state: "cancelling",
+    revision: nextRevision,
+  };
+}
+export async function listenHealthEvents(
+  listener: (event: HealthEvent) => void,
+): Promise<UnlistenFn> {
+  if (isDesktop()) {
+    return listen<HealthEvent>("health:event", ({ payload }) => {
+      listener(payload);
+    });
+  }
+
+  demoHealthListeners.add(listener);
+  return () => {
+    demoHealthListeners.delete(listener);
+
+    if (demoHealthListeners.size === 0) {
+      for (const run of demoHealthRuns.values()) {
+        if (run.terminal) continue;
+
+        run.terminal = true;
+        for (const timer of run.timers) clearTimeout(timer);
+      }
+    }
+  };
+}
 export async function reviewDiscovery(id: string, decision: "import" | "ignore" | "unknown"): Promise<void> {
-  if (isDesktop()) await invoke("review_discovery", { id, decision });
+  if (isDesktop()) {
+    await invoke("review_discovery", { id, decision });
+    return;
+  }
+
+  const item = demoPending.find((candidate) => candidate.id === id);
+  demoPending = demoPending.filter((candidate) => candidate.id !== id);
+
+  if (decision !== "import" || !item) return;
+
+  const capabilityId = `cap-${item.id}`;
+  const installationId = `inst-${item.id}`;
+
+  demoCapabilities.push({
+    id: capabilityId,
+    canonicalName: item.suggested_name,
+    stableIdentity: `demo:${item.id}`,
+    createdAt: item.observed_at,
+    updatedAt: item.observed_at,
+    revision: `demo-capability-${item.id}`,
+  });
+
+  demoInstallations.push({
+    id: installationId,
+    capabilityId,
+    sourceDiscoveryId: item.id,
+    kind: item.suggested_type,
+    displayName: item.suggested_name,
+    host: "localhost",
+    installationState: "installed",
+    registrationState: "registered",
+    enablementState: "enabled",
+    runtimeState: "unknown",
+    connectionState: "unknown",
+    authenticationState: "unknown",
+    aggregateHealth: "grey",
+    createdAt: item.observed_at,
+    updatedAt: item.observed_at,
+  });
 }
 
 export const pickScanRoots = () => invoke<string[]>("pick_scan_roots");
