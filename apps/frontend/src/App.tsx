@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { bootstrap, cancelScan, pauseScan, pickScanRoots, resumeScan, reviewDiscovery, startScan } from "./api";
-import type { BootstrapState, Discovery, PageName, ScanEvent, ScanLifecycleState, ScanMode, ScanRequest, ScanState } from "./model";
+import HealthPage, { healthStateLabel } from "./HealthPage";
+import { useHealth } from "./useHealth";
+import type { BootstrapState, CanonicalCapability, Discovery, HealthWorkspaceSnapshot, InstallationInstance, PageName, ScanEvent, ScanLifecycleState, ScanMode, ScanRequest, ScanState } from "./model";
 
 const pages: PageName[] = ["Overview", "Inventory", "Review Queue", "Health", "Dependencies", "Activity", "Adapter Packs", "Backups", "Settings"];
 
@@ -42,6 +44,7 @@ const defaultScanDraft: ScanDraft = {
 };
 
 export default function App() {
+  const health = useHealth();
   const [page, setPage] = useState<PageName>("Overview");
   const [state, setState] = useState<BootstrapState>({ mode: "demo", pending: [], capabilities: [], installations: [], scanRevision: "", healthRevision: "", dependencyRevision: "" });
   const [workspaceRevision, setWorkspaceRevision] = useState("");
@@ -56,6 +59,7 @@ export default function App() {
   const stopListening = useRef<null | (() => void)>(null);
   const demoTimer = useRef<number | null>(null);
   const demoStep = useRef(0);
+  const healthRefreshKey = useRef("");
   // The scan:event listener attaches before start_scan is invoked, so events
   // (including an immediate terminal one for a fast-failing scan) can arrive
   // before activeScan is set from the resolved handle. Buffer them here and
@@ -69,6 +73,27 @@ export default function App() {
       setWorkspaceRevision(result.scanRevision);
     });
   }, []);
+
+  useEffect(() => {
+    const needsHealthWorkspace =
+      page === "Overview" || page === "Inventory" || page === "Health";
+
+    if (!state.healthRevision || !needsHealthWorkspace) {
+      return;
+    }
+
+    const key = state.healthRevision;
+    if (healthRefreshKey.current === key) {
+      return;
+    }
+
+    healthRefreshKey.current = key;
+    void health.refresh().catch(() => {
+      if (healthRefreshKey.current === key) {
+        healthRefreshKey.current = "";
+      }
+    });
+  }, [page, state.healthRevision, health.refresh]);
 
   useEffect(
     () => () => {
@@ -500,18 +525,154 @@ export default function App() {
               : `Scan ${terminalNotice.kind}: ${terminalNotice.counts?.discovered ?? 0} discoveries, ${terminalNotice.counts?.visited ?? 0} visited, ${terminalNotice.counts?.failureCount ?? 0} failures.`}
           </div>
         )}
-        {page === "Overview" ? <Overview state={state} onReview={() => setPage("Review Queue")} /> : page === "Review Queue" ? <ReviewQueue items={visible} decide={decide} /> : page === "Inventory" ? <Inventory items={state.installations} /> : <EmptyPage name={page} />}
+        {page === "Overview" ? <Overview state={state} healthWorkspace={health.workspace} onReview={() => setPage("Review Queue")} /> : page === "Review Queue" ? <ReviewQueue items={visible} decide={decide} /> : page === "Inventory" ? <Inventory items={state.installations} capabilities={state.capabilities} healthWorkspace={health.workspace} /> : page === "Health" ? <HealthPage health={health} installations={state.installations} capabilities={state.capabilities} /> : <EmptyPage name={page} />}
       </main>
     </div>
   );
 }
 
-function Overview({ state, onReview }: { state: BootstrapState; onReview: () => void }) {
-  return <><section className="metrics"><Metric label="Reviewed tools" value={state.installations.length} tone="mint" /><Metric label="Pending review" value={state.pending.length} tone="amber" /><Metric label="Health failures" value={0} tone="rose" /><Metric label="Unknown state" value={state.pending.length} tone="blue" /></section><section className="panel hero"><div><p className="eyebrow">Next best action</p><h2>Review discoveries before they enter inventory</h2><p>Every scanner observation stays pending until you explicitly import, ignore, or retain it as unknown.</p></div><button onClick={onReview}>Review {state.pending.length} items →</button></section><section className="panel"><div className="panel-title"><div><p className="eyebrow">Recent evidence</p><h2>Pending discoveries</h2></div><span>{state.pending.length} observations</span></div>{state.pending.slice(0, 4).map((item) => <EvidenceRow key={item.id} item={item} />)}</section></>;
+function Overview({
+  state,
+  healthWorkspace,
+  onReview,
+}: {
+  state: BootstrapState;
+  healthWorkspace: HealthWorkspaceSnapshot | null;
+  onReview: () => void;
+}) {
+  const persistedCounts = state.installations.reduce(
+    (counts, installation) => {
+      counts[installation.aggregateHealth] += 1;
+      return counts;
+    },
+    { green: 0, yellow: 0, red: 0, grey: 0, blue: 0 },
+  );
+
+  const summary = healthWorkspace?.summary ?? {
+    capabilityCount: state.capabilities.length,
+    installationCount: state.installations.length,
+    pendingDiscoveryCount: state.pending.length,
+    greenCount: persistedCounts.green,
+    yellowCount: persistedCounts.yellow,
+    redCount: persistedCounts.red,
+    greyCount: persistedCounts.grey,
+    blueCount: persistedCounts.blue,
+  };
+
+  return (
+    <>
+      <section className="metrics">
+        <Metric label="Capabilities" value={summary.capabilityCount} tone="mint" unit="canonical capabilities" />
+        <Metric label="Installations" value={summary.installationCount} tone="mint" />
+        <Metric label="Pending review" value={summary.pendingDiscoveryCount} tone="amber" unit="pending discoveries" />
+        <Metric label="Healthy" value={summary.greenCount} tone="mint" />
+        <Metric label="Warnings" value={summary.yellowCount} tone="amber" />
+        <Metric label="Failures" value={summary.redCount} tone="rose" />
+        <Metric label="Unknown" value={summary.greyCount} tone="blue" />
+        <Metric label="Setup required" value={summary.blueCount} tone="blue" />
+      </section>
+
+      <section className="panel hero">
+        <div>
+          <p className="eyebrow">Next best action</p>
+          <h2>Review discoveries before they enter inventory</h2>
+          <p>
+            Every scanner observation stays pending until you explicitly import,
+            ignore, or retain it as unknown.
+          </p>
+        </div>
+        <button onClick={onReview}>
+          Review {state.pending.length} items
+        </button>
+      </section>
+
+      <section className="panel">
+        <div className="panel-title">
+          <div>
+            <p className="eyebrow">Recent evidence</p>
+            <h2>Pending discoveries</h2>
+          </div>
+          <span>{state.pending.length} observations</span>
+        </div>
+        {state.pending.slice(0, 4).map((item) => (
+          <EvidenceRow key={item.id} item={item} />
+        ))}
+      </section>
+    </>
+  );
 }
 
-function Metric({ label, value, tone }: { label: string; value: number; tone: string }) { return <article className={`metric ${tone}`}><span>{label}</span><strong>{value.toString().padStart(2, "0")}</strong><small>installation instances</small></article>; }
+function Metric({
+  label,
+  value,
+  tone,
+  unit = "installation instances",
+}: {
+  label: string;
+  value: number;
+  tone: string;
+  unit?: string;
+}) {
+  return (
+    <article className={`metric ${tone}`}>
+      <span>{label}</span>
+      <strong>{value.toString().padStart(2, "0")}</strong>
+      <small>{unit}</small>
+    </article>
+  );
+}
 function EvidenceRow({ item }: { item: Discovery }) { return <article className="row"><div className="toolicon">{item.suggested_name.slice(0, 2).toUpperCase()}</div><div><strong>{item.suggested_name}</strong><span>{item.evidence[0]?.summary}</span></div><em>{item.confidence} confidence</em><b>Unknown</b></article>; }
 function ReviewQueue({ items, decide }: { items: Discovery[]; decide: (item: Discovery, decision: "import" | "ignore" | "unknown") => void }) { return <section className="panel"><div className="panel-title"><div><p className="eyebrow">Mandatory gate</p><h2>{items.length} discoveries need a decision</h2></div></div>{items.length === 0 ? <p className="empty">No matching pending discoveries.</p> : items.map((item) => <article className="review" key={item.id}><EvidenceRow item={item} /><p>Detected by {item.source_scanner}. Health remains unknown until a reviewed check runs.</p><div><button onClick={() => void decide(item, "import")}>Import</button><button onClick={() => void decide(item, "unknown")}>Keep unknown</button><button className="quiet" onClick={() => void decide(item, "ignore")}>Ignore once</button></div></article>)}</section>; }
-function Inventory({ items }: { items: import("./model").InstallationInstance[] }) { return <section className="panel"><div className="panel-title"><div><p className="eyebrow">Reviewed only</p><h2>Inventory</h2></div></div>{items.length ? items.map((item) => <article className="row" key={item.id}><div className="toolicon">{item.displayName.slice(0, 2).toUpperCase()}</div><div><strong>{item.displayName}</strong><span>{item.kind}</span></div><em>{item.host}</em><b>{item.aggregateHealth === "grey" ? "Not checked" : item.aggregateHealth}</b></article>) : <p className="empty">Nothing imported yet. Review a discovery first.</p>}</section>; }
+function Inventory({
+  items,
+  capabilities,
+  healthWorkspace,
+}: {
+  items: InstallationInstance[];
+  capabilities: CanonicalCapability[];
+  healthWorkspace: HealthWorkspaceSnapshot | null;
+}) {
+  const capabilityById = new Map(
+    capabilities.map((capability) => [capability.id, capability]),
+  );
+  const effectiveHealthByInstallation = new Map(
+    (healthWorkspace?.installations ?? []).map((snapshot) => [
+      snapshot.installation.id,
+      snapshot.effectiveHealth,
+    ]),
+  );
+
+  return (
+    <section className="panel">
+      <div className="panel-title">
+        <div>
+          <p className="eyebrow">Reviewed only</p>
+          <h2>Inventory</h2>
+        </div>
+      </div>
+
+      {items.length ? (
+        items.map((item) => {
+          const capability = capabilityById.get(item.capabilityId);
+          const effectiveHealth =
+            effectiveHealthByInstallation.get(item.id) ?? item.aggregateHealth;
+
+          return (
+            <article className="row" key={item.id}>
+              <div className="toolicon">{item.displayName.slice(0, 2).toUpperCase()}</div>
+              <div>
+                <strong>{item.displayName}</strong>
+                <span>{capability?.canonicalName ?? item.kind}</span>
+              </div>
+              <em>{item.kind} · {item.host}</em>
+              <b>{healthStateLabel(effectiveHealth)}</b>
+            </article>
+          );
+        })
+      ) : (
+        <p className="empty">Nothing imported yet. Review a discovery first.</p>
+      )}
+    </section>
+  );
+}
 function EmptyPage({ name }: { name: PageName }) { return <section className="panel empty-page"><span>{name.slice(0, 2)}</span><h2>{name}</h2><p>This workspace will populate from reviewed local evidence. No synthetic status is shown.</p><button disabled title="Available after reviewed evidence exists">No reviewed data yet</button></section>; }

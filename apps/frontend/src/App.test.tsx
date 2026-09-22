@@ -20,7 +20,7 @@ describe("review gate", () => {
     const imports = await screen.findAllByRole("button", { name: "Import" });
     await user.click(imports[0]);
     await user.click(screen.getByRole("button", { name: /^inventory/i }));
-    expect(screen.getByText("Example local runtime")).toBeInTheDocument();
+    expect(screen.getByText("Example local runtime", { selector: "strong" })).toBeInTheDocument();
   });
 
   it("allows navigation while a scan is active", async () => {
@@ -36,6 +36,24 @@ describe("review gate", () => {
   });
 });
 
+describe("browser demo health integration", () => {
+  it("health_ui_does_not_treat_reviewed_as_healthy", async () => {
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    render(<App />);
+
+    expect(await screen.findByText(/all records are synthetic/i)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /review queue/i }));
+    const imports = await screen.findAllByRole("button", { name: "Import" });
+    await user.click(imports[0]);
+
+    await user.click(screen.getByRole("button", { name: /^health/i }));
+
+    expect(await screen.findByText("Example local runtime", { selector: "strong" })).toBeInTheDocument();
+    expect(screen.getByText("Not checked", { selector: "b" })).toBeInTheDocument();
+    expect(screen.queryByText("Healthy")).not.toBeInTheDocument();
+  });
+});
 describe("browser demo scan simulation", () => {
   it("does not touch the filesystem and runs progress, a recoverable warning, pause/resume, and terminal", async () => {
     const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });

@@ -52,3 +52,216 @@ header { display: flex; justify-content: space-between; align-items: center; mar
 .modal-actions button:disabled { opacity: .5; cursor: not-allowed; }
 .network-confirm button { border: 0; border-radius: 6px; background: #8bf5c6; color: #092118; padding: 6px 10px; font-size: 11px; cursor: pointer; }
 .network-confirm button.quiet { background: transparent; color: #ffd8bc; border: 1px solid #7a482e; }
+
+/* Health workspace */
+.health-page > .panel-title {
+  align-items: flex-start;
+  gap: 20px;
+}
+
+.health-page > .panel-title > div > p:not(.eyebrow) {
+  margin: 6px 0 0;
+  color: #8a9c96;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.health-page button {
+  border: 1px solid #35544b;
+  border-radius: 7px;
+  background: #172b25;
+  color: #dbe6e1;
+  padding: 7px 11px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.health-page button:hover:not(:disabled) {
+  background: #203a32;
+}
+
+.health-page button:disabled {
+  opacity: .5;
+  cursor: not-allowed;
+}
+
+.health-page > .panel-title > button {
+  border: 0;
+  background: #8bf5c6;
+  color: #092118;
+  padding: 9px 14px;
+  font-weight: 750;
+}
+
+.health-page > .row {
+  grid-template-columns: 38px minmax(180px, 1fr) minmax(90px, auto) minmax(155px, auto) auto;
+  gap: 14px;
+}
+
+.health-installation-select {
+  min-width: 0;
+  padding: 0 !important;
+  border: 0 !important;
+  background: transparent !important;
+  text-align: left;
+  display: grid;
+  gap: 4px;
+}
+
+.health-installation-select strong,
+.health-installation-select span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.health-state {
+  display: grid;
+  gap: 3px;
+  justify-items: start;
+  min-width: 145px;
+}
+
+.health-state b {
+  width: max-content;
+  max-width: 100%;
+}
+
+.health-state span {
+  white-space: normal;
+  line-height: 1.35;
+}
+
+.health-run-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 10px 0 4px;
+  padding: 10px 12px;
+  border: 1px solid #2b4c42;
+  border-radius: 9px;
+  background: #10201c;
+}
+
+.health-run-progress span {
+  color: #9bb0a9;
+  font-size: 10px;
+}
+
+.health-run-progress button {
+  margin-left: auto;
+}
+
+.health-detail {
+  margin-top: 22px;
+  padding-top: 20px;
+  border-top: 1px solid #20332f;
+}
+
+.health-detail h3 {
+  margin: 4px 0 2px;
+  font: 500 19px/1.25 Georgia, serif;
+}
+
+.health-detail > p:not(.eyebrow):not(.empty) {
+  margin: 5px 0;
+  color: #8fa29b;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.health-checks {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.health-check {
+  border: 1px solid #20332f;
+  border-radius: 9px;
+  background: #0d1a17;
+  padding: 13px;
+}
+
+.health-check > div:first-child {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.health-check strong,
+.health-history strong {
+  font-size: 11px;
+  word-break: break-word;
+}
+
+.health-check span,
+.health-history span {
+  color: #80958e;
+  font-size: 10px;
+}
+
+.health-check p {
+  margin: 5px 0;
+  color: #9aada6;
+  font-size: 10px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.health-history {
+  margin-top: 18px;
+}
+
+.health-history h4 {
+  margin: 0 0 8px;
+  color: #cbd8d3;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.health-history article {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) auto auto auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 0;
+  border-top: 1px solid #1a2a27;
+}
+
+.health-history article p {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: #82978f;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+@media (max-width: 1100px) {
+  .health-page > .row {
+    grid-template-columns: 38px minmax(160px, 1fr) auto;
+  }
+
+  .health-page > .row > em,
+  .health-page > .row > .health-state {
+    grid-column: 2;
+  }
+
+  .health-page > .row > button:last-child {
+    grid-column: 3;
+    grid-row: 1 / span 3;
+  }
+
+  .health-checks {
+    grid-template-columns: 1fr;
+  }
+
+  .health-history article {
+    grid-template-columns: 1fr auto;
+  }
+}
