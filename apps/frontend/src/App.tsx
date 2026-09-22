@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { bootstrap, cancelScan, pauseScan, pickScanRoots, resumeScan, reviewDiscovery, startScan } from "./api";
 import HealthPage, { healthStateLabel } from "./HealthPage";
+import DependenciesPage from "./DependenciesPage";
 import { useHealth } from "./useHealth";
 import type { BootstrapState, CanonicalCapability, Discovery, HealthWorkspaceSnapshot, InstallationInstance, PageName, ScanEvent, ScanLifecycleState, ScanMode, ScanRequest, ScanState } from "./model";
 
@@ -525,7 +526,7 @@ export default function App() {
               : `Scan ${terminalNotice.kind}: ${terminalNotice.counts?.discovered ?? 0} discoveries, ${terminalNotice.counts?.visited ?? 0} visited, ${terminalNotice.counts?.failureCount ?? 0} failures.`}
           </div>
         )}
-        {page === "Overview" ? <Overview state={state} healthWorkspace={health.workspace} onReview={() => setPage("Review Queue")} /> : page === "Review Queue" ? <ReviewQueue items={visible} decide={decide} /> : page === "Inventory" ? <Inventory items={state.installations} capabilities={state.capabilities} healthWorkspace={health.workspace} /> : page === "Health" ? <HealthPage health={health} installations={state.installations} capabilities={state.capabilities} /> : <EmptyPage name={page} />}
+        {page === "Overview" ? <Overview state={state} healthWorkspace={health.workspace} onReview={() => setPage("Review Queue")} /> : page === "Review Queue" ? <ReviewQueue items={visible} decide={decide} /> : page === "Inventory" ? <Inventory items={state.installations} capabilities={state.capabilities} healthWorkspace={health.workspace} /> : page === "Health" ? <HealthPage health={health} installations={state.installations} capabilities={state.capabilities} /> : page === "Dependencies" ? <DependenciesPage capabilities={state.capabilities} initialRevision={state.dependencyRevision} /> : <EmptyPage name={page} />}
       </main>
     </div>
   );

@@ -2,7 +2,7 @@ import { cleanup, render, screen, waitFor, within } from "@testing-library/react
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
-import { bootstrap, cancelHealthRun, cancelScan, listenHealthEvents, listHealthSummary, listInstallationHealth, pauseScan, pickScanRoots, resumeScan, reviewDiscovery, runAllHealthChecks, runHealthChecks, startScan } from "./api";
+import { bootstrap, cancelHealthRun, cancelScan, createUserDependency, deleteUserDependency, listenHealthEvents, listDependencies, listHealthSummary, listInstallationHealth, pauseScan, pickScanRoots, resumeScan, reviewDiscovery, runAllHealthChecks, runHealthChecks, startScan } from "./api";
 
 vi.mock("./api", () => ({
   bootstrap: vi.fn(),
@@ -12,6 +12,9 @@ vi.mock("./api", () => ({
   resumeScan: vi.fn(),
   cancelScan: vi.fn(),
   reviewDiscovery: vi.fn(),
+  listDependencies: vi.fn(),
+  createUserDependency: vi.fn(),
+  deleteUserDependency: vi.fn(),
   runHealthChecks: vi.fn(),
   runAllHealthChecks: vi.fn(),
   cancelHealthRun: vi.fn(),
@@ -30,6 +33,9 @@ beforeEach(() => {
   vi.mocked(cancelScan).mockReset();
   vi.mocked(pickScanRoots).mockReset();
   vi.mocked(reviewDiscovery).mockReset();
+  vi.mocked(listDependencies).mockReset();
+  vi.mocked(createUserDependency).mockReset();
+  vi.mocked(deleteUserDependency).mockReset();
   vi.mocked(runHealthChecks).mockReset();
   vi.mocked(runAllHealthChecks).mockReset();
   vi.mocked(cancelHealthRun).mockReset();
@@ -2041,5 +2047,667 @@ describe("health frontend bootstrap contracts", () => {
     expect(metric("Capabilities").getByText("01")).toBeInTheDocument();
     expect(metric("Installations").getByText("01")).toBeInTheDocument();
     expect(metric("Unknown").getByText("01")).toBeInTheDocument();
+  });
+});
+
+describe("dependency workspace UI", () => {
+  it("dependency_ui_list_is_primary_authoritative_view", async () => {
+    vi.mocked(bootstrap).mockResolvedValueOnce({
+      mode: "desktop",
+      pending: [],
+      capabilities: [
+        {
+          id: "cap-source",
+          canonicalName: "Source Capability",
+          stableIdentity: "runtime:source",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          revision: "cap-r1",
+        },
+        {
+          id: "cap-target",
+          canonicalName: "Target Capability",
+          stableIdentity: "runtime:target",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          revision: "cap-r1",
+        },
+      ],
+      installations: [],
+      scanRevision: "scan-r1",
+      healthRevision: "health-r1",
+      dependencyRevision: "dependency-r1",
+    } as never);
+
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [
+        {
+          id: "dep-1",
+          sourceCapabilityId: "cap-source",
+          targetCapabilityId: "cap-target",
+          kind: "requires",
+          owner: "scanner",
+          provenance: "scanner:test",
+          evidenceSummary: "Redacted scanner evidence",
+          createdAt: "2026-01-01T00:00:01Z",
+          revision: "dependency-r1",
+        },
+      ],
+      revision: "dependency-r1",
+    } as never);
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Dependencies" }));
+
+    expect(await screen.findByText("Source Capability")).toBeInTheDocument();
+    expect(screen.getByText("Requires")).toBeInTheDocument();
+    expect(screen.getByText("Target Capability")).toBeInTheDocument();
+    expect(screen.getByText(/scanner/i)).toBeInTheDocument();
+  });
+});
+describe("dependency workspace contracts", () => {
+  const capabilities = [
+    {
+      id: "cap-a",
+      canonicalName: "Capability Alpha",
+      stableIdentity: "runtime:alpha",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      revision: "cap-r1",
+    },
+    {
+      id: "cap-b",
+      canonicalName: "Capability Beta",
+      stableIdentity: "runtime:beta",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      revision: "cap-r1",
+    },
+    {
+      id: "cap-c",
+      canonicalName: "Capability Gamma",
+      stableIdentity: "runtime:gamma",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      revision: "cap-r1",
+    },
+  ];
+
+  const requiresUser = {
+    id: "dep-user",
+    sourceCapabilityId: "cap-a",
+    targetCapabilityId: "cap-b",
+    kind: "requires",
+    owner: "user",
+    provenance: "user",
+    evidenceSummary: "User-created relationship",
+    createdAt: "2026-01-01T00:00:01Z",
+    revision: "dependency-r1",
+  };
+
+  const dependsScanner = {
+    id: "dep-scanner",
+    sourceCapabilityId: "cap-b",
+    targetCapabilityId: "cap-c",
+    kind: "depends_on",
+    owner: "scanner",
+    provenance: "scanner:test",
+    evidenceSummary: "Redacted scanner evidence",
+    createdAt: "2026-01-01T00:00:02Z",
+    revision: "dependency-r1",
+  };
+
+  function seedDependencyBootstrap(
+    pending: unknown[] = [],
+    installations: unknown[] = [],
+  ) {
+    vi.mocked(bootstrap).mockResolvedValueOnce({
+      mode: "desktop",
+      pending,
+      capabilities,
+      installations,
+      scanRevision: "scan-r1",
+      healthRevision: "health-r1",
+      dependencyRevision: "dependency-r1",
+    } as never);
+  }
+
+  async function openDependencies() {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "Dependencies" }));
+    return user;
+  }
+
+  it("dependency_ui_requires_and_depends_on_are_distinct", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [requiresUser, dependsScanner],
+      revision: "dependency-r1",
+    } as never);
+
+    await openDependencies();
+
+    expect(await screen.findByText("Requires")).toBeInTheDocument();
+    expect(screen.getByText("Depends on")).toBeInTheDocument();
+  });
+
+  it("dependency_ui_scanner_relationship_is_read_only", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [dependsScanner],
+      revision: "dependency-r1",
+    } as never);
+
+    await openDependencies();
+
+    const row = await screen.findByTestId("dependency-row-dep-scanner");
+    expect(within(row).getByText(/scanner/i)).toBeInTheDocument();
+    expect(within(row).getByText(/read.?only/i)).toBeInTheDocument();
+    expect(within(row).queryByRole("button", { name: "Delete" })).not.toBeInTheDocument();
+  });
+
+  it("dependency_ui_user_relationship_can_be_deleted", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [requiresUser],
+      revision: "dependency-r7",
+    } as never);
+    vi.mocked(deleteUserDependency).mockResolvedValueOnce({
+      relationships: [],
+      revision: "dependency-r8",
+    } as never);
+
+    const user = await openDependencies();
+    const row = await screen.findByTestId("dependency-row-dep-user");
+    await user.click(within(row).getByRole("button", { name: "Delete" }));
+
+    await waitFor(() =>
+      expect(deleteUserDependency).toHaveBeenCalledWith("dep-user", "dependency-r7"),
+    );
+  });
+
+  it("dependency_ui_add_form_uses_reviewed_capabilities_only", async () => {
+    seedDependencyBootstrap(
+      [
+        {
+          id: "pending-secret",
+          suggested_name: "Pending Discovery Should Not Appear",
+          suggested_type: "runtime",
+          source_scanner: "test",
+          confidence: "high",
+          evidence: [],
+          observed_at: "2026-01-01T00:00:00Z",
+          health_state: "unknown",
+        },
+      ],
+      [
+        {
+          id: "installation-secret",
+          capabilityId: "cap-a",
+          sourceDiscoveryId: "disc-a",
+          kind: "runtime",
+          displayName: "Installation Id Should Not Appear",
+          host: "localhost",
+          installationState: "installed",
+          registrationState: "registered",
+          enablementState: "enabled",
+          runtimeState: "unknown",
+          connectionState: "unknown",
+          authenticationState: "unknown",
+          aggregateHealth: "grey",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+        },
+      ],
+    );
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [],
+      revision: "dependency-r1",
+    } as never);
+
+    await openDependencies();
+
+    const source = await screen.findByLabelText("Source capability");
+    const target = screen.getByLabelText("Target capability");
+
+    expect(within(source).getByRole("option", { name: "Capability Alpha" })).toBeInTheDocument();
+    expect(within(source).getByRole("option", { name: "Capability Beta" })).toBeInTheDocument();
+    expect(within(target).getByRole("option", { name: "Capability Gamma" })).toBeInTheDocument();
+
+    expect(within(source).queryByRole("option", { name: "Pending Discovery Should Not Appear" })).not.toBeInTheDocument();
+    expect(within(target).queryByRole("option", { name: "Installation Id Should Not Appear" })).not.toBeInTheDocument();
+    expect(source).not.toHaveTextContent("pending-secret");
+    expect(target).not.toHaveTextContent("installation-secret");
+  });
+
+  it("dependency_ui_client_blocks_self_reference", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [],
+      revision: "dependency-r1",
+    } as never);
+
+    const user = await openDependencies();
+
+    await user.selectOptions(await screen.findByLabelText("Source capability"), "cap-a");
+    await user.selectOptions(screen.getByLabelText("Target capability"), "cap-a");
+
+    expect(screen.getByRole("button", { name: "Add relationship" })).toBeDisabled();
+    expect(createUserDependency).not.toHaveBeenCalled();
+  });
+
+  it("dependency_ui_create_passes_current_revision", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [],
+      revision: "dependency-r7",
+    } as never);
+    vi.mocked(createUserDependency).mockResolvedValueOnce({
+      relationships: [requiresUser],
+      revision: "dependency-r8",
+    } as never);
+
+    const user = await openDependencies();
+
+    await user.selectOptions(await screen.findByLabelText("Source capability"), "cap-a");
+    await user.selectOptions(screen.getByLabelText("Relationship type"), "requires");
+    await user.selectOptions(screen.getByLabelText("Target capability"), "cap-b");
+    await user.click(screen.getByRole("button", { name: "Add relationship" }));
+
+    await waitFor(() =>
+      expect(createUserDependency).toHaveBeenCalledWith(
+        "cap-a",
+        "requires",
+        "cap-b",
+        "dependency-r7",
+      ),
+    );
+  });
+
+  it("dependency_ui_create_success_replaces_authoritative_list_and_revision", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [requiresUser],
+      revision: "dependency-r1",
+    } as never);
+
+    const replacement = {
+      ...dependsScanner,
+      id: "dep-created-authoritative",
+      owner: "user",
+      provenance: "user",
+      revision: "dependency-r2",
+    };
+
+    vi.mocked(createUserDependency)
+      .mockResolvedValueOnce({
+        relationships: [replacement],
+        revision: "dependency-r2",
+      } as never)
+      .mockResolvedValueOnce({
+        relationships: [replacement],
+        revision: "dependency-r3",
+      } as never);
+
+    const user = await openDependencies();
+
+    expect(await screen.findByTestId("dependency-row-dep-user")).toBeInTheDocument();
+
+    await user.selectOptions(screen.getByLabelText("Source capability"), "cap-b");
+    await user.selectOptions(screen.getByLabelText("Relationship type"), "depends_on");
+    await user.selectOptions(screen.getByLabelText("Target capability"), "cap-c");
+    await user.click(screen.getByRole("button", { name: "Add relationship" }));
+
+    expect(await screen.findByTestId("dependency-row-dep-created-authoritative")).toBeInTheDocument();
+    expect(screen.queryByTestId("dependency-row-dep-user")).not.toBeInTheDocument();
+
+    await user.selectOptions(screen.getByLabelText("Source capability"), "cap-a");
+    await user.selectOptions(screen.getByLabelText("Relationship type"), "requires");
+    await user.selectOptions(screen.getByLabelText("Target capability"), "cap-b");
+    await user.click(screen.getByRole("button", { name: "Add relationship" }));
+
+    await waitFor(() =>
+      expect(createUserDependency).toHaveBeenLastCalledWith(
+        "cap-a",
+        "requires",
+        "cap-b",
+        "dependency-r2",
+      ),
+    );
+  });
+
+  it("dependency_ui_delete_success_replaces_authoritative_list_and_revision", async () => {
+    seedDependencyBootstrap();
+    const second = {
+      ...requiresUser,
+      id: "dep-user-second",
+      sourceCapabilityId: "cap-b",
+      targetCapabilityId: "cap-c",
+    };
+
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [requiresUser, second],
+      revision: "dependency-r1",
+    } as never);
+    vi.mocked(deleteUserDependency)
+      .mockResolvedValueOnce({
+        relationships: [second],
+        revision: "dependency-r2",
+      } as never)
+      .mockResolvedValueOnce({
+        relationships: [],
+        revision: "dependency-r3",
+      } as never);
+
+    const user = await openDependencies();
+
+    const firstRow = await screen.findByTestId("dependency-row-dep-user");
+    await user.click(within(firstRow).getByRole("button", { name: "Delete" }));
+
+    expect(screen.queryByTestId("dependency-row-dep-user")).not.toBeInTheDocument();
+    const secondRow = await screen.findByTestId("dependency-row-dep-user-second");
+    expect(secondRow).toBeInTheDocument();
+
+    await user.click(within(secondRow).getByRole("button", { name: "Delete" }));
+
+    await waitFor(() =>
+      expect(deleteUserDependency).toHaveBeenLastCalledWith(
+        "dep-user-second",
+        "dependency-r2",
+      ),
+    );
+  });
+
+  it("dependency_ui_failed_create_does_not_optimistically_add", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [requiresUser],
+      revision: "dependency-r1",
+    } as never);
+    vi.mocked(createUserDependency).mockRejectedValueOnce({
+      code: "storage_failed",
+      message: "internal detail must not replace authoritative state",
+    });
+
+    const user = await openDependencies();
+
+    await user.selectOptions(await screen.findByLabelText("Source capability"), "cap-b");
+    await user.selectOptions(screen.getByLabelText("Relationship type"), "depends_on");
+    await user.selectOptions(screen.getByLabelText("Target capability"), "cap-c");
+    await user.click(screen.getByRole("button", { name: "Add relationship" }));
+
+    await waitFor(() => expect(createUserDependency).toHaveBeenCalledTimes(1));
+    expect(screen.getByTestId("dependency-row-dep-user")).toBeInTheDocument();
+    expect(document.querySelectorAll("[data-dependency-row]").length).toBe(1);
+  });
+
+  it("dependency_ui_failed_delete_does_not_optimistically_remove", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [requiresUser],
+      revision: "dependency-r1",
+    } as never);
+    vi.mocked(deleteUserDependency).mockRejectedValueOnce({
+      code: "storage_failed",
+      message: "delete failed",
+    });
+
+    const user = await openDependencies();
+    const row = await screen.findByTestId("dependency-row-dep-user");
+
+    await user.click(within(row).getByRole("button", { name: "Delete" }));
+
+    await waitFor(() => expect(deleteUserDependency).toHaveBeenCalledTimes(1));
+    expect(screen.getByTestId("dependency-row-dep-user")).toBeInTheDocument();
+  });
+
+  it("dependency_ui_conflict_refreshes_once_without_auto_replay", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies)
+      .mockResolvedValueOnce({
+        relationships: [requiresUser],
+        revision: "dependency-r1",
+      } as never)
+      .mockResolvedValueOnce({
+        relationships: [dependsScanner],
+        revision: "dependency-r2",
+      } as never);
+
+    vi.mocked(createUserDependency).mockRejectedValueOnce({
+      code: "conflict",
+      message: "stale dependency revision",
+    });
+
+    const user = await openDependencies();
+
+    await user.selectOptions(await screen.findByLabelText("Source capability"), "cap-b");
+    await user.selectOptions(screen.getByLabelText("Relationship type"), "depends_on");
+    await user.selectOptions(screen.getByLabelText("Target capability"), "cap-c");
+    await user.click(screen.getByRole("button", { name: "Add relationship" }));
+
+    await waitFor(() => expect(listDependencies).toHaveBeenCalledTimes(2));
+    expect(createUserDependency).toHaveBeenCalledTimes(1);
+    expect(await screen.findByTestId("dependency-row-dep-scanner")).toBeInTheDocument();
+    expect(screen.queryByTestId("dependency-row-dep-user")).not.toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(/changed.*retry/i);
+  });
+
+  it("dependency_ui_duplicate_is_recoverable", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [requiresUser],
+      revision: "dependency-r1",
+    } as never);
+    vi.mocked(createUserDependency).mockRejectedValueOnce({
+      code: "dependency_duplicate",
+      message: "raw duplicate detail",
+    });
+
+    const user = await openDependencies();
+
+    await user.selectOptions(await screen.findByLabelText("Source capability"), "cap-a");
+    await user.selectOptions(screen.getByLabelText("Relationship type"), "requires");
+    await user.selectOptions(screen.getByLabelText("Target capability"), "cap-b");
+    await user.click(screen.getByRole("button", { name: "Add relationship" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/relationship already exists/i);
+    expect(screen.getByTestId("dependency-row-dep-user")).toBeInTheDocument();
+  });
+
+  it("dependency_ui_self_reference_backend_error_is_recoverable", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [],
+      revision: "dependency-r1",
+    } as never);
+    vi.mocked(createUserDependency).mockRejectedValueOnce({
+      code: "dependency_self_reference",
+      message: "raw self-reference detail",
+    });
+
+    const user = await openDependencies();
+
+    await user.selectOptions(await screen.findByLabelText("Source capability"), "cap-a");
+    await user.selectOptions(screen.getByLabelText("Relationship type"), "requires");
+    await user.selectOptions(screen.getByLabelText("Target capability"), "cap-b");
+    await user.click(screen.getByRole("button", { name: "Add relationship" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/cannot.*itself|self-reference/i);
+    expect(document.querySelectorAll("[data-dependency-row]").length).toBe(0);
+  });
+
+  it("dependency_ui_invalid_endpoint_is_recoverable", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [],
+      revision: "dependency-r1",
+    } as never);
+    vi.mocked(createUserDependency).mockRejectedValueOnce({
+      code: "dependency_invalid",
+      message: "raw invalid endpoint detail",
+    });
+
+    const user = await openDependencies();
+
+    await user.selectOptions(await screen.findByLabelText("Source capability"), "cap-a");
+    await user.selectOptions(screen.getByLabelText("Relationship type"), "requires");
+    await user.selectOptions(screen.getByLabelText("Target capability"), "cap-b");
+    await user.click(screen.getByRole("button", { name: "Add relationship" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/valid reviewed capabilities|invalid relationship/i);
+    expect(document.querySelectorAll("[data-dependency-row]").length).toBe(0);
+  });
+
+  it("dependency_ui_scanner_delete_error_preserves_row", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [requiresUser],
+      revision: "dependency-r1",
+    } as never);
+    vi.mocked(deleteUserDependency).mockRejectedValueOnce({
+      code: "dependency_not_user_owned",
+      message: "backend reports protected ownership",
+    });
+
+    const user = await openDependencies();
+    const row = await screen.findByTestId("dependency-row-dep-user");
+
+    await user.click(within(row).getByRole("button", { name: "Delete" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/scanner.*read.?only|not user-owned/i);
+    expect(screen.getByTestId("dependency-row-dep-user")).toBeInTheDocument();
+  });
+
+  it("dependency_ui_navigation_only_reads_relationships", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [],
+      revision: "dependency-r1",
+    } as never);
+
+    await openDependencies();
+
+    await waitFor(() => expect(listDependencies).toHaveBeenCalledTimes(1));
+    expect(createUserDependency).not.toHaveBeenCalled();
+    expect(deleteUserDependency).not.toHaveBeenCalled();
+  });
+
+  it("dependency_ui_empty_state_invents_no_edges", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [],
+      revision: "dependency-r1",
+    } as never);
+
+    await openDependencies();
+
+    expect(await screen.findByText(/no persisted relationships/i)).toBeInTheDocument();
+    expect(document.querySelectorAll("[data-dependency-edge]").length).toBe(0);
+  });
+
+  it("dependency_ui_graph_nodes_are_capabilities_not_installations", async () => {
+    seedDependencyBootstrap([], [
+      {
+        id: "inst-a-1",
+        capabilityId: "cap-a",
+        sourceDiscoveryId: "disc-a-1",
+        kind: "runtime",
+        displayName: "Alpha Install One",
+        host: "host-1",
+        installationState: "installed",
+        registrationState: "registered",
+        enablementState: "enabled",
+        runtimeState: "unknown",
+        connectionState: "unknown",
+        authenticationState: "unknown",
+        aggregateHealth: "grey",
+        createdAt: "2026-01-01T00:00:00Z",
+        updatedAt: "2026-01-01T00:00:00Z",
+      },
+      {
+        id: "inst-a-2",
+        capabilityId: "cap-a",
+        sourceDiscoveryId: "disc-a-2",
+        kind: "runtime",
+        displayName: "Alpha Install Two",
+        host: "host-2",
+        installationState: "installed",
+        registrationState: "registered",
+        enablementState: "enabled",
+        runtimeState: "unknown",
+        connectionState: "unknown",
+        authenticationState: "unknown",
+        aggregateHealth: "grey",
+        createdAt: "2026-01-01T00:00:00Z",
+        updatedAt: "2026-01-01T00:00:00Z",
+      },
+    ]);
+
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [requiresUser],
+      revision: "dependency-r1",
+    } as never);
+
+    await openDependencies();
+
+    await screen.findByLabelText("Dependency graph");
+    expect(document.querySelectorAll('[data-capability-node="cap-a"]').length).toBe(1);
+    expect(document.querySelectorAll('[data-capability-node="cap-b"]').length).toBe(1);
+    expect(document.querySelector('[data-capability-node="inst-a-1"]')).toBeNull();
+    expect(document.querySelector('[data-capability-node="inst-a-2"]')).toBeNull();
+  });
+
+  it("dependency_ui_graph_edges_match_persisted_relationships_exactly", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [requiresUser, dependsScanner],
+      revision: "dependency-r1",
+    } as never);
+
+    await openDependencies();
+
+    await screen.findByLabelText("Dependency graph");
+    const edges = [...document.querySelectorAll<HTMLElement>("[data-dependency-edge]")];
+
+    expect(edges).toHaveLength(2);
+    expect(
+      edges.map((edge) => ({
+        source: edge.dataset.sourceCapabilityId,
+        target: edge.dataset.targetCapabilityId,
+        kind: edge.dataset.dependencyKind,
+      })),
+    ).toEqual(
+      expect.arrayContaining([
+        { source: "cap-a", target: "cap-b", kind: "requires" },
+        { source: "cap-b", target: "cap-c", kind: "depends_on" },
+      ]),
+    );
+  });
+
+  it("dependency_ui_graph_is_read_only", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [requiresUser],
+      revision: "dependency-r1",
+    } as never);
+
+    const user = await openDependencies();
+
+    const graph = await screen.findByLabelText("Dependency graph");
+    const node = graph.querySelector<HTMLElement>('[data-capability-node="cap-a"]');
+    const edge = graph.querySelector<HTMLElement>('[data-dependency-edge="dep-user"]');
+
+    if (!node || !edge) throw new Error("dependency graph node/edge not found");
+
+    await user.click(node);
+    await user.keyboard("{Enter}");
+    await user.click(edge);
+    await user.keyboard("{Enter}");
+
+    expect(createUserDependency).not.toHaveBeenCalled();
+    expect(deleteUserDependency).not.toHaveBeenCalled();
   });
 });

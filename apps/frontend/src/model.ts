@@ -147,6 +147,30 @@ export type HealthEvent =
       completedInstallationCount: number;
     };
 
+export type DependencyKind = "requires" | "depends_on";
+export type DependencyOwner = "scanner" | "user";
+
+export interface DependencyRelationship {
+  id: string;
+  sourceCapabilityId: string;
+  targetCapabilityId: string;
+  kind: DependencyKind;
+  owner: DependencyOwner;
+  provenance: string;
+  evidenceSummary: string;
+  createdAt: string;
+  revision: string;
+}
+
+export interface DependencyWorkspaceSnapshot {
+  relationships: DependencyRelationship[];
+  revision: string;
+}
+
+export interface DependencyMutationResponse {
+  relationships: DependencyRelationship[];
+  revision: string;
+}
 export interface CanonicalCapability {
   id: string;
   canonicalName: string;

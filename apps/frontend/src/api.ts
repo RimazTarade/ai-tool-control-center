@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { BootstrapState, CanonicalCapability, Discovery, HealthEvent, HealthResult, HealthRunHandle, HealthRunStateResponse, HealthWorkspaceSnapshot, InstallationHealthDetail, InstallationInstance, ScanEvent, ScanHandle, ScanMutationRequest, ScanRequest, ScanState } from "./model";
+import type { BootstrapState, CanonicalCapability, DependencyKind, DependencyMutationResponse, DependencyRelationship, DependencyWorkspaceSnapshot, Discovery, HealthEvent, HealthResult, HealthRunHandle, HealthRunStateResponse, HealthWorkspaceSnapshot, InstallationHealthDetail, InstallationInstance, ScanEvent, ScanHandle, ScanMutationRequest, ScanRequest, ScanState } from "./model";
 
 const synthetic: Discovery[] = [
   {
@@ -28,6 +28,74 @@ const synthetic: Discovery[] = [
 let demoPending = [...synthetic];
 const demoCapabilities: CanonicalCapability[] = [];
 const demoInstallations: InstallationInstance[] = [];
+
+const demoDependencyRelationships: DependencyRelationship[] = [];
+let demoDependencyRevisionCounter = 1;
+let demoDependencyRevision = "demo-dependency-r1";
+let demoDependencyRelationshipCounter = 0;
+
+function rotateDemoDependencyRevision() {
+  demoDependencyRevisionCounter += 1;
+  demoDependencyRevision = `demo-dependency-r${demoDependencyRevisionCounter}`;
+  return demoDependencyRevision;
+}
+
+function ensureDemoScannerDependency() {
+  const relationshipId = "demo-scanner";
+  if (
+    demoDependencyRelationships.some(
+      (relationship) => relationship.id === relationshipId,
+    )
+  ) {
+    return;
+  }
+
+  const sourceExists = demoCapabilities.some(
+    (capability) => capability.id === "cap-demo-1",
+  );
+  const targetExists = demoCapabilities.some(
+    (capability) => capability.id === "cap-demo-2",
+  );
+
+  if (!sourceExists || !targetExists) return;
+
+  const revision = rotateDemoDependencyRevision();
+  demoDependencyRelationships.push({
+    id: relationshipId,
+    sourceCapabilityId: "cap-demo-1",
+    targetCapabilityId: "cap-demo-2",
+    kind: "requires",
+    owner: "scanner",
+    provenance: "demo.fixture",
+    evidenceSummary:
+      "Explicit synthetic scanner relationship for browser demo behavior.",
+    createdAt: "2026-01-01T00:00:01Z",
+    revision,
+  });
+}
+
+function dependencyError(code: string, message: string): never {
+  throw { code, message };
+}
+
+function normalizeDependencyError(error: unknown) {
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    typeof error.code === "string" &&
+    "message" in error &&
+    typeof error.message === "string"
+  ) {
+    return { code: error.code, message: error.message };
+  }
+
+  return {
+    code: "dependency_error",
+    message: "Unable to update local relationship data.",
+  };
+}
+
 const demoHealthListeners = new Set<(event: HealthEvent) => void>();
 const demoHealthHistory = new Map<string, HealthResult[]>();
 
@@ -92,7 +160,7 @@ export async function bootstrap(): Promise<BootstrapState> {
     installations: [...demoInstallations],
     scanRevision: "demo-revision",
     healthRevision: "demo-health-revision",
-    dependencyRevision: "demo-dependency-revision",
+    dependencyRevision: demoDependencyRevision,
   };
 }
 export async function listHealthSummary(): Promise<HealthWorkspaceSnapshot> {
@@ -366,6 +434,157 @@ export async function listenHealthEvents(
     }
   };
 }
+export async function listDependencies(): Promise<DependencyWorkspaceSnapshot> {
+  if (isDesktop()) {
+    try {
+      return await invoke<DependencyWorkspaceSnapshot>("list_dependencies");
+    } catch (error) {
+      throw normalizeDependencyError(error);
+    }
+  }
+
+  ensureDemoScannerDependency();
+  return {
+    relationships: [...demoDependencyRelationships],
+    revision: demoDependencyRevision,
+  };
+}
+
+export async function createUserDependency(
+  sourceCapabilityId: string,
+  kind: DependencyKind,
+  targetCapabilityId: string,
+  revision: string,
+): Promise<DependencyMutationResponse> {
+  if (isDesktop()) {
+    try {
+      return await invoke<DependencyMutationResponse>("create_user_dependency", {
+        request: {
+          sourceCapabilityId,
+          kind,
+          targetCapabilityId,
+          revision,
+        },
+      });
+    } catch (error) {
+      throw normalizeDependencyError(error);
+    }
+  }
+
+  ensureDemoScannerDependency();
+
+  if (revision !== demoDependencyRevision) {
+    dependencyError(
+      "conflict",
+      "Dependency data changed. Refresh and retry.",
+    );
+  }
+
+  if (sourceCapabilityId === targetCapabilityId) {
+    dependencyError(
+      "dependency_self_reference",
+      "A capability cannot depend on itself.",
+    );
+  }
+
+  const sourceExists = demoCapabilities.some(
+    (capability) => capability.id === sourceCapabilityId,
+  );
+  const targetExists = demoCapabilities.some(
+    (capability) => capability.id === targetCapabilityId,
+  );
+
+  if (!sourceExists || !targetExists) {
+    dependencyError(
+      "dependency_invalid",
+      "Dependency endpoints must be reviewed capabilities.",
+    );
+  }
+
+  if (
+    demoDependencyRelationships.some(
+      (relationship) =>
+        relationship.sourceCapabilityId === sourceCapabilityId &&
+        relationship.kind === kind &&
+        relationship.targetCapabilityId === targetCapabilityId,
+    )
+  ) {
+    dependencyError(
+      "dependency_duplicate",
+      "That relationship already exists.",
+    );
+  }
+
+  demoDependencyRelationshipCounter += 1;
+  const nextRevision = rotateDemoDependencyRevision();
+
+  demoDependencyRelationships.push({
+    id: `demo-user-${demoDependencyRelationshipCounter}`,
+    sourceCapabilityId,
+    targetCapabilityId,
+    kind,
+    owner: "user",
+    provenance: "user",
+    evidenceSummary: "User-created synthetic demo relationship.",
+    createdAt: new Date().toISOString(),
+    revision: nextRevision,
+  });
+
+  return {
+    relationships: [...demoDependencyRelationships],
+    revision: nextRevision,
+  };
+}
+
+export async function deleteUserDependency(
+  relationshipId: string,
+  revision: string,
+): Promise<DependencyMutationResponse> {
+  if (isDesktop()) {
+    try {
+      return await invoke<DependencyMutationResponse>("delete_user_dependency", {
+        request: {
+          relationshipId,
+          revision,
+        },
+      });
+    } catch (error) {
+      throw normalizeDependencyError(error);
+    }
+  }
+
+  ensureDemoScannerDependency();
+
+  if (revision !== demoDependencyRevision) {
+    dependencyError(
+      "conflict",
+      "Dependency data changed. Refresh and retry.",
+    );
+  }
+
+  const index = demoDependencyRelationships.findIndex(
+    (relationship) => relationship.id === relationshipId,
+  );
+
+  if (index < 0) {
+    dependencyError("not_found", "Dependency relationship not found.");
+  }
+
+  if (demoDependencyRelationships[index].owner !== "user") {
+    dependencyError(
+      "dependency_not_user_owned",
+      "Scanner relationships are read-only.",
+    );
+  }
+
+  demoDependencyRelationships.splice(index, 1);
+  const nextRevision = rotateDemoDependencyRevision();
+
+  return {
+    relationships: [...demoDependencyRelationships],
+    revision: nextRevision,
+  };
+}
 export async function reviewDiscovery(id: string, decision: "import" | "ignore" | "unknown"): Promise<void> {
   if (isDesktop()) {
     await invoke("review_discovery", { id, decision });
@@ -406,6 +625,8 @@ export async function reviewDiscovery(id: string, decision: "import" | "ignore" 
     createdAt: item.observed_at,
     updatedAt: item.observed_at,
   });
+
+  ensureDemoScannerDependency();
 }
 
 export const pickScanRoots = () => invoke<string[]>("pick_scan_roots");

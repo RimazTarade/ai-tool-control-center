@@ -80,3 +80,29 @@ describe("browser demo scan simulation", () => {
     expect(screen.getByRole("dialog", { name: "Run scan" })).toBeInTheDocument();
   });
 });
+
+describe("browser demo dependency integration", () => {
+  it("dependency_ui_browser_demo_enforces_scanner_read_only", async () => {
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    render(<App />);
+
+    expect(await screen.findByText(/all records are synthetic/i)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /review queue/i }));
+
+    let imports = screen.queryAllByRole("button", { name: "Import" });
+    while (imports.length > 0) {
+      await user.click(imports[0]);
+      imports = screen.queryAllByRole("button", { name: "Import" });
+    }
+
+    await user.click(screen.getByRole("button", { name: /^dependencies/i }));
+
+    const scannerRow = await screen.findByTestId("dependency-row-demo-scanner");
+    expect(scannerRow).toHaveTextContent(/scanner/i);
+    expect(scannerRow).toHaveTextContent(/read.?only/i);
+    expect(
+      scannerRow.querySelector('button[aria-label="Delete"]'),
+    ).toBeNull();
+  });
+});
