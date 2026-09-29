@@ -60,6 +60,18 @@ describe("useHealth orchestration", () => {
 
   afterEach(cleanup);
 
+  it("health_frontend_strict_mode_remount_still_allows_single_run", async () => {
+    const { result } = renderHook(() => useHealth(), {
+      reactStrictMode: true,
+    });
+
+    await act(async () => {
+      await result.current.runInstallation("inst-1");
+    });
+
+    expect(runHealthChecks).toHaveBeenCalledTimes(1);
+    expect(runHealthChecks).toHaveBeenCalledWith("inst-1", "");
+  });
   it("health_frontend_listener_is_ready_before_single_run_invoke", async () => {
     const order: string[] = [];
 
@@ -157,6 +169,61 @@ describe("useHealth orchestration", () => {
 
     expect(result.current.activeRuns["run-early"]).toBeUndefined();
     expect(listHealthSummary).toHaveBeenCalled();
+  });
+  it("health_frontend_installation_updated_refreshes_workspace_without_ending_active_run", async () => {
+    let listener: ((event: unknown) => void) | undefined;
+
+    const refreshedWorkspace = {
+      ...emptyWorkspace,
+      summary: {
+        ...emptyWorkspace.summary,
+        greenCount: 1,
+        greyCount: 0,
+      },
+      revision: "health-r2",
+    };
+
+    vi.mocked(listenHealthEvents).mockImplementation(async (onEvent) => {
+      listener = onEvent as (event: unknown) => void;
+      return (() => {}) as () => void;
+    });
+
+    vi.mocked(runAllHealthChecks).mockResolvedValue({
+      runId: "run-all-1",
+      scope: "all",
+      state: "running",
+      revision: "run-all-r1",
+      startedAt: "2026-01-01T00:00:00Z",
+      requestedInstallationCount: 1,
+      scheduledInstallationCount: 1,
+      skippedActiveInstallationCount: 0,
+    } as never);
+
+    vi.mocked(listHealthSummary).mockResolvedValue(refreshedWorkspace as never);
+
+    const { result } = renderHook(() => useHealth());
+
+    await act(async () => {
+      await result.current.runAll();
+    });
+
+    expect(result.current.activeRuns["run-all-1"]).toBeDefined();
+
+    act(() => {
+      listener?.({
+        kind: "installation_updated",
+        runId: "run-all-1",
+        installationId: "inst-1",
+        aggregate: "green",
+      });
+    });
+
+    await waitFor(() => {
+      expect(listHealthSummary).toHaveBeenCalledTimes(1);
+      expect(result.current.workspace?.revision).toBe("health-r2");
+      expect(result.current.workspace?.summary.greenCount).toBe(1);
+      expect(result.current.activeRuns["run-all-1"]).toBeDefined();
+    });
   });
   it("health_frontend_terminal_completed_refreshes_backend_authority", async () => {
     let listener: ((event: unknown) => void) | undefined;

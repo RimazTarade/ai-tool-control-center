@@ -233,6 +233,15 @@ describe("health API adapter", () => {
       expect(first.history.length).toBeGreaterThan(0);
       expect(second.history.length).toBeGreaterThan(0);
 
+      expect(first.snapshot.checks).toHaveLength(1);
+      expect(first.snapshot.checks[0]?.definition.checkType).toBe("path_exists");
+      expect(first.snapshot.checks[0]?.definition.required).toBe(true);
+      expect(first.snapshot.checks[0]?.latestResult?.state).toBe("green");
+      expect(first.snapshot.checks[0]?.latestResult?.durationMs).toBe(10);
+      expect(first.snapshot.checks[0]?.latestResult?.redactedEvidence).toBe(
+        "Synthetic demo result - not observed on this computer",
+      );
+
       unlisten();
     } finally {
       vi.useRealTimers();

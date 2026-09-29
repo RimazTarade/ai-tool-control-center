@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { BootstrapState, CanonicalCapability, DependencyKind, DependencyMutationResponse, DependencyRelationship, DependencyWorkspaceSnapshot, Discovery, HealthEvent, HealthResult, HealthRunHandle, HealthRunStateResponse, HealthWorkspaceSnapshot, InstallationHealthDetail, InstallationInstance, ScanEvent, ScanHandle, ScanMutationRequest, ScanRequest, ScanState } from "./model";
+import type { BootstrapState, CanonicalCapability, DependencyKind, DependencyMutationResponse, DependencyRelationship, DependencyWorkspaceSnapshot, Discovery, HealthCheckSnapshot, HealthEvent, HealthResult, HealthRunHandle, HealthRunStateResponse, HealthWorkspaceSnapshot, InstallationHealthDetail, InstallationInstance, ScanEvent, ScanHandle, ScanMutationRequest, ScanRequest, ScanState } from "./model";
 
 const synthetic: Discovery[] = [
   {
@@ -98,6 +98,14 @@ function normalizeDependencyError(error: unknown) {
 
 const demoHealthListeners = new Set<(event: HealthEvent) => void>();
 const demoHealthHistory = new Map<string, HealthResult[]>();
+let demoHealthRevisionCounter = 1;
+let demoHealthRevision = "demo-health-revision";
+
+function rotateDemoHealthRevision() {
+  demoHealthRevisionCounter += 1;
+  demoHealthRevision = `demo-health-revision-${demoHealthRevisionCounter}`;
+  return demoHealthRevision;
+}
 
 type DemoHealthRun = {
   installationIds: string[];
@@ -121,7 +129,7 @@ function recordDemoHealthResult(runId: string, installationId: string, sequence:
     id: `demo-result-${runId}-${installationId}-${sequence}`,
     runId,
     installationId,
-    checkDefinitionId: `demo-check-${installationId}-${sequence}`,
+    checkDefinitionId: `demo-check-${installationId}-path`,
     checkType: "path_exists",
     required: true,
     state: "green",
@@ -159,9 +167,44 @@ export async function bootstrap(): Promise<BootstrapState> {
     capabilities: [...demoCapabilities],
     installations: [...demoInstallations],
     scanRevision: "demo-revision",
-    healthRevision: "demo-health-revision",
+    healthRevision: demoHealthRevision,
     dependencyRevision: demoDependencyRevision,
   };
+}
+function demoHealthCheckSnapshots(
+  installationId: string,
+  history: HealthResult[],
+): HealthCheckSnapshot[] {
+  const latestResult = [...history]
+    .reverse()
+    .find(
+      (result) =>
+        result.checkDefinitionId === `demo-check-${installationId}-path`,
+    );
+
+  if (!latestResult) return [];
+
+  return [
+    {
+      definition: {
+        id: latestResult.checkDefinitionId,
+        installationId,
+        checkType: latestResult.checkType,
+        required: latestResult.required,
+        expectedCondition: "exists",
+        timeoutMs: 1_000,
+        staleAfterSeconds: null,
+        target: {
+          kind: "path",
+          path: "[synthetic demo path]",
+        },
+        createdAt: latestResult.observedAt,
+        updatedAt: latestResult.observedAt,
+      },
+      latestResult,
+      stale: false,
+    },
+  ];
 }
 export async function listHealthSummary(): Promise<HealthWorkspaceSnapshot> {
   if (isDesktop()) return invoke<HealthWorkspaceSnapshot>("list_health_summary");
@@ -179,7 +222,7 @@ export async function listHealthSummary(): Promise<HealthWorkspaceSnapshot> {
       {
         installation,
         capability,
-        checks: [],
+        checks: demoHealthCheckSnapshots(installation.id, history),
         effectiveHealth: installation.aggregateHealth,
         lastCheckedAt: latestResult?.observedAt ?? null,
         warningCount: installation.aggregateHealth === "yellow" ? 1 : 0,
@@ -203,7 +246,7 @@ export async function listHealthSummary(): Promise<HealthWorkspaceSnapshot> {
       blueCount: count("blue"),
     },
     installations,
-    revision: "demo-health-revision",
+    revision: demoHealthRevision,
   };
 }
 export async function listInstallationHealth(
@@ -229,7 +272,7 @@ export async function listInstallationHealth(
     snapshot: {
       installation,
       capability,
-      checks: [],
+      checks: demoHealthCheckSnapshots(installation.id, history),
       effectiveHealth: installation.aggregateHealth,
       lastCheckedAt: history.at(-1)?.observedAt ?? null,
       warningCount: 0,
@@ -278,8 +321,10 @@ export async function runHealthChecks(
   });
 
   run.timers.push(
+    // Keep the first result quick, but leave enough browser-visible time for
+    // transient running UI before later results and terminal completion.
     setTimeout(() => recordDemoHealthResult(runId, installationId, 1), 50),
-    setTimeout(() => recordDemoHealthResult(runId, installationId, 2), 100),
+    setTimeout(() => recordDemoHealthResult(runId, installationId, 2), 450),
     setTimeout(() => {
       const current = demoHealthRuns.get(runId);
       if (!current || current.terminal) return;
@@ -290,7 +335,7 @@ export async function runHealthChecks(
         runId,
         completedInstallationCount: 1,
       });
-    }, 150),
+    }, 800),
   );
 
   return {
@@ -340,7 +385,7 @@ export async function runAllHealthChecks(
     run.timers.push(
       setTimeout(
         () => recordDemoHealthResult(runId, installationId, 1),
-        50 + index * 50,
+        50 + index * 600,
       ),
     );
   });
@@ -356,7 +401,7 @@ export async function runAllHealthChecks(
         runId,
         completedInstallationCount: installationIds.length,
       });
-    }, 100 + installationIds.length * 50),
+    }, 350 + installationIds.length * 600),
   );
 
   return {
@@ -626,6 +671,7 @@ export async function reviewDiscovery(id: string, decision: "import" | "ignore" 
     updatedAt: item.observed_at,
   });
 
+  rotateDemoHealthRevision();
   ensureDemoScannerDependency();
 }
 

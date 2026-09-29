@@ -19,6 +19,8 @@ export interface UseHealthValue {
   workspace: HealthWorkspaceSnapshot | null;
   selected: InstallationHealthDetail | null;
   activeRuns: Record<string, HealthRunHandle>;
+  activeInstallationRuns: Record<string, string>;
+  lastTerminalRunState: "completed" | "cancelled" | null;
   loading: boolean;
   error: string | null;
   refresh(): Promise<void>;
@@ -32,6 +34,10 @@ export function useHealth(): UseHealthValue {
   const [workspace, setWorkspace] = useState<HealthWorkspaceSnapshot | null>(null);
   const [selected, setSelected] = useState<InstallationHealthDetail | null>(null);
   const [activeRuns, setActiveRuns] = useState<Record<string, HealthRunHandle>>({});
+  const [activeInstallationRuns, setActiveInstallationRuns] = useState<Record<string, string>>({});
+  const [lastTerminalRunState, setLastTerminalRunState] = useState<
+    "completed" | "cancelled" | null
+  >(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -52,7 +58,25 @@ export function useHealth(): UseHealthValue {
       return;
     }
 
+    if (event.kind === "installation_updated") {
+      const refreshed = await listHealthSummary();
+      if (unmountedRef.current) return;
+
+      setWorkspace(refreshed);
+
+      if (selectedInstallationIdRef.current === event.installationId) {
+        const refreshedSelected = await listInstallationHealth(
+          event.installationId,
+        );
+        if (unmountedRef.current) return;
+        setSelected(refreshedSelected);
+      }
+
+      return;
+    }
     if (event.kind === "completed" || event.kind === "cancelled") {
+      setLastTerminalRunState(event.kind);
+
       const runInstallationId = activeRunInstallationsRef.current.get(event.runId) ?? null;
 
       activeRunIdsRef.current.delete(event.runId);
@@ -62,6 +86,11 @@ export function useHealth(): UseHealthValue {
         installationActiveRunRef.current.get(runInstallationId) === event.runId
       ) {
         installationActiveRunRef.current.delete(runInstallationId);
+        setActiveInstallationRuns((current) => {
+          const next = { ...current };
+          delete next[runInstallationId];
+          return next;
+        });
       }
 
       setActiveRuns((current) => {
@@ -108,10 +137,15 @@ export function useHealth(): UseHealthValue {
 
   const registerRun = useCallback(
     async (handle: HealthRunHandle, installationId: string | null) => {
+      setLastTerminalRunState(null);
       activeRunIdsRef.current.add(handle.runId);
       activeRunInstallationsRef.current.set(handle.runId, installationId);
       if (installationId !== null) {
         installationActiveRunRef.current.set(installationId, handle.runId);
+        setActiveInstallationRuns((current) => ({
+          ...current,
+          [installationId]: handle.runId,
+        }));
       }
 
       setActiveRuns((current) => ({
@@ -260,18 +294,23 @@ export function useHealth(): UseHealthValue {
     }
   }, [activeRuns]);
 
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    // React StrictMode replays mount effects in development. Reset the flag on
+    // every setup so the replay cleanup is not mistaken for a real unmount.
+    unmountedRef.current = false;
+
+    return () => {
       unmountedRef.current = true;
       unlistenRef.current?.();
-    },
-    [],
-  );
+    };
+  }, []);
 
   return {
     workspace,
     selected,
     activeRuns,
+    activeInstallationRuns,
+    lastTerminalRunState,
     loading,
     error,
     refresh,

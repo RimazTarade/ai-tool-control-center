@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
@@ -49,9 +49,16 @@ describe("browser demo health integration", () => {
 
     await user.click(screen.getByRole("button", { name: /^health/i }));
 
-    expect(await screen.findByText("Example local runtime", { selector: "strong" })).toBeInTheDocument();
-    expect(screen.getByText("Not checked", { selector: "b" })).toBeInTheDocument();
-    expect(screen.queryByText("Healthy")).not.toBeInTheDocument();
+    const runtimeName = await screen.findByText("Example local runtime", {
+      selector: "strong",
+    });
+    const runtimeRow = runtimeName.closest("article");
+    if (!runtimeRow) throw new Error("Example local runtime row not found");
+
+    expect(
+      within(runtimeRow).getByText("Not checked", { selector: "b" }),
+    ).toBeInTheDocument();
+    expect(within(runtimeRow).queryByText("Healthy")).not.toBeInTheDocument();
   });
 });
 describe("browser demo scan simulation", () => {

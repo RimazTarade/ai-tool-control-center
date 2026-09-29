@@ -76,7 +76,11 @@ export default function HealthPage({
       </div>
 
       {activeCheckAll && (
-        <div className="health-run-progress" aria-label="Health check progress">
+        <div
+          className="health-run-progress"
+          role="region"
+          aria-label="Health check progress"
+        >
           <span>Requested {activeCheckAll.requestedInstallationCount}</span>
           <span>Scheduled {activeCheckAll.scheduledInstallationCount}</span>
           <span>Skipped {activeCheckAll.skippedActiveInstallationCount}</span>
@@ -89,6 +93,10 @@ export default function HealthPage({
             Cancel
           </button>
         </div>
+      )}
+
+      {!activeCheckAll && health.lastTerminalRunState === "cancelled" && (
+        <p role="status">Cancelled</p>
       )}
 
       {rows.length === 0 ? (
@@ -116,7 +124,9 @@ export default function HealthPage({
             </button>
             <em>{installation.host}</em>
             <div className="health-state">
-              {activeCheckAll && <span>Checking</span>}
+              {(activeCheckAll || health.activeInstallationRuns[installation.id]) && (
+                <span>Checking</span>
+              )}
               <b>{healthStateLabel(state)}</b>
               <span>Last checked: {lastCheckedAt ?? "Not checked"}</span>
               <span>Warnings: {warningCount}</span>

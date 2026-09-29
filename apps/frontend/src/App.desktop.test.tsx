@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
@@ -669,6 +669,13 @@ describe("health workspace UI", () => {
     await waitFor(() => expect(runHealthChecks).toHaveBeenCalledTimes(1));
     expect(vi.mocked(runHealthChecks).mock.calls[0][0]).toBe("inst-two");
     expect(runAllHealthChecks).not.toHaveBeenCalled();
+
+    expect(await within(runtimeTwo).findByText("Checking")).toBeInTheDocument();
+    expect(within(runtimeTwo).getByText("Not checked", { selector: "b" })).toBeInTheDocument();
+
+    const runtimeOne = screen.getByText("Runtime One").closest("article");
+    if (!runtimeOne) throw new Error("Runtime One row not found");
+    expect(within(runtimeOne).queryByText("Checking")).not.toBeInTheDocument();
   });
   it("health_ui_active_check_all_shows_requested_scheduled_and_skipped_counts", async () => {
     vi.mocked(bootstrap).mockResolvedValueOnce({
@@ -725,13 +732,24 @@ describe("health workspace UI", () => {
     await user.click(await screen.findByRole("button", { name: "Health" }));
     await user.click(screen.getByRole("button", { name: "Check All" }));
 
-    expect(await screen.findByText(/Requested 5/i)).toBeInTheDocument();
-    expect(screen.getByText(/Scheduled 3/i)).toBeInTheDocument();
-    expect(screen.getByText(/Skipped 2/i)).toBeInTheDocument();
-    expect(screen.queryByText(/Completed 3/i)).not.toBeInTheDocument();
+    const progress = await screen.findByRole("region", {
+      name: "Health check progress",
+    });
+
+    expect(within(progress).getByText(/Requested 5/i)).toBeInTheDocument();
+    expect(within(progress).getByText(/Scheduled 3/i)).toBeInTheDocument();
+    expect(within(progress).getByText(/Skipped 2/i)).toBeInTheDocument();
+    expect(within(progress).queryByText(/Completed 3/i)).not.toBeInTheDocument();
   });
 
   it("health_ui_cancel_control_cancels_active_run", async () => {
+    let listener: ((event: unknown) => void) | undefined;
+
+    vi.mocked(listenHealthEvents).mockImplementation(async (onEvent) => {
+      listener = onEvent as (event: unknown) => void;
+      return (() => {}) as () => void;
+    });
+
     vi.mocked(bootstrap).mockResolvedValueOnce({
       mode: "desktop",
       pending: [],
@@ -759,6 +777,21 @@ describe("health workspace UI", () => {
       revision: "health-r3",
     });
 
+    vi.mocked(listHealthSummary).mockResolvedValue({
+      summary: {
+        capabilityCount: 0,
+        installationCount: 0,
+        pendingDiscoveryCount: 0,
+        greenCount: 0,
+        yellowCount: 0,
+        redCount: 0,
+        greyCount: 0,
+        blueCount: 0,
+      },
+      installations: [],
+      revision: "health-r4",
+    } as never);
+
     const user = userEvent.setup();
     render(<App />);
 
@@ -768,6 +801,16 @@ describe("health workspace UI", () => {
 
     await waitFor(() => expect(cancelHealthRun).toHaveBeenCalledTimes(1));
     expect(vi.mocked(cancelHealthRun).mock.calls[0][0]).toBe("run-cancel-me");
+
+    act(() => {
+      listener?.({
+        kind: "cancelled",
+        runId: "run-cancel-me",
+        completedInstallationCount: 0,
+      });
+    });
+
+    expect(await screen.findByText("Cancelled", { exact: true })).toBeInTheDocument();
   });
 
   it("health_ui_never_checked_installation_displays_not_checked", async () => {
