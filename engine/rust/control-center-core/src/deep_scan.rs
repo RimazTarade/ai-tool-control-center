@@ -6,7 +6,7 @@
 //! directories concurrently, cooperatively pauses before launching new
 //! directory reads (an in-flight read may still settle while paused),
 //! remains cancellable while paused, never follows symbolic links or
-//! junctions unless the caller opts in, and — when it does follow them —
+//! junctions unless the caller opts in, and Ã¢â‚¬â€ when it does follow them Ã¢â‚¬â€
 //! prevents cycles via the stable directory identity from
 //! [`crate::deep_scan_windows`].
 
@@ -15,7 +15,7 @@ use crate::deep_scan_windows::{
     DirectoryIdentity, EntryPolicy, RootLocation, classify_root, entry_policy,
     stable_directory_identity,
 };
-use crate::scan::{fingerprint, looks_relevant, quick_excluded_names};
+use crate::scan::{add_file_health_metadata, fingerprint, looks_relevant, quick_excluded_names};
 use crate::scan_control::{PauseGate, ScanEvent, ScanEventSink, ScanScope};
 use std::collections::{HashSet, VecDeque};
 use std::io;
@@ -261,11 +261,13 @@ fn apply_policy(
                 depth: work.depth + 1,
             });
         } else if looks_relevant(&entry.path) {
-            discoveries.push(Discovery::unknown(
+            let mut discovery = Discovery::unknown(
                 entry.file_name.clone(),
                 SCANNER_ID,
                 fingerprint(&entry.path),
-            ));
+            );
+            add_file_health_metadata(&mut discovery, &entry.path);
+            discoveries.push(discovery);
         }
     }
 
@@ -461,7 +463,7 @@ async fn run_deep_scan(
             completed_units: visited,
             total_units: None,
             current_location: Some(format!(
-                "Selected root {} · depth {}",
+                "Selected root {} Ã‚Â· depth {}",
                 work.root_index + 1,
                 work.depth
             )),
@@ -1315,7 +1317,7 @@ mod tests {
         });
 
         let location = depth_two.expect("expected a depth-2 progress event");
-        assert_eq!(location, "Selected root 1 · depth 2");
+        assert_eq!(location, "Selected root 1 Ã‚Â· depth 2");
         assert!(!location.to_ascii_lowercase().contains("fakeroot"));
         assert!(!location.contains('\\'));
     }
@@ -1487,5 +1489,58 @@ mod tests {
                 "expected Completed terminal event (panic must not fail the whole scan), got {other:?}"
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn typed_deep_filesystem_discovery_carries_exact_file_health_metadata() {
+        use crate::windows::windows_path_key;
+        use crate::{HealthCheckType, HealthExpectedCondition, HealthTarget};
+
+        let root = PathBuf::from(r"C:\FakeRoot");
+        let signal = root.join("mcp-config.json");
+        let mut tree = HashMap::new();
+        tree.insert(root.clone(), vec![file("mcp-config.json")]);
+
+        let fake = Arc::new(FakeDeepScanIo::new(tree));
+        let context = DeepScanContext {
+            roots: vec![root],
+            follow_reparse_points: false,
+            network_consent: false,
+        };
+        let (tx, rx) = mpsc::channel(64);
+        let events = ScanEventSink::new(tx);
+        let drain = drain_events(rx);
+
+        run_deep_scan(
+            context,
+            events,
+            CancellationToken::new(),
+            PauseGate::default(),
+            fake,
+        )
+        .await;
+
+        let received = drain.await.unwrap();
+        let discovery = received
+            .iter()
+            .find_map(|event| match event {
+                ScanEvent::Discovery { discovery } => Some(discovery),
+                _ => None,
+            })
+            .expect("deep filesystem discovery should be emitted");
+
+        let expected_identity = format!("windows-path:{}", windows_path_key(&signal));
+        assert_eq!(
+            discovery.canonical_identity.as_deref(),
+            Some(expected_identity.as_str())
+        );
+        assert_eq!(discovery.health_hints.len(), 1);
+
+        let hint = &discovery.health_hints[0];
+        assert_eq!(hint.check_type, HealthCheckType::FileExists);
+        assert!(hint.required);
+        assert_eq!(hint.expected_condition, HealthExpectedCondition::Exists);
+        assert_eq!(hint.stale_after_seconds, None);
+        assert_eq!(hint.target, HealthTarget::Path { path: signal });
     }
 }

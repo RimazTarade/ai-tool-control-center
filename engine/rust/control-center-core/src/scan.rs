@@ -1,5 +1,8 @@
 use crate::scan_control::{PauseGate, ScanEvent, ScanEventSink, ScanScope};
-use crate::{Discovery, Evidence};
+use crate::{
+    DEFAULT_HEALTH_TIMEOUT_MS, Discovery, Evidence, HealthCheckHint, HealthCheckType,
+    HealthExpectedCondition, HealthTarget,
+};
 use sha2::{Digest, Sha256};
 use std::{
     future::Future,
@@ -472,7 +475,7 @@ fn build_quick_scan_jobs(context: QuickScanContext) -> Vec<ScannerJob> {
                 // both embed real filesystem paths, including per-user profile
                 // paths and resolved shortcut targets. Scan events and
                 // persisted scan errors must never carry a raw path, so only a
-                // stable, path-free issue count is reported here — never
+                // stable, path-free issue count is reported here Ã¢â‚¬â€ never
                 // either error source's own text.
                 let issue_count = root_errors.len() + report.errors.len();
 
@@ -780,6 +783,34 @@ pub async fn quick_scan(
     }
 }
 
+pub(crate) fn add_file_health_metadata(discovery: &mut Discovery, path: &Path) {
+    discovery.canonical_identity = Some(format!(
+        "windows-path:{}",
+        crate::windows::windows_path_key(path)
+    ));
+
+    if discovery.health_hints.iter().any(|hint| {
+        hint.check_type == HealthCheckType::FileExists
+            && hint.target
+                == HealthTarget::Path {
+                    path: path.to_path_buf(),
+                }
+    }) {
+        return;
+    }
+
+    discovery.health_hints.push(HealthCheckHint {
+        check_type: HealthCheckType::FileExists,
+        required: true,
+        expected_condition: HealthExpectedCondition::Exists,
+        timeout_ms: DEFAULT_HEALTH_TIMEOUT_MS,
+        stale_after_seconds: None,
+        target: HealthTarget::Path {
+            path: path.to_path_buf(),
+        },
+    });
+}
+
 fn scan_blocking(
     roots: Vec<PathBuf>,
     events: ScanEventSink,
@@ -831,6 +862,7 @@ fn scan_blocking(
                     kind: "path".into(),
                     summary: path.display().to_string(),
                 });
+                add_file_health_metadata(&mut discovery, &path);
                 let _ = events.blocking_critical(ScanEvent::Discovery { discovery });
             }
         }
@@ -2050,5 +2082,52 @@ mod tests {
         run.await.unwrap();
 
         assert!(completed);
+    }
+
+    #[tokio::test]
+    async fn typed_quick_filesystem_discovery_carries_exact_file_health_metadata() {
+        use crate::windows::windows_path_key;
+        use crate::{HealthCheckType, HealthExpectedCondition, HealthTarget};
+
+        let root = tempdir().unwrap();
+        let signal = root.path().join("example-mcp.json");
+        fs::write(&signal, "{}").unwrap();
+
+        let roots = vec![root.path().to_path_buf()];
+        let (sender, mut receiver) = mpsc::channel(16);
+        let events = ScanEventSink::new(sender);
+        let terminal = tokio::task::spawn_blocking(move || {
+            scan_blocking(roots, events, CancellationToken::new())
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            terminal,
+            ScannerTerminal::Completed { discovered: 1, .. }
+        ));
+
+        let mut discovery = None;
+        while let Ok(event) = receiver.try_recv() {
+            if let ScanEvent::Discovery { discovery: item } = event {
+                discovery = Some(item);
+                break;
+            }
+        }
+
+        let discovery = discovery.expect("quick filesystem discovery should be emitted");
+        let expected_identity = format!("windows-path:{}", windows_path_key(&signal));
+        assert_eq!(
+            discovery.canonical_identity.as_deref(),
+            Some(expected_identity.as_str())
+        );
+        assert_eq!(discovery.health_hints.len(), 1);
+
+        let hint = &discovery.health_hints[0];
+        assert_eq!(hint.check_type, HealthCheckType::FileExists);
+        assert!(hint.required);
+        assert_eq!(hint.expected_condition, HealthExpectedCondition::Exists);
+        assert_eq!(hint.stale_after_seconds, None);
+        assert_eq!(hint.target, HealthTarget::Path { path: signal });
     }
 }

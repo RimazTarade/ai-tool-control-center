@@ -1,8 +1,8 @@
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
-import { bootstrap, cancelScan, pauseScan, pickScanRoots, resumeScan, reviewDiscovery, startScan } from "./api";
+import { bootstrap, cancelHealthRun, cancelScan, createUserDependency, deleteUserDependency, listenHealthEvents, listDependencies, listHealthSummary, listInstallationHealth, pauseScan, pickScanRoots, resumeScan, reviewDiscovery, runAllHealthChecks, runHealthChecks, startScan } from "./api";
 
 vi.mock("./api", () => ({
   bootstrap: vi.fn(),
@@ -12,18 +12,40 @@ vi.mock("./api", () => ({
   resumeScan: vi.fn(),
   cancelScan: vi.fn(),
   reviewDiscovery: vi.fn(),
+  listDependencies: vi.fn(),
+  createUserDependency: vi.fn(),
+  deleteUserDependency: vi.fn(),
+  runHealthChecks: vi.fn(),
+  runAllHealthChecks: vi.fn(),
+  cancelHealthRun: vi.fn(),
+  listHealthSummary: vi.fn(),
+  listInstallationHealth: vi.fn(),
+  listenHealthEvents: vi.fn(),
   isDesktop: vi.fn(() => true),
 }));
 
 beforeEach(() => {
   vi.mocked(bootstrap).mockReset();
-  vi.mocked(bootstrap).mockResolvedValue({ mode: "desktop", pending: [], inventory: [], scanRevision: "workspace-r1" });
+  vi.mocked(bootstrap).mockResolvedValue({ mode: "desktop", pending: [], capabilities: [], installations: [], scanRevision: "workspace-r1", healthRevision: "health-r1", dependencyRevision: "dependency-r1" });
   vi.mocked(startScan).mockReset();
   vi.mocked(pauseScan).mockReset();
   vi.mocked(resumeScan).mockReset();
   vi.mocked(cancelScan).mockReset();
   vi.mocked(pickScanRoots).mockReset();
   vi.mocked(reviewDiscovery).mockReset();
+  vi.mocked(listDependencies).mockReset();
+  vi.mocked(createUserDependency).mockReset();
+  vi.mocked(deleteUserDependency).mockReset();
+  vi.mocked(runHealthChecks).mockReset();
+  vi.mocked(runAllHealthChecks).mockReset();
+  vi.mocked(cancelHealthRun).mockReset();
+  vi.mocked(listHealthSummary).mockReset();
+  vi.mocked(listHealthSummary).mockRejectedValue(
+    new Error("health summary unavailable unless configured by this test"),
+  );
+  vi.mocked(listInstallationHealth).mockReset();
+  vi.mocked(listenHealthEvents).mockReset();
+  vi.mocked(listenHealthEvents).mockResolvedValue(() => {});
 });
 afterEach(cleanup);
 
@@ -232,7 +254,7 @@ describe("scan lifecycle controls", () => {
       emit = handler as (event: unknown) => void;
     });
 
-    vi.mocked(bootstrap).mockResolvedValue({ mode: "desktop", pending: [], inventory: [], scanRevision: "workspace-r2" });
+    vi.mocked(bootstrap).mockResolvedValue({ mode: "desktop", pending: [], capabilities: [], installations: [], scanRevision: "workspace-r2", healthRevision: "health-r2", dependencyRevision: "dependency-r2" });
     emit({ kind: "completed", visited: 3, discovered: 1, failure_count: 0, duration_ms: 10 });
 
     await waitFor(() => expect(screen.queryByLabelText(/scan progress/i)).not.toBeInTheDocument());
@@ -273,7 +295,7 @@ describe("scan lifecycle controls", () => {
 
   it("treats a terminal event that arrives before start_scan resolves as already-terminal, not a stuck running scan", async () => {
     const user = userEvent.setup();
-    vi.mocked(bootstrap).mockResolvedValue({ mode: "desktop", pending: [], inventory: [], scanRevision: "workspace-r2" });
+    vi.mocked(bootstrap).mockResolvedValue({ mode: "desktop", pending: [], capabilities: [], installations: [], scanRevision: "workspace-r2", healthRevision: "health-r2", dependencyRevision: "dependency-r2" });
     vi.mocked(startScan).mockImplementation(async (_request, handler) => {
       handler({ kind: "failed", code: "scanner_failed", message: "The scan failed immediately", failure_count: 1, duration_ms: 1 });
       await Promise.resolve();
@@ -303,8 +325,8 @@ describe("start conflict recovery", () => {
         unlisten: vi.fn(),
       });
     vi.mocked(bootstrap)
-      .mockResolvedValueOnce({ mode: "desktop", pending: [], inventory: [], scanRevision: "workspace-r1" })
-      .mockResolvedValueOnce({ mode: "desktop", pending: [], inventory: [], scanRevision: "workspace-r2" });
+      .mockResolvedValueOnce({ mode: "desktop", pending: [], capabilities: [], installations: [], scanRevision: "workspace-r1", healthRevision: "health-r1", dependencyRevision: "dependency-r1" })
+      .mockResolvedValueOnce({ mode: "desktop", pending: [], capabilities: [], installations: [], scanRevision: "workspace-r2", healthRevision: "health-r2", dependencyRevision: "dependency-r2" });
 
     render(<App />);
     await user.click(await screen.findByRole("button", { name: "Run scan" }));
@@ -440,5 +462,2295 @@ describe("network consent retry", () => {
     await waitFor(() => expect(startScan).toHaveBeenCalledTimes(1));
     const [request] = vi.mocked(startScan).mock.calls[0];
     expect(request).toMatchObject({ networkConsent: false });
+  });
+});
+
+describe("health workspace UI", () => {
+  it("health_ui_lists_reviewed_installations_not_pending_discoveries", async () => {
+    vi.mocked(bootstrap).mockResolvedValueOnce({
+      mode: "desktop",
+      pending: [
+        {
+          id: "disc-pending",
+          suggested_name: "Pending Runtime",
+          suggested_type: "runtime",
+          source_scanner: "test",
+          confidence: "high",
+          evidence: [{ kind: "test", summary: "Pending evidence" }],
+          observed_at: "2026-01-01T00:00:00Z",
+          health_state: "unknown",
+        },
+      ],
+      capabilities: [
+        {
+          id: "cap-reviewed",
+          canonicalName: "Reviewed Capability",
+          stableIdentity: "runtime:reviewed",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          revision: "cap-r1",
+        },
+      ],
+      installations: [
+        {
+          id: "inst-reviewed",
+          capabilityId: "cap-reviewed",
+          sourceDiscoveryId: "disc-reviewed",
+          kind: "runtime",
+          displayName: "Reviewed Runtime",
+          host: "localhost",
+          installationState: "installed",
+          registrationState: "registered",
+          enablementState: "enabled",
+          runtimeState: "unknown",
+          connectionState: "unknown",
+          authenticationState: "unknown",
+          aggregateHealth: "grey",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+        },
+      ],
+      scanRevision: "scan-r1",
+      healthRevision: "health-r1",
+      dependencyRevision: "dependency-r1",
+    } as never);
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Health" }));
+
+    expect(await screen.findByText("Reviewed Runtime")).toBeInTheDocument();
+    expect(screen.queryByText("Pending Runtime")).not.toBeInTheDocument();
+  });
+  it("health_ui_check_all_invokes_explicit_run", async () => {
+    vi.mocked(bootstrap).mockResolvedValueOnce({
+      mode: "desktop",
+      pending: [],
+      capabilities: [
+        {
+          id: "cap-one",
+          canonicalName: "Capability One",
+          stableIdentity: "runtime:one",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          revision: "cap-r1",
+        },
+      ],
+      installations: [
+        {
+          id: "inst-one",
+          capabilityId: "cap-one",
+          sourceDiscoveryId: "disc-one",
+          kind: "runtime",
+          displayName: "Runtime One",
+          host: "localhost",
+          installationState: "installed",
+          registrationState: "registered",
+          enablementState: "enabled",
+          runtimeState: "unknown",
+          connectionState: "unknown",
+          authenticationState: "unknown",
+          aggregateHealth: "grey",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+        },
+      ],
+      scanRevision: "scan-r1",
+      healthRevision: "health-r1",
+      dependencyRevision: "dependency-r1",
+    } as never);
+
+    vi.mocked(runAllHealthChecks).mockResolvedValue({
+      runId: "run-all-1",
+      scope: "all",
+      state: "running",
+      revision: "health-r2",
+      startedAt: "2026-01-01T00:00:01Z",
+      requestedInstallationCount: 1,
+      scheduledInstallationCount: 1,
+      skippedActiveInstallationCount: 0,
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Health" }));
+    expect(runAllHealthChecks).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "Check All" }));
+
+    await waitFor(() => expect(runAllHealthChecks).toHaveBeenCalledTimes(1));
+  });
+
+  it("health_ui_single_run_invokes_selected_installation", async () => {
+    vi.mocked(bootstrap).mockResolvedValueOnce({
+      mode: "desktop",
+      pending: [],
+      capabilities: [
+        {
+          id: "cap-one",
+          canonicalName: "Capability One",
+          stableIdentity: "runtime:one",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          revision: "cap-r1",
+        },
+        {
+          id: "cap-two",
+          canonicalName: "Capability Two",
+          stableIdentity: "runtime:two",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          revision: "cap-r1",
+        },
+      ],
+      installations: [
+        {
+          id: "inst-one",
+          capabilityId: "cap-one",
+          sourceDiscoveryId: "disc-one",
+          kind: "runtime",
+          displayName: "Runtime One",
+          host: "localhost",
+          installationState: "installed",
+          registrationState: "registered",
+          enablementState: "enabled",
+          runtimeState: "unknown",
+          connectionState: "unknown",
+          authenticationState: "unknown",
+          aggregateHealth: "grey",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+        },
+        {
+          id: "inst-two",
+          capabilityId: "cap-two",
+          sourceDiscoveryId: "disc-two",
+          kind: "runtime",
+          displayName: "Runtime Two",
+          host: "localhost",
+          installationState: "installed",
+          registrationState: "registered",
+          enablementState: "enabled",
+          runtimeState: "unknown",
+          connectionState: "unknown",
+          authenticationState: "unknown",
+          aggregateHealth: "grey",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+        },
+      ],
+      scanRevision: "scan-r1",
+      healthRevision: "health-r1",
+      dependencyRevision: "dependency-r1",
+    } as never);
+
+    vi.mocked(runHealthChecks).mockResolvedValue({
+      runId: "run-one",
+      scope: "installation",
+      state: "running",
+      revision: "health-r2",
+      startedAt: "2026-01-01T00:00:01Z",
+      requestedInstallationCount: 1,
+      scheduledInstallationCount: 1,
+      skippedActiveInstallationCount: 0,
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Health" }));
+    const runtimeTwo = screen.getByText("Runtime Two").closest("article");
+    if (!runtimeTwo) throw new Error("Runtime Two row not found");
+
+    await user.click(within(runtimeTwo).getByRole("button", { name: "Run checks" }));
+
+    await waitFor(() => expect(runHealthChecks).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(runHealthChecks).mock.calls[0][0]).toBe("inst-two");
+    expect(runAllHealthChecks).not.toHaveBeenCalled();
+
+    expect(await within(runtimeTwo).findByText("Checking")).toBeInTheDocument();
+    expect(within(runtimeTwo).getByText("Not checked", { selector: "b" })).toBeInTheDocument();
+
+    const runtimeOne = screen.getByText("Runtime One").closest("article");
+    if (!runtimeOne) throw new Error("Runtime One row not found");
+    expect(within(runtimeOne).queryByText("Checking")).not.toBeInTheDocument();
+  });
+  it("health_ui_active_check_all_shows_requested_scheduled_and_skipped_counts", async () => {
+    vi.mocked(bootstrap).mockResolvedValueOnce({
+      mode: "desktop",
+      pending: [],
+      capabilities: [
+        {
+          id: "cap-active",
+          canonicalName: "Active Capability",
+          stableIdentity: "runtime:active",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          revision: "cap-r1",
+        },
+      ],
+      installations: [
+        {
+          id: "inst-active",
+          capabilityId: "cap-active",
+          sourceDiscoveryId: "disc-active",
+          kind: "runtime",
+          displayName: "Active Runtime",
+          host: "localhost",
+          installationState: "installed",
+          registrationState: "registered",
+          enablementState: "enabled",
+          runtimeState: "unknown",
+          connectionState: "unknown",
+          authenticationState: "unknown",
+          aggregateHealth: "grey",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+        },
+      ],
+      scanRevision: "scan-r1",
+      healthRevision: "health-r1",
+      dependencyRevision: "dependency-r1",
+    } as never);
+
+    vi.mocked(runAllHealthChecks).mockResolvedValue({
+      runId: "run-all-active",
+      scope: "all",
+      state: "running",
+      revision: "health-r2",
+      startedAt: "2026-01-01T00:00:01Z",
+      requestedInstallationCount: 5,
+      scheduledInstallationCount: 3,
+      skippedActiveInstallationCount: 2,
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Health" }));
+    await user.click(screen.getByRole("button", { name: "Check All" }));
+
+    const progress = await screen.findByRole("region", {
+      name: "Health check progress",
+    });
+
+    expect(within(progress).getByText(/Requested 5/i)).toBeInTheDocument();
+    expect(within(progress).getByText(/Scheduled 3/i)).toBeInTheDocument();
+    expect(within(progress).getByText(/Skipped 2/i)).toBeInTheDocument();
+    expect(within(progress).queryByText(/Completed 3/i)).not.toBeInTheDocument();
+  });
+
+  it("health_ui_cancel_control_cancels_active_run", async () => {
+    let listener: ((event: unknown) => void) | undefined;
+
+    vi.mocked(listenHealthEvents).mockImplementation(async (onEvent) => {
+      listener = onEvent as (event: unknown) => void;
+      return (() => {}) as () => void;
+    });
+
+    vi.mocked(bootstrap).mockResolvedValueOnce({
+      mode: "desktop",
+      pending: [],
+      capabilities: [],
+      installations: [],
+      scanRevision: "scan-r1",
+      healthRevision: "health-r1",
+      dependencyRevision: "dependency-r1",
+    } as never);
+
+    vi.mocked(runAllHealthChecks).mockResolvedValue({
+      runId: "run-cancel-me",
+      scope: "all",
+      state: "running",
+      revision: "health-r2",
+      startedAt: "2026-01-01T00:00:01Z",
+      requestedInstallationCount: 0,
+      scheduledInstallationCount: 0,
+      skippedActiveInstallationCount: 0,
+    });
+
+    vi.mocked(cancelHealthRun).mockResolvedValue({
+      runId: "run-cancel-me",
+      state: "cancelling",
+      revision: "health-r3",
+    });
+
+    vi.mocked(listHealthSummary).mockResolvedValue({
+      summary: {
+        capabilityCount: 0,
+        installationCount: 0,
+        pendingDiscoveryCount: 0,
+        greenCount: 0,
+        yellowCount: 0,
+        redCount: 0,
+        greyCount: 0,
+        blueCount: 0,
+      },
+      installations: [],
+      revision: "health-r4",
+    } as never);
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Health" }));
+    await user.click(screen.getByRole("button", { name: "Check All" }));
+    await user.click(await screen.findByRole("button", { name: "Cancel" }));
+
+    await waitFor(() => expect(cancelHealthRun).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(cancelHealthRun).mock.calls[0][0]).toBe("run-cancel-me");
+
+    act(() => {
+      listener?.({
+        kind: "cancelled",
+        runId: "run-cancel-me",
+        completedInstallationCount: 0,
+      });
+    });
+
+    expect(await screen.findByText("Cancelled", { exact: true })).toBeInTheDocument();
+  });
+
+  it("health_ui_never_checked_installation_displays_not_checked", async () => {
+    vi.mocked(bootstrap).mockResolvedValueOnce({
+      mode: "desktop",
+      pending: [],
+      capabilities: [
+        {
+          id: "cap-never",
+          canonicalName: "Never Checked Capability",
+          stableIdentity: "runtime:never",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          revision: "cap-r1",
+        },
+      ],
+      installations: [
+        {
+          id: "inst-never",
+          capabilityId: "cap-never",
+          sourceDiscoveryId: "disc-never",
+          kind: "runtime",
+          displayName: "Never Checked Runtime",
+          host: "localhost",
+          installationState: "installed",
+          registrationState: "registered",
+          enablementState: "enabled",
+          runtimeState: "unknown",
+          connectionState: "unknown",
+          authenticationState: "unknown",
+          aggregateHealth: "grey",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+        },
+      ],
+      scanRevision: "scan-r1",
+      healthRevision: "health-r1",
+      dependencyRevision: "dependency-r1",
+    } as never);
+
+    vi.mocked(listHealthSummary).mockResolvedValueOnce({
+      summary: {
+        capabilityCount: 1,
+        installationCount: 1,
+        pendingDiscoveryCount: 0,
+        greenCount: 0,
+        yellowCount: 0,
+        redCount: 0,
+        greyCount: 1,
+        blueCount: 0,
+      },
+      installations: [
+        {
+          installation: {
+            id: "inst-never",
+            capabilityId: "cap-never",
+            sourceDiscoveryId: "disc-never",
+            kind: "runtime",
+            displayName: "Never Checked Runtime",
+            host: "localhost",
+            installationState: "installed",
+            registrationState: "registered",
+            enablementState: "enabled",
+            runtimeState: "unknown",
+            connectionState: "unknown",
+            authenticationState: "unknown",
+            aggregateHealth: "grey",
+            createdAt: "2026-01-01T00:00:00Z",
+            updatedAt: "2026-01-01T00:00:00Z",
+          },
+          capability: {
+            id: "cap-never",
+            canonicalName: "Never Checked Capability",
+            stableIdentity: "runtime:never",
+            createdAt: "2026-01-01T00:00:00Z",
+            updatedAt: "2026-01-01T00:00:00Z",
+            revision: "cap-r1",
+          },
+          checks: [],
+          effectiveHealth: "grey",
+          lastCheckedAt: null,
+          warningCount: 0,
+          failureCount: 0,
+        },
+      ],
+      revision: "health-r2",
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    await waitFor(() => expect(listHealthSummary).toHaveBeenCalledTimes(1));
+    await user.click(screen.getByRole("button", { name: "Health" }));
+
+    const row = screen.getByText("Never Checked Runtime").closest("article");
+    if (!row) throw new Error("Never Checked Runtime row not found");
+
+    expect(within(row).getByText("Not checked")).toBeInTheDocument();
+    expect(within(row).getByText(/Last checked:\s*Not checked/i)).toBeInTheDocument();
+    expect(within(row).getByText(/Warnings:\s*0/i)).toBeInTheDocument();
+    expect(within(row).getByText(/Failures:\s*0/i)).toBeInTheDocument();
+  });
+  it.each([
+    [
+      "health_ui_blue_is_setup_required_not_failure",
+      "blue",
+      "Setup required",
+      "Failed required check",
+    ],
+    [
+      "health_ui_yellow_is_warning",
+      "yellow",
+      "Warning",
+      "Healthy",
+    ],
+    [
+      "health_ui_red_is_required_failure",
+      "red",
+      "Failed required check",
+      "Warning",
+    ],
+  ] as const)(
+    "%s",
+    async (_name, healthState, expectedLabel, absentLabel) => {
+      vi.mocked(bootstrap).mockResolvedValueOnce({
+        mode: "desktop",
+        pending: [],
+        capabilities: [
+          {
+            id: `cap-${healthState}`,
+            canonicalName: `${expectedLabel} Capability`,
+            stableIdentity: `runtime:${healthState}`,
+            createdAt: "2026-01-01T00:00:00Z",
+            updatedAt: "2026-01-01T00:00:00Z",
+            revision: "cap-r1",
+          },
+        ],
+        installations: [
+          {
+            id: `inst-${healthState}`,
+            capabilityId: `cap-${healthState}`,
+            sourceDiscoveryId: `disc-${healthState}`,
+            kind: "runtime",
+            displayName: `${expectedLabel} Runtime`,
+            host: "localhost",
+            installationState: "installed",
+            registrationState: "registered",
+            enablementState: "enabled",
+            runtimeState: "unknown",
+            connectionState: "unknown",
+            authenticationState: "unknown",
+            aggregateHealth: healthState,
+            createdAt: "2026-01-01T00:00:00Z",
+            updatedAt: "2026-01-01T00:00:00Z",
+          },
+        ],
+        scanRevision: "scan-r1",
+        healthRevision: "health-r1",
+        dependencyRevision: "dependency-r1",
+      } as never);
+
+      vi.mocked(listHealthSummary).mockResolvedValueOnce({
+        summary: {
+          capabilityCount: 1,
+          installationCount: 1,
+          pendingDiscoveryCount: 0,
+          greenCount: 0,
+          yellowCount: healthState === "yellow" ? 1 : 0,
+          redCount: healthState === "red" ? 1 : 0,
+          greyCount: 0,
+          blueCount: healthState === "blue" ? 1 : 0,
+        },
+        installations: [
+          {
+            installation: {
+              id: `inst-${healthState}`,
+              capabilityId: `cap-${healthState}`,
+              sourceDiscoveryId: `disc-${healthState}`,
+              kind: "runtime",
+              displayName: `${expectedLabel} Runtime`,
+              host: "localhost",
+              installationState: "installed",
+              registrationState: "registered",
+              enablementState: "enabled",
+              runtimeState: "unknown",
+              connectionState: "unknown",
+              authenticationState: "unknown",
+              aggregateHealth: healthState,
+              createdAt: "2026-01-01T00:00:00Z",
+              updatedAt: "2026-01-01T00:00:00Z",
+            },
+            capability: {
+              id: `cap-${healthState}`,
+              canonicalName: `${expectedLabel} Capability`,
+              stableIdentity: `runtime:${healthState}`,
+              createdAt: "2026-01-01T00:00:00Z",
+              updatedAt: "2026-01-01T00:00:00Z",
+              revision: "cap-r1",
+            },
+            checks: [],
+            effectiveHealth: healthState,
+            lastCheckedAt: "2026-01-01T00:00:05Z",
+            warningCount: healthState === "yellow" ? 1 : 0,
+            failureCount: healthState === "red" ? 1 : 0,
+          },
+        ],
+        revision: "health-r2",
+      });
+
+      const user = userEvent.setup();
+      render(<App />);
+
+      await waitFor(() => expect(listHealthSummary).toHaveBeenCalledTimes(1));
+      await user.click(screen.getByRole("button", { name: "Health" }));
+
+      const row = screen
+        .getByText(`${expectedLabel} Runtime`, { selector: "strong" })
+        .closest("article");
+      if (!row) throw new Error(`${expectedLabel} row not found`);
+
+      expect(within(row).getByText(expectedLabel)).toBeInTheDocument();
+      expect(within(row).queryByText(absentLabel)).not.toBeInTheDocument();
+    },
+  );
+  it("health_ui_checking_is_temporary_not_persisted_health", async () => {
+    vi.mocked(bootstrap).mockResolvedValueOnce({
+      mode: "desktop",
+      pending: [],
+      capabilities: [
+        {
+          id: "cap-warning",
+          canonicalName: "Warning Capability",
+          stableIdentity: "runtime:warning",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          revision: "cap-r1",
+        },
+      ],
+      installations: [
+        {
+          id: "inst-warning",
+          capabilityId: "cap-warning",
+          sourceDiscoveryId: "disc-warning",
+          kind: "runtime",
+          displayName: "Warning Runtime",
+          host: "localhost",
+          installationState: "installed",
+          registrationState: "registered",
+          enablementState: "enabled",
+          runtimeState: "unknown",
+          connectionState: "unknown",
+          authenticationState: "unknown",
+          aggregateHealth: "yellow",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+        },
+      ],
+      scanRevision: "scan-r1",
+      healthRevision: "health-r1",
+      dependencyRevision: "dependency-r1",
+    } as never);
+
+    vi.mocked(runAllHealthChecks).mockResolvedValue({
+      runId: "run-warning",
+      scope: "all",
+      state: "running",
+      revision: "health-r2",
+      startedAt: "2026-01-01T00:00:01Z",
+      requestedInstallationCount: 1,
+      scheduledInstallationCount: 1,
+      skippedActiveInstallationCount: 0,
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Health" }));
+    await user.click(screen.getByRole("button", { name: "Check All" }));
+
+    expect(await screen.findByText("Checking")).toBeInTheDocument();
+    expect(screen.getByText("Warning", { selector: "b" })).toBeInTheDocument();
+    expect(screen.queryByText("Healthy")).not.toBeInTheDocument();
+  });
+});
+describe("health installation detail", () => {
+  it("health_ui_detail_loads_on_selection", async () => {
+    vi.mocked(bootstrap).mockResolvedValueOnce({
+      mode: "desktop",
+      pending: [],
+      capabilities: [
+        {
+          id: "cap-detail",
+          canonicalName: "Detail Capability",
+          stableIdentity: "runtime:detail",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          revision: "cap-r1",
+        },
+      ],
+      installations: [
+        {
+          id: "inst-detail",
+          capabilityId: "cap-detail",
+          sourceDiscoveryId: "disc-detail",
+          kind: "runtime",
+          displayName: "Detail Runtime",
+          host: "localhost",
+          installationState: "installed",
+          registrationState: "registered",
+          enablementState: "enabled",
+          runtimeState: "unknown",
+          connectionState: "unknown",
+          authenticationState: "unknown",
+          aggregateHealth: "yellow",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+        },
+      ],
+      scanRevision: "scan-r1",
+      healthRevision: "health-r1",
+      dependencyRevision: "dependency-r1",
+    } as never);
+
+    vi.mocked(listInstallationHealth).mockResolvedValue({
+      snapshot: {
+        installation: {
+          id: "inst-detail",
+          capabilityId: "cap-detail",
+          sourceDiscoveryId: "disc-detail",
+          kind: "runtime",
+          displayName: "Detail Runtime",
+          host: "localhost",
+          installationState: "installed",
+          registrationState: "registered",
+          enablementState: "enabled",
+          runtimeState: "unknown",
+          connectionState: "unknown",
+          authenticationState: "unknown",
+          aggregateHealth: "yellow",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+        },
+        capability: {
+          id: "cap-detail",
+          canonicalName: "Detail Capability",
+          stableIdentity: "runtime:detail",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          revision: "cap-r1",
+        },
+        checks: [],
+        effectiveHealth: "yellow",
+        lastCheckedAt: "2026-01-01T00:00:05Z",
+        warningCount: 1,
+        failureCount: 0,
+      },
+      history: [],
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Health" }));
+    await user.click(screen.getByText("Detail Runtime"));
+
+    await waitFor(() =>
+      expect(listInstallationHealth).toHaveBeenCalledWith("inst-detail"),
+    );
+    expect(
+      await screen.findByRole("heading", { name: "Detail Runtime" }),
+    ).toBeInTheDocument();
+    const detail = screen.getByRole("region", { name: "Installation health detail" });
+    expect(within(detail).getByText("Detail Capability")).toBeInTheDocument();
+  });
+});
+describe("health installation detail contracts", () => {
+  it.each([
+    "health_ui_detail_shows_required_optional_state_duration_and_time",
+    "health_ui_detail_marks_stale_checks",
+    "health_ui_detail_shows_only_redacted_evidence_field",
+    "health_ui_history_is_newest_first",
+  ])("%s", async () => {
+    vi.mocked(bootstrap).mockResolvedValueOnce({
+      mode: "desktop",
+      pending: [],
+      capabilities: [
+        {
+          id: "cap-checks",
+          canonicalName: "Checks Capability",
+          stableIdentity: "runtime:checks",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          revision: "cap-r1",
+        },
+      ],
+      installations: [
+        {
+          id: "inst-checks",
+          capabilityId: "cap-checks",
+          sourceDiscoveryId: "disc-checks",
+          kind: "runtime",
+          displayName: "Checks Runtime",
+          host: "localhost",
+          installationState: "installed",
+          registrationState: "registered",
+          enablementState: "enabled",
+          runtimeState: "unknown",
+          connectionState: "unknown",
+          authenticationState: "unknown",
+          aggregateHealth: "yellow",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+        },
+      ],
+      scanRevision: "scan-r1",
+      healthRevision: "health-r1",
+      dependencyRevision: "dependency-r1",
+    } as never);
+
+    vi.mocked(listInstallationHealth).mockResolvedValue({
+      snapshot: {
+        installation: {
+          id: "inst-checks",
+          capabilityId: "cap-checks",
+          sourceDiscoveryId: "disc-checks",
+          kind: "runtime",
+          displayName: "Checks Runtime",
+          host: "localhost",
+          installationState: "installed",
+          registrationState: "registered",
+          enablementState: "enabled",
+          runtimeState: "unknown",
+          connectionState: "unknown",
+          authenticationState: "unknown",
+          aggregateHealth: "yellow",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+        },
+        capability: {
+          id: "cap-checks",
+          canonicalName: "Checks Capability",
+          stableIdentity: "runtime:checks",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          revision: "cap-r1",
+        },
+        checks: [
+          {
+            definition: {
+              id: "check-required",
+              installationId: "inst-checks",
+              checkType: "config_parses",
+              required: true,
+              expectedCondition: "parses",
+              timeoutMs: 1000,
+              staleAfterSeconds: 60,
+              target: {
+                kind: "config",
+                path: "C:\\secret\\config.json",
+                format: "json",
+              },
+              createdAt: "2026-01-01T00:00:00Z",
+              updatedAt: "2026-01-01T00:00:00Z",
+            },
+            latestResult: {
+              id: "result-required",
+              runId: "run-detail",
+              installationId: "inst-checks",
+              checkDefinitionId: "check-required",
+              checkType: "config_parses",
+              required: true,
+              state: "yellow",
+              resultCode: "config_stale",
+              redactedEvidence: "Configuration parsed from an approved local source.",
+              durationMs: 42,
+              observedAt: "2026-01-01T00:00:05Z",
+            },
+            stale: true,
+          },
+          {
+            definition: {
+              id: "check-optional",
+              installationId: "inst-checks",
+              checkType: "process_running",
+              required: false,
+              expectedCondition: "running",
+              timeoutMs: 1000,
+              staleAfterSeconds: null,
+              target: {
+                kind: "process_executable",
+                path: "C:\\secret\\runtime.exe",
+              },
+              createdAt: "2026-01-01T00:00:00Z",
+              updatedAt: "2026-01-01T00:00:00Z",
+            },
+            latestResult: {
+              id: "result-optional",
+              runId: "run-detail",
+              installationId: "inst-checks",
+              checkDefinitionId: "check-optional",
+              checkType: "process_running",
+              required: false,
+              state: "green",
+              resultCode: "process_running",
+              redactedEvidence: "Process is running.",
+              durationMs: 7,
+              observedAt: "2026-01-01T00:00:06Z",
+            },
+            stale: false,
+          },
+        ],
+        effectiveHealth: "yellow",
+        lastCheckedAt: "2026-01-01T00:00:06Z",
+        warningCount: 1,
+        failureCount: 0,
+      },
+      history: [
+        {
+          id: "history-new",
+          runId: "run-new",
+          installationId: "inst-checks",
+          checkDefinitionId: "check-required",
+          checkType: "config_parses",
+          required: true,
+          state: "yellow",
+          resultCode: "newest-result",
+          redactedEvidence: "Newest safe evidence.",
+          durationMs: 31,
+          observedAt: "2026-01-02T00:00:00Z",
+        },
+        {
+          id: "history-old",
+          runId: "run-old",
+          installationId: "inst-checks",
+          checkDefinitionId: "check-required",
+          checkType: "config_parses",
+          required: true,
+          state: "green",
+          resultCode: "older-result",
+          redactedEvidence: "Older safe evidence.",
+          durationMs: 21,
+          observedAt: "2026-01-01T00:00:00Z",
+        },
+      ],
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Health" }));
+    await user.click(screen.getByRole("button", { name: /Checks Runtime/i }));
+
+    const detail = await screen.findByRole("region", {
+      name: "Installation health detail",
+    });
+
+    expect(within(detail).getByText("Required")).toBeInTheDocument();
+    expect(within(detail).getByText("Optional")).toBeInTheDocument();
+    expect(within(detail).getByText("Warning")).toBeInTheDocument();
+    expect(within(detail).getByText("Healthy")).toBeInTheDocument();
+    expect(within(detail).getByText(/Result code:\s*config_stale/i)).toBeInTheDocument();
+    expect(within(detail).getByText(/Duration:\s*42\s*ms/i)).toBeInTheDocument();
+    expect(within(detail).getByText(/Observed:\s*2026-01-01T00:00:05Z/i)).toBeInTheDocument();
+    expect(within(detail).getByText("Stale")).toBeInTheDocument();
+    expect(
+      within(detail).getByText(
+        "Configuration parsed from an approved local source.",
+      ),
+    ).toBeInTheDocument();
+
+    expect(
+      within(detail).queryByText("C:\\secret\\config.json"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(detail).queryByText("C:\\secret\\runtime.exe"),
+    ).not.toBeInTheDocument();
+
+    const newest = within(detail).getByText("newest-result");
+    const older = within(detail).getByText("older-result");
+    expect(
+      newest.compareDocumentPosition(older) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("health_ui_no_definitions_remains_grey", async () => {
+    vi.mocked(bootstrap).mockResolvedValueOnce({
+      mode: "desktop",
+      pending: [],
+      capabilities: [
+        {
+          id: "cap-none",
+          canonicalName: "No Checks Capability",
+          stableIdentity: "runtime:no-checks",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          revision: "cap-r1",
+        },
+      ],
+      installations: [
+        {
+          id: "inst-none",
+          capabilityId: "cap-none",
+          sourceDiscoveryId: "disc-none",
+          kind: "runtime",
+          displayName: "No Checks Runtime",
+          host: "localhost",
+          installationState: "installed",
+          registrationState: "registered",
+          enablementState: "enabled",
+          runtimeState: "unknown",
+          connectionState: "unknown",
+          authenticationState: "unknown",
+          aggregateHealth: "grey",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+        },
+      ],
+      scanRevision: "scan-r1",
+      healthRevision: "health-r1",
+      dependencyRevision: "dependency-r1",
+    } as never);
+
+    vi.mocked(listInstallationHealth).mockResolvedValue({
+      snapshot: {
+        installation: {
+          id: "inst-none",
+          capabilityId: "cap-none",
+          sourceDiscoveryId: "disc-none",
+          kind: "runtime",
+          displayName: "No Checks Runtime",
+          host: "localhost",
+          installationState: "installed",
+          registrationState: "registered",
+          enablementState: "enabled",
+          runtimeState: "unknown",
+          connectionState: "unknown",
+          authenticationState: "unknown",
+          aggregateHealth: "grey",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+        },
+        capability: {
+          id: "cap-none",
+          canonicalName: "No Checks Capability",
+          stableIdentity: "runtime:no-checks",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          revision: "cap-r1",
+        },
+        checks: [],
+        effectiveHealth: "grey",
+        lastCheckedAt: null,
+        warningCount: 0,
+        failureCount: 0,
+      },
+      history: [],
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Health" }));
+    await user.click(screen.getByRole("button", { name: /No Checks Runtime/i }));
+
+    const detail = await screen.findByRole("region", {
+      name: "Installation health detail",
+    });
+
+    expect(
+      within(detail).getByText(/no supported local health checks are configured/i),
+    ).toBeInTheDocument();
+    expect(within(detail).getByText(/Current state: Not checked/i)).toBeInTheDocument();
+    expect(within(detail).queryByText("Healthy")).not.toBeInTheDocument();
+  });
+});
+describe("health inventory and overview integration", () => {
+  it("health_ui_inventory_uses_installation_instances", async () => {
+    vi.mocked(bootstrap).mockResolvedValueOnce({
+      mode: "desktop",
+      pending: [],
+      capabilities: [
+        {
+          id: "cap-instance",
+          canonicalName: "Canonical Runtime",
+          stableIdentity: "runtime:canonical",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          revision: "cap-r1",
+        },
+      ],
+      installations: [
+        {
+          id: "inst-instance",
+          capabilityId: "cap-instance",
+          sourceDiscoveryId: "disc-instance",
+          kind: "runtime",
+          displayName: "Laptop Runtime Instance",
+          host: "workstation-a",
+          installationState: "installed",
+          registrationState: "registered",
+          enablementState: "enabled",
+          runtimeState: "unknown",
+          connectionState: "unknown",
+          authenticationState: "unknown",
+          aggregateHealth: "grey",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+        },
+      ],
+      scanRevision: "scan-r1",
+      healthRevision: "health-r1",
+      dependencyRevision: "dependency-r1",
+    } as never);
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Inventory" }));
+
+    const instanceName = await screen.findByText("Laptop Runtime Instance");
+    const row = instanceName.closest("article");
+    if (!row) throw new Error("Inventory installation row not found");
+
+    expect(within(row).getByText("Canonical Runtime")).toBeInTheDocument();
+    expect(
+      within(row).getByText(/runtime.*workstation-a/i, { selector: "em" }),
+    ).toBeInTheDocument();
+    expect(within(row).getByText("Not checked")).toBeInTheDocument();
+  });
+  it("health_ui_inventory_prefers_effective_health_projection", async () => {
+    vi.mocked(bootstrap).mockResolvedValueOnce({
+      mode: "desktop",
+      pending: [],
+      capabilities: [
+        {
+          id: "cap-inventory",
+          canonicalName: "Inventory Capability",
+          stableIdentity: "runtime:inventory",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          revision: "cap-r1",
+        },
+      ],
+      installations: [
+        {
+          id: "inst-inventory",
+          capabilityId: "cap-inventory",
+          sourceDiscoveryId: "disc-inventory",
+          kind: "runtime",
+          displayName: "Inventory Runtime",
+          host: "localhost",
+          installationState: "installed",
+          registrationState: "registered",
+          enablementState: "enabled",
+          runtimeState: "unknown",
+          connectionState: "unknown",
+          authenticationState: "unknown",
+          aggregateHealth: "green",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+        },
+      ],
+      scanRevision: "scan-r1",
+      healthRevision: "health-r1",
+      dependencyRevision: "dependency-r1",
+    } as never);
+
+    vi.mocked(listHealthSummary).mockResolvedValueOnce({
+      summary: {
+        capabilityCount: 1,
+        installationCount: 1,
+        pendingDiscoveryCount: 0,
+        greenCount: 0,
+        yellowCount: 1,
+        redCount: 0,
+        greyCount: 0,
+        blueCount: 0,
+      },
+      installations: [
+        {
+          installation: {
+            id: "inst-inventory",
+            capabilityId: "cap-inventory",
+            sourceDiscoveryId: "disc-inventory",
+            kind: "runtime",
+            displayName: "Inventory Runtime",
+            host: "localhost",
+            installationState: "installed",
+            registrationState: "registered",
+            enablementState: "enabled",
+            runtimeState: "unknown",
+            connectionState: "unknown",
+            authenticationState: "unknown",
+            aggregateHealth: "green",
+            createdAt: "2026-01-01T00:00:00Z",
+            updatedAt: "2026-01-01T00:00:00Z",
+          },
+          capability: {
+            id: "cap-inventory",
+            canonicalName: "Inventory Capability",
+            stableIdentity: "runtime:inventory",
+            createdAt: "2026-01-01T00:00:00Z",
+            updatedAt: "2026-01-01T00:00:00Z",
+            revision: "cap-r1",
+          },
+          checks: [],
+          effectiveHealth: "yellow",
+          lastCheckedAt: "2026-01-01T00:00:05Z",
+          warningCount: 1,
+          failureCount: 0,
+        },
+      ],
+      revision: "health-r2",
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Inventory" }));
+
+    await waitFor(() => expect(listHealthSummary).toHaveBeenCalled());
+    expect(await screen.findByText("Inventory Capability")).toBeInTheDocument();
+    expect(screen.getByText("Warning")).toBeInTheDocument();
+    expect(screen.queryByText("Healthy")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    "health_ui_overview_uses_backend_health_counts",
+    "health_ui_overview_counts_installations_separately_from_capabilities",
+    "health_ui_overview_health_counts_total_installations",
+    "health_ui_overview_removes_hardcoded_zero_failures",
+    "health_ui_read_only_refresh_may_run_on_navigation_but_health_checks_do_not",
+  ])("%s", async () => {
+    vi.mocked(bootstrap).mockResolvedValueOnce({
+      mode: "desktop",
+      pending: [
+        {
+          id: "disc-pending",
+          suggested_name: "Pending Runtime",
+          suggested_type: "runtime",
+          source_scanner: "test",
+          confidence: "high",
+          evidence: [{ kind: "test", summary: "Pending evidence" }],
+          observed_at: "2026-01-01T00:00:00Z",
+          health_state: "unknown",
+        },
+      ],
+      capabilities: [
+        {
+          id: "cap-a",
+          canonicalName: "Capability A",
+          stableIdentity: "runtime:a",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          revision: "cap-r1",
+        },
+        {
+          id: "cap-b",
+          canonicalName: "Capability B",
+          stableIdentity: "runtime:b",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          revision: "cap-r1",
+        },
+      ],
+      installations: [],
+      scanRevision: "scan-r1",
+      healthRevision: "health-r1",
+      dependencyRevision: "dependency-r1",
+    } as never);
+
+    vi.mocked(listHealthSummary).mockResolvedValueOnce({
+      summary: {
+        capabilityCount: 2,
+        installationCount: 5,
+        pendingDiscoveryCount: 1,
+        greenCount: 1,
+        yellowCount: 1,
+        redCount: 1,
+        greyCount: 1,
+        blueCount: 1,
+      },
+      installations: [],
+      revision: "health-r2",
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(listHealthSummary).toHaveBeenCalledTimes(1));
+
+    const metrics = document.querySelector<HTMLElement>(".metrics");
+    if (!metrics) throw new Error("metrics section not found");
+
+    const metric = (label: string) => {
+      const labelNode = within(metrics).getByText(label);
+      const article = labelNode.closest("article");
+      if (!article) throw new Error(`${label} metric not found`);
+      return within(article);
+    };
+
+    expect(metric("Capabilities").getByText("02")).toBeInTheDocument();
+    expect(metric("Installations").getByText("05")).toBeInTheDocument();
+    expect(metric("Pending review").getByText("01")).toBeInTheDocument();
+    expect(metric("Healthy").getByText("01")).toBeInTheDocument();
+    expect(metric("Warnings").getByText("01")).toBeInTheDocument();
+    expect(metric("Failures").getByText("01")).toBeInTheDocument();
+    expect(metric("Unknown").getByText("01")).toBeInTheDocument();
+    expect(metric("Setup required").getByText("01")).toBeInTheDocument();
+
+    expect(runHealthChecks).not.toHaveBeenCalled();
+    expect(runAllHealthChecks).not.toHaveBeenCalled();
+  });
+  it("health_ui_overview_pending_is_not_unknown_health", async () => {
+    vi.mocked(bootstrap).mockResolvedValueOnce({
+      mode: "desktop",
+      pending: [
+        {
+          id: "disc-pending-a",
+          suggested_name: "Pending A",
+          suggested_type: "runtime",
+          source_scanner: "test",
+          confidence: "high",
+          evidence: [{ kind: "test", summary: "Pending A evidence" }],
+          observed_at: "2026-01-01T00:00:00Z",
+          health_state: "unknown",
+        },
+        {
+          id: "disc-pending-b",
+          suggested_name: "Pending B",
+          suggested_type: "runtime",
+          source_scanner: "test",
+          confidence: "high",
+          evidence: [{ kind: "test", summary: "Pending B evidence" }],
+          observed_at: "2026-01-01T00:00:01Z",
+          health_state: "unknown",
+        },
+        {
+          id: "disc-pending-c",
+          suggested_name: "Pending C",
+          suggested_type: "runtime",
+          source_scanner: "test",
+          confidence: "high",
+          evidence: [{ kind: "test", summary: "Pending C evidence" }],
+          observed_at: "2026-01-01T00:00:02Z",
+          health_state: "unknown",
+        },
+      ],
+      capabilities: [
+        {
+          id: "cap-grey-overview",
+          canonicalName: "Grey Overview Capability",
+          stableIdentity: "runtime:grey-overview",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          revision: "cap-r1",
+        },
+      ],
+      installations: [
+        {
+          id: "inst-grey-overview",
+          capabilityId: "cap-grey-overview",
+          sourceDiscoveryId: "disc-reviewed",
+          kind: "runtime",
+          displayName: "Grey Reviewed Runtime",
+          host: "localhost",
+          installationState: "installed",
+          registrationState: "registered",
+          enablementState: "enabled",
+          runtimeState: "unknown",
+          connectionState: "unknown",
+          authenticationState: "unknown",
+          aggregateHealth: "grey",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+        },
+      ],
+      scanRevision: "scan-r1",
+      healthRevision: "health-r1",
+      dependencyRevision: "dependency-r1",
+    } as never);
+
+    vi.mocked(listHealthSummary).mockResolvedValueOnce({
+      summary: {
+        capabilityCount: 1,
+        installationCount: 1,
+        pendingDiscoveryCount: 3,
+        greenCount: 0,
+        yellowCount: 0,
+        redCount: 0,
+        greyCount: 1,
+        blueCount: 0,
+      },
+      installations: [],
+      revision: "health-r2",
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(listHealthSummary).toHaveBeenCalledTimes(1));
+
+    const metrics = document.querySelector<HTMLElement>(".metrics");
+    if (!metrics) throw new Error("metrics section not found");
+
+    const metric = (label: string) => {
+      const labelNode = within(metrics).getByText(label);
+      const article = labelNode.closest("article");
+      if (!article) throw new Error(`${label} metric not found`);
+      return within(article);
+    };
+
+    expect(metric("Pending review").getByText("03")).toBeInTheDocument();
+    expect(metric("Unknown").getByText("01")).toBeInTheDocument();
+  });
+});
+  it("health_ui_refreshes_authoritative_summary_after_health_revision_changes", async () => {
+    vi.mocked(bootstrap)
+      .mockResolvedValueOnce({
+        mode: "desktop",
+        pending: [
+          {
+            id: "disc-refresh",
+            suggested_name: "Refresh Runtime",
+            suggested_type: "runtime",
+            source_scanner: "test",
+            confidence: "high",
+            evidence: [],
+            observed_at: "2026-01-01T00:00:00Z",
+            health_state: "unknown",
+          },
+        ],
+        capabilities: [],
+        installations: [],
+        scanRevision: "scan-r1",
+        healthRevision: "health-r1",
+        dependencyRevision: "dependency-r1",
+      } as never)
+      .mockResolvedValueOnce({
+        mode: "desktop",
+        pending: [],
+        capabilities: [
+          {
+            id: "cap-refresh",
+            canonicalName: "Refresh Capability",
+            stableIdentity: "runtime:refresh",
+            createdAt: "2026-01-01T00:00:01Z",
+            updatedAt: "2026-01-01T00:00:01Z",
+            revision: "cap-r1",
+          },
+        ],
+        installations: [
+          {
+            id: "inst-refresh",
+            capabilityId: "cap-refresh",
+            sourceDiscoveryId: "disc-refresh",
+            kind: "runtime",
+            displayName: "Refresh Runtime",
+            host: "localhost",
+            installationState: "installed",
+            registrationState: "registered",
+            enablementState: "enabled",
+            runtimeState: "unknown",
+            connectionState: "unknown",
+            authenticationState: "unknown",
+            aggregateHealth: "grey",
+            createdAt: "2026-01-01T00:00:01Z",
+            updatedAt: "2026-01-01T00:00:01Z",
+          },
+        ],
+        scanRevision: "scan-r2",
+        healthRevision: "health-r2",
+        dependencyRevision: "dependency-r1",
+      } as never);
+
+    vi.mocked(reviewDiscovery).mockResolvedValue(undefined as never);
+
+    vi.mocked(listHealthSummary)
+      .mockResolvedValueOnce({
+        summary: {
+          capabilityCount: 0,
+          installationCount: 0,
+          pendingDiscoveryCount: 1,
+          greenCount: 0,
+          yellowCount: 0,
+          redCount: 0,
+          greyCount: 0,
+          blueCount: 0,
+        },
+        installations: [],
+        revision: "health-r1",
+      })
+      .mockResolvedValueOnce({
+        summary: {
+          capabilityCount: 1,
+          installationCount: 1,
+          pendingDiscoveryCount: 0,
+          greenCount: 0,
+          yellowCount: 0,
+          redCount: 0,
+          greyCount: 1,
+          blueCount: 0,
+        },
+        installations: [
+          {
+            installation: {
+              id: "inst-refresh",
+              capabilityId: "cap-refresh",
+              sourceDiscoveryId: "disc-refresh",
+              kind: "runtime",
+              displayName: "Refresh Runtime",
+              host: "localhost",
+              installationState: "installed",
+              registrationState: "registered",
+              enablementState: "enabled",
+              runtimeState: "unknown",
+              connectionState: "unknown",
+              authenticationState: "unknown",
+              aggregateHealth: "grey",
+              createdAt: "2026-01-01T00:00:01Z",
+              updatedAt: "2026-01-01T00:00:01Z",
+            },
+            capability: {
+              id: "cap-refresh",
+              canonicalName: "Refresh Capability",
+              stableIdentity: "runtime:refresh",
+              createdAt: "2026-01-01T00:00:01Z",
+              updatedAt: "2026-01-01T00:00:01Z",
+              revision: "cap-r1",
+            },
+            checks: [],
+            effectiveHealth: "grey",
+            lastCheckedAt: null,
+            warningCount: 0,
+            failureCount: 0,
+          },
+        ],
+        revision: "health-r2",
+      });
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    await waitFor(() => expect(listHealthSummary).toHaveBeenCalledTimes(1));
+
+    await user.click(screen.getByRole("button", { name: "Review Queue" }));
+    const reviewItem = await screen.findByText("Refresh Runtime");
+    const review = reviewItem.closest(".review") as HTMLElement | null;
+    if (!review) throw new Error("Refresh Runtime review card not found");
+
+    await user.click(within(review).getByRole("button", { name: "Import" }));
+
+    await waitFor(() => expect(bootstrap).toHaveBeenCalledTimes(2));
+
+    await user.click(screen.getByRole("button", { name: "Health" }));
+
+    await waitFor(() => expect(listHealthSummary).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText("Refresh Capability")).toBeInTheDocument();
+    expect(screen.getByText("Refresh Runtime")).toBeInTheDocument();
+  });
+describe("health frontend bootstrap contracts", () => {
+  it("health_frontend_navigation_does_not_start_checks", async () => {
+    const user = userEvent.setup();
+
+    render(<App />);
+    await screen.findByText("Capabilities");
+
+    await user.click(screen.getByRole("button", { name: "Health" }));
+    expect(screen.getByRole("button", { name: "Health" })).toHaveClass("active");
+
+    await user.click(screen.getByRole("button", { name: "Inventory" }));
+    expect(screen.getByRole("button", { name: "Inventory" })).toHaveClass("active");
+
+    await user.click(screen.getByRole("button", { name: "Overview" }));
+    expect(screen.getByRole("button", { name: "Overview" })).toHaveClass("active");
+
+    expect(runHealthChecks).not.toHaveBeenCalled();
+    expect(runAllHealthChecks).not.toHaveBeenCalled();
+  });
+  it("health_ui_inventory_bootstrap_grey_is_not_promoted", async () => {
+    vi.mocked(bootstrap).mockResolvedValueOnce({
+      mode: "desktop",
+      pending: [],
+      capabilities: [
+        {
+          id: "cap-grey",
+          canonicalName: "Unchecked Runtime",
+          stableIdentity: "runtime:unchecked",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          revision: "cap-grey-r1",
+        },
+      ],
+      installations: [
+        {
+          id: "inst-grey",
+          capabilityId: "cap-grey",
+          sourceDiscoveryId: "disc-grey",
+          kind: "runtime",
+          displayName: "Unchecked Runtime",
+          host: "localhost",
+          installationState: "installed",
+          registrationState: "registered",
+          enablementState: "enabled",
+          runtimeState: "unknown",
+          connectionState: "unknown",
+          authenticationState: "unknown",
+          aggregateHealth: "grey",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+        },
+      ],
+      scanRevision: "scan-r1",
+      healthRevision: "health-r1",
+      dependencyRevision: "dependency-r1",
+    } as never);
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Inventory" }));
+
+    expect(await screen.findByText("Unchecked Runtime", { selector: "strong" })).toBeInTheDocument();
+    expect(screen.getByText("Not checked")).toBeInTheDocument();
+    expect(screen.queryByText(/^green$/i)).not.toBeInTheDocument();
+  });
+  it("health_frontend_bootstrap_uses_capabilities_installations_and_independent_revisions", async () => {
+    vi.mocked(bootstrap).mockResolvedValueOnce({
+      mode: "desktop",
+      pending: [],
+      capabilities: [
+        {
+          id: "cap-1",
+          canonicalName: "Example Runtime",
+          stableIdentity: "runtime:example",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          revision: "cap-r1",
+        },
+      ],
+      installations: [
+        {
+          id: "inst-1",
+          capabilityId: "cap-1",
+          sourceDiscoveryId: "disc-1",
+          kind: "runtime",
+          displayName: "Example Runtime",
+          host: "localhost",
+          installationState: "installed",
+          registrationState: "registered",
+          enablementState: "enabled",
+          runtimeState: "unknown",
+          connectionState: "unknown",
+          authenticationState: "unknown",
+          aggregateHealth: "grey",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+        },
+      ],
+      scanRevision: "scan-r1",
+      healthRevision: "health-r1",
+      dependencyRevision: "dependency-r1",
+    } as never);
+
+    render(<App />);
+
+    await screen.findByText("Capabilities");
+
+    const metrics = document.querySelector<HTMLElement>(".metrics");
+    if (!metrics) throw new Error("metrics section not found");
+
+    const metric = (label: string) => {
+      const labelNode = within(metrics).getByText(label);
+      const article = labelNode.closest("article");
+      if (!article) throw new Error(`${label} metric not found`);
+      return within(article);
+    };
+
+    expect(metric("Capabilities").getByText("01")).toBeInTheDocument();
+    expect(metric("Installations").getByText("01")).toBeInTheDocument();
+    expect(metric("Unknown").getByText("01")).toBeInTheDocument();
+  });
+});
+
+describe("dependency workspace UI", () => {
+  it("dependency_ui_list_is_primary_authoritative_view", async () => {
+    vi.mocked(bootstrap).mockResolvedValueOnce({
+      mode: "desktop",
+      pending: [],
+      capabilities: [
+        {
+          id: "cap-source",
+          canonicalName: "Source Capability",
+          stableIdentity: "runtime:source",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          revision: "cap-r1",
+        },
+        {
+          id: "cap-target",
+          canonicalName: "Target Capability",
+          stableIdentity: "runtime:target",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          revision: "cap-r1",
+        },
+      ],
+      installations: [],
+      scanRevision: "scan-r1",
+      healthRevision: "health-r1",
+      dependencyRevision: "dependency-r1",
+    } as never);
+
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [
+        {
+          id: "dep-1",
+          sourceCapabilityId: "cap-source",
+          targetCapabilityId: "cap-target",
+          kind: "requires",
+          owner: "scanner",
+          provenance: "scanner:test",
+          evidenceSummary: "Redacted scanner evidence",
+          createdAt: "2026-01-01T00:00:01Z",
+          revision: "dependency-r1",
+        },
+      ],
+      revision: "dependency-r1",
+    } as never);
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Dependencies" }));
+
+    expect(await screen.findByText("Source Capability")).toBeInTheDocument();
+    expect(screen.getByText("Requires")).toBeInTheDocument();
+    expect(screen.getByText("Target Capability")).toBeInTheDocument();
+    expect(screen.getByText(/scanner/i)).toBeInTheDocument();
+  });
+});
+describe("dependency workspace contracts", () => {
+  const capabilities = [
+    {
+      id: "cap-a",
+      canonicalName: "Capability Alpha",
+      stableIdentity: "runtime:alpha",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      revision: "cap-r1",
+    },
+    {
+      id: "cap-b",
+      canonicalName: "Capability Beta",
+      stableIdentity: "runtime:beta",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      revision: "cap-r1",
+    },
+    {
+      id: "cap-c",
+      canonicalName: "Capability Gamma",
+      stableIdentity: "runtime:gamma",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      revision: "cap-r1",
+    },
+  ];
+
+  const requiresUser = {
+    id: "dep-user",
+    sourceCapabilityId: "cap-a",
+    targetCapabilityId: "cap-b",
+    kind: "requires",
+    owner: "user",
+    provenance: "user",
+    evidenceSummary: "User-created relationship",
+    createdAt: "2026-01-01T00:00:01Z",
+    revision: "dependency-r1",
+  };
+
+  const dependsScanner = {
+    id: "dep-scanner",
+    sourceCapabilityId: "cap-b",
+    targetCapabilityId: "cap-c",
+    kind: "depends_on",
+    owner: "scanner",
+    provenance: "scanner:test",
+    evidenceSummary: "Redacted scanner evidence",
+    createdAt: "2026-01-01T00:00:02Z",
+    revision: "dependency-r1",
+  };
+
+  function seedDependencyBootstrap(
+    pending: unknown[] = [],
+    installations: unknown[] = [],
+  ) {
+    vi.mocked(bootstrap).mockResolvedValueOnce({
+      mode: "desktop",
+      pending,
+      capabilities,
+      installations,
+      scanRevision: "scan-r1",
+      healthRevision: "health-r1",
+      dependencyRevision: "dependency-r1",
+    } as never);
+  }
+
+  async function openDependencies() {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "Dependencies" }));
+    return user;
+  }
+
+  it("dependency_ui_requires_and_depends_on_are_distinct", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [requiresUser, dependsScanner],
+      revision: "dependency-r1",
+    } as never);
+
+    await openDependencies();
+
+    expect(await screen.findByText("Requires")).toBeInTheDocument();
+    expect(screen.getByText("Depends on")).toBeInTheDocument();
+  });
+
+  it("dependency_ui_scanner_relationship_is_read_only", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [dependsScanner],
+      revision: "dependency-r1",
+    } as never);
+
+    await openDependencies();
+
+    const row = await screen.findByTestId("dependency-row-dep-scanner");
+    expect(within(row).getByText(/scanner/i)).toBeInTheDocument();
+    expect(within(row).getByText(/read.?only/i)).toBeInTheDocument();
+    expect(within(row).queryByRole("button", { name: "Delete" })).not.toBeInTheDocument();
+  });
+
+  it("dependency_ui_user_relationship_can_be_deleted", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [requiresUser],
+      revision: "dependency-r7",
+    } as never);
+    vi.mocked(deleteUserDependency).mockResolvedValueOnce({
+      relationships: [],
+      revision: "dependency-r8",
+    } as never);
+
+    const user = await openDependencies();
+    const row = await screen.findByTestId("dependency-row-dep-user");
+    await user.click(within(row).getByRole("button", { name: "Delete" }));
+
+    await waitFor(() =>
+      expect(deleteUserDependency).toHaveBeenCalledWith("dep-user", "dependency-r7"),
+    );
+  });
+
+  it("dependency_ui_add_form_uses_reviewed_capabilities_only", async () => {
+    seedDependencyBootstrap(
+      [
+        {
+          id: "pending-secret",
+          suggested_name: "Pending Discovery Should Not Appear",
+          suggested_type: "runtime",
+          source_scanner: "test",
+          confidence: "high",
+          evidence: [],
+          observed_at: "2026-01-01T00:00:00Z",
+          health_state: "unknown",
+        },
+      ],
+      [
+        {
+          id: "installation-secret",
+          capabilityId: "cap-a",
+          sourceDiscoveryId: "disc-a",
+          kind: "runtime",
+          displayName: "Installation Id Should Not Appear",
+          host: "localhost",
+          installationState: "installed",
+          registrationState: "registered",
+          enablementState: "enabled",
+          runtimeState: "unknown",
+          connectionState: "unknown",
+          authenticationState: "unknown",
+          aggregateHealth: "grey",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+        },
+      ],
+    );
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [],
+      revision: "dependency-r1",
+    } as never);
+
+    await openDependencies();
+
+    const source = await screen.findByLabelText("Source capability");
+    const target = screen.getByLabelText("Target capability");
+
+    expect(within(source).getByRole("option", { name: "Capability Alpha" })).toBeInTheDocument();
+    expect(within(source).getByRole("option", { name: "Capability Beta" })).toBeInTheDocument();
+    expect(within(target).getByRole("option", { name: "Capability Gamma" })).toBeInTheDocument();
+
+    expect(within(source).queryByRole("option", { name: "Pending Discovery Should Not Appear" })).not.toBeInTheDocument();
+    expect(within(target).queryByRole("option", { name: "Installation Id Should Not Appear" })).not.toBeInTheDocument();
+    expect(source).not.toHaveTextContent("pending-secret");
+    expect(target).not.toHaveTextContent("installation-secret");
+  });
+
+  it("dependency_ui_client_blocks_self_reference", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [],
+      revision: "dependency-r1",
+    } as never);
+
+    const user = await openDependencies();
+
+    await user.selectOptions(await screen.findByLabelText("Source capability"), "cap-a");
+    await user.selectOptions(screen.getByLabelText("Target capability"), "cap-a");
+
+    expect(screen.getByRole("button", { name: "Add relationship" })).toBeDisabled();
+    expect(createUserDependency).not.toHaveBeenCalled();
+  });
+
+  it("dependency_ui_create_passes_current_revision", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [],
+      revision: "dependency-r7",
+    } as never);
+    vi.mocked(createUserDependency).mockResolvedValueOnce({
+      relationships: [requiresUser],
+      revision: "dependency-r8",
+    } as never);
+
+    const user = await openDependencies();
+
+    await user.selectOptions(await screen.findByLabelText("Source capability"), "cap-a");
+    await user.selectOptions(screen.getByLabelText("Relationship type"), "requires");
+    await user.selectOptions(screen.getByLabelText("Target capability"), "cap-b");
+    await user.click(screen.getByRole("button", { name: "Add relationship" }));
+
+    await waitFor(() =>
+      expect(createUserDependency).toHaveBeenCalledWith(
+        "cap-a",
+        "requires",
+        "cap-b",
+        "dependency-r7",
+      ),
+    );
+  });
+
+  it("dependency_ui_create_success_replaces_authoritative_list_and_revision", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [requiresUser],
+      revision: "dependency-r1",
+    } as never);
+
+    const replacement = {
+      ...dependsScanner,
+      id: "dep-created-authoritative",
+      owner: "user",
+      provenance: "user",
+      revision: "dependency-r2",
+    };
+
+    vi.mocked(createUserDependency)
+      .mockResolvedValueOnce({
+        relationships: [replacement],
+        revision: "dependency-r2",
+      } as never)
+      .mockResolvedValueOnce({
+        relationships: [replacement],
+        revision: "dependency-r3",
+      } as never);
+
+    const user = await openDependencies();
+
+    expect(await screen.findByTestId("dependency-row-dep-user")).toBeInTheDocument();
+
+    await user.selectOptions(screen.getByLabelText("Source capability"), "cap-b");
+    await user.selectOptions(screen.getByLabelText("Relationship type"), "depends_on");
+    await user.selectOptions(screen.getByLabelText("Target capability"), "cap-c");
+    await user.click(screen.getByRole("button", { name: "Add relationship" }));
+
+    expect(await screen.findByTestId("dependency-row-dep-created-authoritative")).toBeInTheDocument();
+    expect(screen.queryByTestId("dependency-row-dep-user")).not.toBeInTheDocument();
+
+    await user.selectOptions(screen.getByLabelText("Source capability"), "cap-a");
+    await user.selectOptions(screen.getByLabelText("Relationship type"), "requires");
+    await user.selectOptions(screen.getByLabelText("Target capability"), "cap-b");
+    await user.click(screen.getByRole("button", { name: "Add relationship" }));
+
+    await waitFor(() =>
+      expect(createUserDependency).toHaveBeenLastCalledWith(
+        "cap-a",
+        "requires",
+        "cap-b",
+        "dependency-r2",
+      ),
+    );
+  });
+
+  it("dependency_ui_delete_success_replaces_authoritative_list_and_revision", async () => {
+    seedDependencyBootstrap();
+    const second = {
+      ...requiresUser,
+      id: "dep-user-second",
+      sourceCapabilityId: "cap-b",
+      targetCapabilityId: "cap-c",
+    };
+
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [requiresUser, second],
+      revision: "dependency-r1",
+    } as never);
+    vi.mocked(deleteUserDependency)
+      .mockResolvedValueOnce({
+        relationships: [second],
+        revision: "dependency-r2",
+      } as never)
+      .mockResolvedValueOnce({
+        relationships: [],
+        revision: "dependency-r3",
+      } as never);
+
+    const user = await openDependencies();
+
+    const firstRow = await screen.findByTestId("dependency-row-dep-user");
+    await user.click(within(firstRow).getByRole("button", { name: "Delete" }));
+
+    expect(screen.queryByTestId("dependency-row-dep-user")).not.toBeInTheDocument();
+    const secondRow = await screen.findByTestId("dependency-row-dep-user-second");
+    expect(secondRow).toBeInTheDocument();
+
+    await user.click(within(secondRow).getByRole("button", { name: "Delete" }));
+
+    await waitFor(() =>
+      expect(deleteUserDependency).toHaveBeenLastCalledWith(
+        "dep-user-second",
+        "dependency-r2",
+      ),
+    );
+  });
+
+  it("dependency_ui_failed_create_does_not_optimistically_add", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [requiresUser],
+      revision: "dependency-r1",
+    } as never);
+    vi.mocked(createUserDependency).mockRejectedValueOnce({
+      code: "storage_failed",
+      message: "internal detail must not replace authoritative state",
+    });
+
+    const user = await openDependencies();
+
+    await user.selectOptions(await screen.findByLabelText("Source capability"), "cap-b");
+    await user.selectOptions(screen.getByLabelText("Relationship type"), "depends_on");
+    await user.selectOptions(screen.getByLabelText("Target capability"), "cap-c");
+    await user.click(screen.getByRole("button", { name: "Add relationship" }));
+
+    await waitFor(() => expect(createUserDependency).toHaveBeenCalledTimes(1));
+    expect(screen.getByTestId("dependency-row-dep-user")).toBeInTheDocument();
+    expect(document.querySelectorAll("[data-dependency-row]").length).toBe(1);
+  });
+
+  it("dependency_ui_failed_delete_does_not_optimistically_remove", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [requiresUser],
+      revision: "dependency-r1",
+    } as never);
+    vi.mocked(deleteUserDependency).mockRejectedValueOnce({
+      code: "storage_failed",
+      message: "delete failed",
+    });
+
+    const user = await openDependencies();
+    const row = await screen.findByTestId("dependency-row-dep-user");
+
+    await user.click(within(row).getByRole("button", { name: "Delete" }));
+
+    await waitFor(() => expect(deleteUserDependency).toHaveBeenCalledTimes(1));
+    expect(screen.getByTestId("dependency-row-dep-user")).toBeInTheDocument();
+  });
+
+  it("dependency_ui_conflict_refreshes_once_without_auto_replay", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies)
+      .mockResolvedValueOnce({
+        relationships: [requiresUser],
+        revision: "dependency-r1",
+      } as never)
+      .mockResolvedValueOnce({
+        relationships: [dependsScanner],
+        revision: "dependency-r2",
+      } as never);
+
+    vi.mocked(createUserDependency).mockRejectedValueOnce({
+      code: "conflict",
+      message: "stale dependency revision",
+    });
+
+    const user = await openDependencies();
+
+    await user.selectOptions(await screen.findByLabelText("Source capability"), "cap-b");
+    await user.selectOptions(screen.getByLabelText("Relationship type"), "depends_on");
+    await user.selectOptions(screen.getByLabelText("Target capability"), "cap-c");
+    await user.click(screen.getByRole("button", { name: "Add relationship" }));
+
+    await waitFor(() => expect(listDependencies).toHaveBeenCalledTimes(2));
+    expect(createUserDependency).toHaveBeenCalledTimes(1);
+    expect(await screen.findByTestId("dependency-row-dep-scanner")).toBeInTheDocument();
+    expect(screen.queryByTestId("dependency-row-dep-user")).not.toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(/changed.*retry/i);
+  });
+
+  it("dependency_ui_duplicate_is_recoverable", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [requiresUser],
+      revision: "dependency-r1",
+    } as never);
+    vi.mocked(createUserDependency).mockRejectedValueOnce({
+      code: "dependency_duplicate",
+      message: "raw duplicate detail",
+    });
+
+    const user = await openDependencies();
+
+    await user.selectOptions(await screen.findByLabelText("Source capability"), "cap-a");
+    await user.selectOptions(screen.getByLabelText("Relationship type"), "requires");
+    await user.selectOptions(screen.getByLabelText("Target capability"), "cap-b");
+    await user.click(screen.getByRole("button", { name: "Add relationship" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/relationship already exists/i);
+    expect(screen.getByTestId("dependency-row-dep-user")).toBeInTheDocument();
+  });
+
+  it("dependency_ui_self_reference_backend_error_is_recoverable", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [],
+      revision: "dependency-r1",
+    } as never);
+    vi.mocked(createUserDependency).mockRejectedValueOnce({
+      code: "dependency_self_reference",
+      message: "raw self-reference detail",
+    });
+
+    const user = await openDependencies();
+
+    await user.selectOptions(await screen.findByLabelText("Source capability"), "cap-a");
+    await user.selectOptions(screen.getByLabelText("Relationship type"), "requires");
+    await user.selectOptions(screen.getByLabelText("Target capability"), "cap-b");
+    await user.click(screen.getByRole("button", { name: "Add relationship" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/cannot.*itself|self-reference/i);
+    expect(document.querySelectorAll("[data-dependency-row]").length).toBe(0);
+  });
+
+  it("dependency_ui_invalid_endpoint_is_recoverable", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [],
+      revision: "dependency-r1",
+    } as never);
+    vi.mocked(createUserDependency).mockRejectedValueOnce({
+      code: "dependency_invalid",
+      message: "raw invalid endpoint detail",
+    });
+
+    const user = await openDependencies();
+
+    await user.selectOptions(await screen.findByLabelText("Source capability"), "cap-a");
+    await user.selectOptions(screen.getByLabelText("Relationship type"), "requires");
+    await user.selectOptions(screen.getByLabelText("Target capability"), "cap-b");
+    await user.click(screen.getByRole("button", { name: "Add relationship" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/valid reviewed capabilities|invalid relationship/i);
+    expect(document.querySelectorAll("[data-dependency-row]").length).toBe(0);
+  });
+
+  it("dependency_ui_scanner_delete_error_preserves_row", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [requiresUser],
+      revision: "dependency-r1",
+    } as never);
+    vi.mocked(deleteUserDependency).mockRejectedValueOnce({
+      code: "dependency_not_user_owned",
+      message: "backend reports protected ownership",
+    });
+
+    const user = await openDependencies();
+    const row = await screen.findByTestId("dependency-row-dep-user");
+
+    await user.click(within(row).getByRole("button", { name: "Delete" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/scanner.*read.?only|not user-owned/i);
+    expect(screen.getByTestId("dependency-row-dep-user")).toBeInTheDocument();
+  });
+
+  it("dependency_ui_navigation_only_reads_relationships", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [],
+      revision: "dependency-r1",
+    } as never);
+
+    await openDependencies();
+
+    await waitFor(() => expect(listDependencies).toHaveBeenCalledTimes(1));
+    expect(createUserDependency).not.toHaveBeenCalled();
+    expect(deleteUserDependency).not.toHaveBeenCalled();
+  });
+
+  it("dependency_ui_empty_state_invents_no_edges", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [],
+      revision: "dependency-r1",
+    } as never);
+
+    await openDependencies();
+
+    expect(await screen.findByText(/no persisted relationships/i)).toBeInTheDocument();
+    expect(document.querySelectorAll("[data-dependency-edge]").length).toBe(0);
+  });
+
+  it("dependency_ui_graph_nodes_are_capabilities_not_installations", async () => {
+    seedDependencyBootstrap([], [
+      {
+        id: "inst-a-1",
+        capabilityId: "cap-a",
+        sourceDiscoveryId: "disc-a-1",
+        kind: "runtime",
+        displayName: "Alpha Install One",
+        host: "host-1",
+        installationState: "installed",
+        registrationState: "registered",
+        enablementState: "enabled",
+        runtimeState: "unknown",
+        connectionState: "unknown",
+        authenticationState: "unknown",
+        aggregateHealth: "grey",
+        createdAt: "2026-01-01T00:00:00Z",
+        updatedAt: "2026-01-01T00:00:00Z",
+      },
+      {
+        id: "inst-a-2",
+        capabilityId: "cap-a",
+        sourceDiscoveryId: "disc-a-2",
+        kind: "runtime",
+        displayName: "Alpha Install Two",
+        host: "host-2",
+        installationState: "installed",
+        registrationState: "registered",
+        enablementState: "enabled",
+        runtimeState: "unknown",
+        connectionState: "unknown",
+        authenticationState: "unknown",
+        aggregateHealth: "grey",
+        createdAt: "2026-01-01T00:00:00Z",
+        updatedAt: "2026-01-01T00:00:00Z",
+      },
+    ]);
+
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [requiresUser],
+      revision: "dependency-r1",
+    } as never);
+
+    await openDependencies();
+
+    await screen.findByLabelText("Dependency graph");
+    expect(document.querySelectorAll('[data-capability-node="cap-a"]').length).toBe(1);
+    expect(document.querySelectorAll('[data-capability-node="cap-b"]').length).toBe(1);
+    expect(document.querySelector('[data-capability-node="inst-a-1"]')).toBeNull();
+    expect(document.querySelector('[data-capability-node="inst-a-2"]')).toBeNull();
+  });
+
+  it("dependency_ui_graph_edges_match_persisted_relationships_exactly", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [requiresUser, dependsScanner],
+      revision: "dependency-r1",
+    } as never);
+
+    await openDependencies();
+
+    await screen.findByLabelText("Dependency graph");
+    const edges = [...document.querySelectorAll<HTMLElement>("[data-dependency-edge]")];
+
+    expect(edges).toHaveLength(2);
+    expect(
+      edges.map((edge) => ({
+        source: edge.dataset.sourceCapabilityId,
+        target: edge.dataset.targetCapabilityId,
+        kind: edge.dataset.dependencyKind,
+      })),
+    ).toEqual(
+      expect.arrayContaining([
+        { source: "cap-a", target: "cap-b", kind: "requires" },
+        { source: "cap-b", target: "cap-c", kind: "depends_on" },
+      ]),
+    );
+  });
+
+  it("dependency_ui_graph_is_read_only", async () => {
+    seedDependencyBootstrap();
+    vi.mocked(listDependencies).mockResolvedValueOnce({
+      relationships: [requiresUser],
+      revision: "dependency-r1",
+    } as never);
+
+    const user = await openDependencies();
+
+    const graph = await screen.findByLabelText("Dependency graph");
+    const node = graph.querySelector<HTMLElement>('[data-capability-node="cap-a"]');
+    const edge = graph.querySelector<HTMLElement>('[data-dependency-edge="dep-user"]');
+
+    if (!node || !edge) throw new Error("dependency graph node/edge not found");
+
+    await user.click(node);
+    await user.keyboard("{Enter}");
+    await user.click(edge);
+    await user.keyboard("{Enter}");
+
+    expect(createUserDependency).not.toHaveBeenCalled();
+    expect(deleteUserDependency).not.toHaveBeenCalled();
   });
 });

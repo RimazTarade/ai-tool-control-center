@@ -1,4 +1,7 @@
-use crate::{Confidence, Discovery, Evidence, ObservedState, ToolKind};
+use crate::{
+    Confidence, DEFAULT_HEALTH_TIMEOUT_MS, Discovery, Evidence, HealthCheckHint, HealthCheckType,
+    HealthExpectedCondition, HealthTarget, ObservedState, ToolKind,
+};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
@@ -53,6 +56,48 @@ fn windows_long_path(path: &Path) -> Option<PathBuf> {
     }
 
     Some(PathBuf::from(OsString::from_wide(&output[..len])))
+}
+
+fn canonical_windows_path_identity(path: &Path) -> String {
+    format!("windows-path:{}", windows_path_key(path))
+}
+
+fn canonical_windows_service_identity(service_name: &str) -> String {
+    format!(
+        "windows-service:{}",
+        service_name.trim().to_ascii_lowercase()
+    )
+}
+
+fn canonical_loopback_identity(host: &str, port: u16) -> Option<String> {
+    let address: std::net::IpAddr = host.trim().parse().ok()?;
+    address
+        .is_loopback()
+        .then(|| format!("loopback-tcp:{address}:{port}"))
+}
+
+fn push_required_health_hint(
+    discovery: &mut Discovery,
+    check_type: HealthCheckType,
+    expected_condition: HealthExpectedCondition,
+    target: HealthTarget,
+) {
+    if discovery
+        .health_hints
+        .iter()
+        .any(|hint| hint.check_type == check_type && hint.target == target)
+    {
+        return;
+    }
+
+    discovery.health_hints.push(HealthCheckHint {
+        check_type,
+        required: true,
+        expected_condition,
+        timeout_ms: DEFAULT_HEALTH_TIMEOUT_MS,
+        stale_after_seconds: None,
+        target,
+    });
 }
 
 /// Removes duplicate Windows paths while preserving the first observation.
@@ -391,6 +436,15 @@ pub fn discover_known_locations(
                     path.display()
                 ),
             });
+            discovery.canonical_identity = Some(canonical_windows_path_identity(path));
+            push_required_health_hint(
+                &mut discovery,
+                HealthCheckType::FileExists,
+                HealthExpectedCondition::Exists,
+                HealthTarget::Path {
+                    path: path.to_path_buf(),
+                },
+            );
 
             #[cfg(windows)]
             if discovery.suggested_type == ToolKind::Launcher {
@@ -477,6 +531,13 @@ pub fn discover_path_executables(path_value: &str, pathext_value: &str) -> Vec<D
                 kind: "path".into(),
                 summary: path.display().to_string(),
             });
+            discovery.canonical_identity = Some(canonical_windows_path_identity(&path));
+            push_required_health_hint(
+                &mut discovery,
+                HealthCheckType::FileExists,
+                HealthExpectedCondition::Exists,
+                HealthTarget::Path { path: path.clone() },
+            );
             discoveries.push(discovery);
         }
     }
@@ -650,6 +711,16 @@ pub fn discover_uninstall_registry_with(
                 kind: "registry".into(),
                 summary: registry_evidence_summary(&record, name),
             });
+            if let Some(install_location) = record.install_location.as_ref() {
+                push_required_health_hint(
+                    &mut discovery,
+                    HealthCheckType::PathExists,
+                    HealthExpectedCondition::Exists,
+                    HealthTarget::Path {
+                        path: install_location.clone(),
+                    },
+                );
+            }
             report.discoveries.push(discovery);
         }
     }
@@ -781,6 +852,17 @@ pub fn discover_processes_with(source: &impl ProcessSource) -> Result<Vec<Discov
             kind: "process".into(),
             summary: process_evidence_summary(&record),
         });
+        if let Some(executable_path) = record.executable_path.as_ref() {
+            discovery.canonical_identity = Some(canonical_windows_path_identity(executable_path));
+            push_required_health_hint(
+                &mut discovery,
+                HealthCheckType::ProcessRunning,
+                HealthExpectedCondition::Running,
+                HealthTarget::ProcessExecutable {
+                    path: executable_path.clone(),
+                },
+            );
+        }
         discoveries.push(discovery);
     }
 
@@ -1101,6 +1183,18 @@ pub fn discover_tcp_endpoints_with(
                     .unwrap_or_else(|| "unknown".into())
             ),
         });
+        if let Some(identity) = canonical_loopback_identity(address, record.local_port) {
+            discovery.canonical_identity = Some(identity);
+            push_required_health_hint(
+                &mut discovery,
+                HealthCheckType::LoopbackPortReachable,
+                HealthExpectedCondition::Reachable,
+                HealthTarget::LoopbackSocket {
+                    host: address.to_string(),
+                    port: record.local_port,
+                },
+            );
+        }
         discoveries.push(discovery);
     }
 
@@ -1288,6 +1382,15 @@ pub fn discover_services_with(source: &impl ServiceSource) -> Result<Vec<Discove
             kind: "service".into(),
             summary: service_evidence_summary(&record),
         });
+        discovery.canonical_identity = Some(canonical_windows_service_identity(service_name));
+        push_required_health_hint(
+            &mut discovery,
+            HealthCheckType::WindowsServiceState,
+            HealthExpectedCondition::Running,
+            HealthTarget::WindowsService {
+                service_name: service_name.to_string(),
+            },
+        );
         discoveries.push(discovery);
     }
 

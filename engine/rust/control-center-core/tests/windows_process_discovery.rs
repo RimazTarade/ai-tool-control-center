@@ -72,3 +72,41 @@ fn process_discovery_reports_process_source_failure() {
 
     assert!(error.contains("process enumeration fixture failed"));
 }
+
+#[test]
+fn typed_process_discovery_only_trusts_exact_executable_paths() {
+    use control_center_core::windows::windows_path_key;
+    use control_center_core::{HealthCheckType, HealthExpectedCondition, HealthTarget};
+
+    let source = FixtureProcesses { fail: false };
+    let discoveries = discover_processes_with(&source).unwrap();
+
+    let exact = discoveries
+        .iter()
+        .find(|item| item.suggested_name == "ollama")
+        .expect("exact-path process should be discovered");
+    let executable = PathBuf::from(r"C:\Fixture\Ollama\ollama.exe");
+    let expected_identity = format!("windows-path:{}", windows_path_key(&executable));
+
+    assert_eq!(
+        exact.canonical_identity.as_deref(),
+        Some(expected_identity.as_str())
+    );
+    assert_eq!(exact.health_hints.len(), 1);
+    let hint = &exact.health_hints[0];
+    assert_eq!(hint.check_type, HealthCheckType::ProcessRunning);
+    assert!(hint.required);
+    assert_eq!(hint.expected_condition, HealthExpectedCondition::Running);
+    assert_eq!(hint.stale_after_seconds, None);
+    assert_eq!(
+        hint.target,
+        HealthTarget::ProcessExecutable { path: executable }
+    );
+
+    let name_only = discoveries
+        .iter()
+        .find(|item| item.suggested_name == "codex")
+        .expect("name-only process should be discovered");
+    assert_eq!(name_only.canonical_identity, None);
+    assert!(name_only.health_hints.is_empty());
+}
