@@ -42,8 +42,8 @@ fn path_executable_discovery_ignores_missing_path_directories() {
 
 #[test]
 fn typed_path_executable_discovery_carries_exact_file_health_metadata() {
-    use control_center_core::{HealthCheckType, HealthExpectedCondition, HealthTarget};
     use control_center_core::windows::windows_path_key;
+    use control_center_core::{HealthCheckType, HealthExpectedCondition, HealthTarget};
 
     let root = tempdir().unwrap();
     let executable = root.path().join("ollama.exe");
@@ -56,7 +56,10 @@ fn typed_path_executable_discovery_carries_exact_file_health_metadata() {
         .expect("PATH executable should be discovered");
 
     let expected_identity = format!("windows-path:{}", windows_path_key(&executable));
-    assert_eq!(discovery.canonical_identity.as_deref(), Some(expected_identity.as_str()));
+    assert_eq!(
+        discovery.canonical_identity.as_deref(),
+        Some(expected_identity.as_str())
+    );
     assert_eq!(discovery.health_hints.len(), 1);
 
     let hint = &discovery.health_hints[0];

@@ -1,5 +1,8 @@
 use crate::scan_control::{PauseGate, ScanEvent, ScanEventSink, ScanScope};
-use crate::{Discovery, Evidence, HealthCheckHint, HealthCheckType, HealthExpectedCondition, HealthTarget, DEFAULT_HEALTH_TIMEOUT_MS};
+use crate::{
+    DEFAULT_HEALTH_TIMEOUT_MS, Discovery, Evidence, HealthCheckHint, HealthCheckType,
+    HealthExpectedCondition, HealthTarget,
+};
 use sha2::{Digest, Sha256};
 use std::{
     future::Future,
@@ -788,7 +791,10 @@ pub(crate) fn add_file_health_metadata(discovery: &mut Discovery, path: &Path) {
 
     if discovery.health_hints.iter().any(|hint| {
         hint.check_type == HealthCheckType::FileExists
-            && hint.target == HealthTarget::Path { path: path.to_path_buf() }
+            && hint.target
+                == HealthTarget::Path {
+                    path: path.to_path_buf(),
+                }
     }) {
         return;
     }
@@ -804,7 +810,6 @@ pub(crate) fn add_file_health_metadata(discovery: &mut Discovery, path: &Path) {
         },
     });
 }
-
 
 fn scan_blocking(
     roots: Vec<PathBuf>,
@@ -2081,8 +2086,8 @@ mod tests {
 
     #[tokio::test]
     async fn typed_quick_filesystem_discovery_carries_exact_file_health_metadata() {
-        use crate::{HealthCheckType, HealthExpectedCondition, HealthTarget};
         use crate::windows::windows_path_key;
+        use crate::{HealthCheckType, HealthExpectedCondition, HealthTarget};
 
         let root = tempdir().unwrap();
         let signal = root.path().join("example-mcp.json");
@@ -2097,7 +2102,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(matches!(terminal, ScannerTerminal::Completed { discovered: 1, .. }));
+        assert!(matches!(
+            terminal,
+            ScannerTerminal::Completed { discovered: 1, .. }
+        ));
 
         let mut discovery = None;
         while let Ok(event) = receiver.try_recv() {

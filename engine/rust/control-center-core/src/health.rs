@@ -61,10 +61,10 @@ pub fn aggregate_health(
     }
 
     for definition in definitions.iter().filter(|definition| !definition.required) {
-        if let Some(result) = latest_results.get(&definition.id) {
-            if result.state != HealthState::Green || is_result_stale(definition, result, now) {
-                yellow = true;
-            }
+        if let Some(result) = latest_results.get(&definition.id)
+            && (result.state != HealthState::Green || is_result_stale(definition, result, now))
+        {
+            yellow = true;
         }
     }
 
@@ -164,13 +164,13 @@ impl HealthProbeIo for NativeHealthProbeIo {
             use crate::windows::{ProcessSource, WindowsProcessSource, windows_path_key};
 
             let target = windows_path_key(executable_path);
-            let processes = WindowsProcessSource::default().read_processes()?;
-            return Ok(processes.into_iter().any(|process| {
+            let processes = WindowsProcessSource.read_processes()?;
+            Ok(processes.into_iter().any(|process| {
                 process
                     .executable_path
                     .as_deref()
                     .is_some_and(|path| windows_path_key(path) == target)
-            }));
+            }))
         }
 
         #[cfg(not(windows))]
@@ -185,15 +185,15 @@ impl HealthProbeIo for NativeHealthProbeIo {
         {
             use crate::windows::{ServiceRuntimeState, ServiceSource, WindowsServiceSource};
 
-            let services = WindowsServiceSource::default().read_services()?;
-            return Ok(services
+            let services = WindowsServiceSource.read_services()?;
+            Ok(services
                 .into_iter()
                 .find(|service| service.service_name.eq_ignore_ascii_case(service_name))
                 .and_then(|service| match service.runtime_state {
                     ServiceRuntimeState::Running => Some(true),
                     ServiceRuntimeState::Stopped => Some(false),
                     ServiceRuntimeState::Unknown => None,
-                }));
+                }))
         }
 
         #[cfg(not(windows))]

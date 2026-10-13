@@ -69,13 +69,6 @@ pub(crate) struct HealthRunHandle {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct HealthMutation {
-    pub(crate) run_id: Uuid,
-    pub(crate) revision: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct HealthWorkspaceSnapshot {
     pub(crate) summary: HealthSummary,
     pub(crate) installations: Vec<InstallationHealthSnapshot>,
@@ -152,6 +145,7 @@ impl HealthRegistry {
         self.state.lock().unwrap().workspace_revision.clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn owns_installation(&self, installation_id: Uuid) -> bool {
         self.state
             .lock()
@@ -160,6 +154,7 @@ impl HealthRegistry {
             .contains_key(&installation_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn owner_of(&self, installation_id: Uuid) -> Option<Uuid> {
         self.state
             .lock()
@@ -169,6 +164,7 @@ impl HealthRegistry {
             .copied()
     }
 
+    #[cfg(test)]
     pub(crate) fn run_state(&self, run_id: Uuid) -> Option<HealthRunStateResponse> {
         let state = self.state.lock().unwrap();
         state.runs.get(&run_id).map(|run| HealthRunStateResponse {
@@ -178,6 +174,7 @@ impl HealthRegistry {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn admit_single(
         &self,
         presented_revision: &str,
@@ -186,6 +183,7 @@ impl HealthRegistry {
         self.admit_single_with_persist(presented_revision, installation_id, || Ok(()))
     }
 
+    #[cfg(test)]
     pub(crate) fn admit_single_with_persist<F>(
         &self,
         presented_revision: &str,
@@ -228,7 +226,7 @@ impl HealthRegistry {
             id: run_id,
             scope: HealthRunScope::Installation,
             state: HealthRunState::Running,
-            started_at: started_at.clone(),
+            started_at,
             finished_at: None,
             requested_installation_count: 1,
             completed_installation_count: 0,
@@ -266,6 +264,7 @@ impl HealthRegistry {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn admit_all(
         &self,
         presented_revision: &str,
@@ -311,9 +310,9 @@ impl HealthRegistry {
             id: run_id,
             scope: HealthRunScope::All,
             state: run_state.clone(),
-            started_at: started_at.clone(),
+            started_at,
             finished_at: if scheduled == 0 {
-                Some(started_at.clone())
+                Some(started_at)
             } else {
                 None
             },
@@ -421,7 +420,7 @@ fn build_health_workspace_snapshot(
     let installations = store.installations()?;
     let mut snapshots = Vec::with_capacity(installations.len());
     for installation in installations {
-        snapshots.push(store.installation_health(installation.id, evaluated_at.clone())?);
+        snapshots.push(store.installation_health(installation.id, evaluated_at)?);
     }
     let summary = store.health_summary(evaluated_at)?;
     Ok(HealthWorkspaceSnapshot {
@@ -713,6 +712,7 @@ pub(crate) enum FrontendHealthEvent {
 }
 
 impl FrontendHealthEvent {
+    #[cfg(test)]
     pub(crate) fn run_id(&self) -> Uuid {
         match self {
             Self::Started { run_id, .. }

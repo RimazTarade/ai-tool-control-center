@@ -1493,8 +1493,8 @@ mod tests {
 
     #[tokio::test]
     async fn typed_deep_filesystem_discovery_carries_exact_file_health_metadata() {
-        use crate::{HealthCheckType, HealthExpectedCondition, HealthTarget};
         use crate::windows::windows_path_key;
+        use crate::{HealthCheckType, HealthExpectedCondition, HealthTarget};
 
         let root = PathBuf::from(r"C:\FakeRoot");
         let signal = root.join("mcp-config.json");

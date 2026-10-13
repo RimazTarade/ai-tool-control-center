@@ -93,102 +93,6 @@ fn cancel_active_work(state: &AppState) {
     state.health.cancel_all();
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn lib_store_errors_are_redacted_for_ipc() {
-        let internal = control_center_core::StoreError::StorageIntegrity(
-            "secret-local-path=C:\\Users\\private\\control-center.db".into(),
-        );
-
-        let error = map_store_error_for_ipc(internal);
-
-        assert_eq!(error.code, "storage_integrity");
-        assert_eq!(error.message, "Local storage is unavailable");
-        assert!(!error.message.contains("private"));
-    }
-    #[test]
-    fn lib_bootstrap_exposes_canonical_inventory_and_health_revision() {
-        let state = AppState::new(Store::in_memory().unwrap());
-        let expected_health_revision = state.health.workspace_revision();
-
-        let bootstrap = build_bootstrap_state(&state).unwrap();
-
-        assert_eq!(bootstrap.health_revision, expected_health_revision);
-        assert!(bootstrap.capabilities.is_empty());
-        assert!(bootstrap.installations.is_empty());
-    }
-    #[test]
-    fn dependency_command_bootstrap_exposes_dependency_revision() {
-        let state = AppState::new(Store::in_memory().unwrap());
-        let expected_dependency_revision = state.dependencies.workspace_revision();
-
-        let bootstrap = build_bootstrap_state(&state).unwrap();
-
-        assert_eq!(bootstrap.dependency_revision, expected_dependency_revision);
-    }
-
-    #[test]
-    fn dependency_command_lib_registers_all_dependency_commands() {
-        let source = include_str!("lib.rs");
-        let handler = source
-            .rsplit_once(".invoke_handler(tauri::generate_handler![")
-            .map(|(_, rest)| rest)
-            .and_then(|rest| rest.split("])").next())
-            .expect("generate_handler block");
-
-        for command in [
-            "list_dependencies",
-            "create_user_dependency",
-            "delete_user_dependency",
-        ] {
-            assert!(
-                handler.contains(command),
-                "missing dependency command: {command}"
-            );
-        }
-    }
-
-    #[test]
-    fn lib_registers_all_health_commands() {
-        let source = include_str!("lib.rs");
-        let handler = source
-            .rsplit_once(".invoke_handler(tauri::generate_handler![")
-            .map(|(_, rest)| rest)
-            .and_then(|rest| rest.split("])").next())
-            .expect("generate_handler block");
-
-        for command in [
-            "list_health_summary",
-            "list_installation_health",
-            "run_health_checks",
-            "run_all_health_checks",
-            "cancel_health_run",
-        ] {
-            assert!(
-                handler.contains(command),
-                "missing health command: {command}"
-            );
-        }
-    }
-    #[test]
-    fn lib_shutdown_cancels_active_health_tokens() {
-        let state = AppState::new(Store::in_memory().unwrap());
-        let installation_id = Uuid::new_v4();
-        let revision = state.health.workspace_revision();
-        let admitted = state
-            .health
-            .admit_single(&revision, installation_id)
-            .unwrap();
-
-        cancel_active_work(&state);
-
-        assert!(admitted.cancellation.is_cancelled());
-    }
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -232,4 +136,100 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("AI Tool Control Center failed to start");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lib_store_errors_are_redacted_for_ipc() {
+        let internal = control_center_core::StoreError::StorageIntegrity(
+            "secret-local-path=C:\\Users\\private\\control-center.db".into(),
+        );
+
+        let error = map_store_error_for_ipc(internal);
+
+        assert_eq!(error.code, "storage_integrity");
+        assert_eq!(error.message, "Local storage is unavailable");
+        assert!(!error.message.contains("private"));
+    }
+    #[test]
+    fn lib_bootstrap_exposes_canonical_inventory_and_health_revision() {
+        let state = AppState::new(Store::in_memory().unwrap());
+        let expected_health_revision = state.health.workspace_revision();
+
+        let bootstrap = build_bootstrap_state(&state).unwrap();
+
+        assert_eq!(bootstrap.health_revision, expected_health_revision);
+        assert!(bootstrap.capabilities.is_empty());
+        assert!(bootstrap.installations.is_empty());
+    }
+    #[test]
+    fn dependency_command_bootstrap_exposes_dependency_revision() {
+        let state = AppState::new(Store::in_memory().unwrap());
+        let expected_dependency_revision = state.dependencies.workspace_revision();
+
+        let bootstrap = build_bootstrap_state(&state).unwrap();
+
+        assert_eq!(bootstrap.dependency_revision, expected_dependency_revision);
+    }
+
+    #[test]
+    fn dependency_command_lib_registers_all_dependency_commands() {
+        let source = include_str!("lib.rs");
+        let handler = source
+            .split_once(".invoke_handler(tauri::generate_handler![")
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.split("])").next())
+            .expect("generate_handler block");
+
+        for command in [
+            "list_dependencies",
+            "create_user_dependency",
+            "delete_user_dependency",
+        ] {
+            assert!(
+                handler.contains(command),
+                "missing dependency command: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn lib_registers_all_health_commands() {
+        let source = include_str!("lib.rs");
+        let handler = source
+            .split_once(".invoke_handler(tauri::generate_handler![")
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.split("])").next())
+            .expect("generate_handler block");
+
+        for command in [
+            "list_health_summary",
+            "list_installation_health",
+            "run_health_checks",
+            "run_all_health_checks",
+            "cancel_health_run",
+        ] {
+            assert!(
+                handler.contains(command),
+                "missing health command: {command}"
+            );
+        }
+    }
+    #[test]
+    fn lib_shutdown_cancels_active_health_tokens() {
+        let state = AppState::new(Store::in_memory().unwrap());
+        let installation_id = Uuid::new_v4();
+        let revision = state.health.workspace_revision();
+        let admitted = state
+            .health
+            .admit_single(&revision, installation_id)
+            .unwrap();
+
+        cancel_active_work(&state);
+
+        assert!(admitted.cancellation.is_cancelled());
+    }
 }

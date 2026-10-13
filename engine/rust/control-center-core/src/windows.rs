@@ -1,6 +1,6 @@
 use crate::{
-    Confidence, Discovery, Evidence, HealthCheckHint, HealthCheckType, HealthExpectedCondition,
-    HealthTarget, ObservedState, ToolKind, DEFAULT_HEALTH_TIMEOUT_MS,
+    Confidence, DEFAULT_HEALTH_TIMEOUT_MS, Discovery, Evidence, HealthCheckHint, HealthCheckType,
+    HealthExpectedCondition, HealthTarget, ObservedState, ToolKind,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -63,7 +63,10 @@ fn canonical_windows_path_identity(path: &Path) -> String {
 }
 
 fn canonical_windows_service_identity(service_name: &str) -> String {
-    format!("windows-service:{}", service_name.trim().to_ascii_lowercase())
+    format!(
+        "windows-service:{}",
+        service_name.trim().to_ascii_lowercase()
+    )
 }
 
 fn canonical_loopback_identity(host: &str, port: u16) -> Option<String> {
@@ -96,7 +99,6 @@ fn push_required_health_hint(
         target,
     });
 }
-
 
 /// Removes duplicate Windows paths while preserving the first observation.
 pub fn dedupe_windows_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {

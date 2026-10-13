@@ -1,4 +1,6 @@
-use control_center_core::{DependencyKind, DependencyRelationship, Store, StoreError};
+#[cfg(test)]
+use control_center_core::Store;
+use control_center_core::{DependencyKind, DependencyRelationship, StoreError};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use uuid::Uuid;
@@ -39,6 +41,7 @@ pub(crate) struct DependencyMutationResponse {
     pub(crate) revision: String,
 }
 
+#[cfg(test)]
 fn create_user_dependency_from_request(
     registry: &DependencyRegistry,
     store: &mut Store,
@@ -59,6 +62,7 @@ fn create_user_dependency_from_request(
     )
 }
 
+#[cfg(test)]
 fn create_user_dependency_in_store(
     registry: &DependencyRegistry,
     store: &mut Store,
@@ -85,6 +89,7 @@ fn create_user_dependency_in_store(
     })
 }
 
+#[cfg(test)]
 fn delete_user_dependency_in_store(
     registry: &DependencyRegistry,
     store: &mut Store,
@@ -266,6 +271,7 @@ fn list_dependencies_from_state(
     })
 }
 
+#[cfg(test)]
 fn build_dependency_workspace_snapshot(
     registry: &DependencyRegistry,
     store: &Store,
@@ -715,8 +721,7 @@ mod tests {
 
     #[test]
     fn dependency_command_storage_details_are_redacted() {
-        let secret_detail =
-            r#"C:\Users\rimaz\private\control-center.sqlite: evidence_token=super-secret"#;
+        let secret_detail = r#"C:\sensitive\control-center.sqlite: evidence_token=super-secret"#;
         let error = map_dependency_store_error(StoreError::StorageIntegrity(secret_detail.into()));
 
         assert_eq!(error.code, "storage_integrity");
